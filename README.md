@@ -66,7 +66,7 @@ To build from source instead of using the zip, run `portingwork/build.ps1`.
 
 **Results on the RX 580 (8 GB):**
 
-2B PTQ1_0 (Ternary-Bonsai-2-2B-PTQ1_0.gguf) - token-exact, 36.8 tok/s
+2B PTQ1_0 (Ternary-Bonsai-2-2B-PTQ1_0.gguf) - token-exact, 36.95 tok/s
 
 ```powershell
 .\kindi_vk_decode.exe --model C:\x\Ternary-Bonsai-2-2B-PTQ1_0.gguf `
@@ -109,6 +109,9 @@ are actually prefilled.
 Measured through the server on an 85-token prompt, greedy, 32 tokens generated. Full
 method, per-model limits and the hardware ceilings are in
 [BENCHMARKS.md](portingwork/BENCHMARKS.md).
+
+Every experiment behind these numbers, including the ones that did not work and why, is in
+[EXPERIMENTS-FINDINGS.md](portingwork/EXPERIMENTS-FINDINGS.md).
 
 The 27B PTQ1_0 generation figure is **5.19 tok/s**, and **6.29 with `--spec`**, against
 0.848 when this port started. That is 7.4x, and every step is token-identical.
@@ -178,9 +181,11 @@ print(r.choices[0].message.content)
 separately in `reasoning_content`, split at `</think>`.
 
 Add `--spec 1` to enable speculative decode in the server too. On the 27B PTQ1_0 + MTP
-head that is 0.88 -> 1.20 tok/s (1.37x) with byte-identical output; it applies to greedy
-requests only and leaves prefill untouched. The 2B has no MTP head, so the server reports
-`--spec ignored` and serves normally.
+head that is 5.19 -> 6.31 tok/s with byte-identical output; it applies to greedy requests
+only and leaves prefill untouched. Acceptance decides whether it pays: break-even is about
+27%, and on one long server prompt with poor acceptance it measured 4.72 tok/s, below the
+serial 5.19. The 2B has no MTP head, so the server reports `--spec ignored` and serves
+normally.
 
 **Prompt reuse** is on by default. The KV cache needs no copying here (it is
 position-indexed and append-only), so a checkpoint of the recurrent state is the whole
@@ -225,9 +230,9 @@ plain decode. Measured on the 27B PTQ1_0 + MTP head, 20 tokens, greedy:
 
 | prompt | plain | `--spec` | acceptance | speedup |
 |---|---|---|---|---|
-| `The sky is blue because` | 0.850 tok/s | **1.25 tok/s** | 100% | **1.47x** |
-| `def fibonacci(n):` | 0.829 tok/s | **1.20 tok/s** | 100% | **1.45x** |
-| `Once upon a time there was` | 0.871 tok/s | **1.00 tok/s** | 53.8% | **1.15x** |
+| `The sky is blue because` | 5.11 tok/s | **6.31 tok/s** | 100% | **1.23x** |
+| `The sky is blue because`, 60 tokens | 5.19 tok/s | 6.31 tok/s | 100% | 1.22x |
+| one long server prompt, poor acceptance | 5.19 tok/s | 4.72 tok/s | low | 0.91x |
 
 Break-even is about 1.27 tokens per pass, so the draft needs roughly 27% acceptance to pay
 for itself. The verify pass runs at 1.74x the serial trunk, close to the 2x ceiling that
