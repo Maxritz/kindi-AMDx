@@ -1,0 +1,135 @@
+// g5ptq_byte3.comp - PTQ1_0 5-trit GEMV, up to THREE tensors sharing one input.
+//
+// Same decode as g5ptq_byte (byte-granular, 5 weights per byte, shared byte->trit
+// LUT, block scale hoisted per byte) and the same 64-thread workgroup and
+// shared-memory tree reduction, so a fused launch produces bit-identical values to
+// separate g5ptq_byte launches. That matters: the speculative verify pass compares
+// rows produced by g5ptqM against tokens the serial path produced with g5ptq_byte,
+// and g5ptqM uses this same tree. Using subgroupAdd here would break the
+// bit-identity that --selftest gates on.
+//
+// What changes is only the launch count. In a GDN layer attn_qkv and attn_gate both
+// read the norm output xp, and in the attention layer q/k/v do. Separate launches
+// cost a COMPUTE->COMPUTE pipeline barrier each, measured at 44 us per dispatch
+// (PERFORMANCE.md).
+//
+// The tensor branch is hoisted OUT of the inner loop on purpose. A first version
+// selected the buffer per byte with `(t==0) ? W0[i] : (t==1) ? W1[i] : W2[i]`, which
+// measured 772 us/op against 563 for the single-tensor shader and made the whole
+// fusion a net loss (device 4789 vs 4707 ms). Three-way dynamic buffer selection on
+// the hottest path is the same mistake the abandoned g4.comp made. Here the row's
+// tensor is uniform across the workgroup, so the branch is taken once and each arm
+// runs the same loop against a statically-known buffer.
+//
+// Row space is the concatenation [0,R0) + [R0,R0+R1) + [R0+R1,R0+R1+R2). One
+// workgroup of 64 owns one row of the concatenated space.
+//
+// PTQ1_0 block = 128 weights in 28 bytes: 26 trit bytes then an fp16 scale at
+// bytes 26..27. Each trit byte carries five base-3 digits (3^5 = 243 < 256):
+//   bytes  0..15 -> trits j, 16+j, 32+j, 48+j, 64+j        (j = 0..15)
+//   bytes 16..23 -> trits 80+j, 88+j, 96+j, 104+j, 112+j   (j = 0..7)
+//   bytes 24..25 -> trits 120+j, 122+j, 124+j, 126+j       (j = 0..1)
+//
+// Push: { int R0; int R1; int R2; int C; }
+// Bindings: 0 W0 1 Y0 2 W1 3 Y1 4 W2 5 Y2 6 X
+#version 450
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer W0B { uint W0[]; };
+layout(set = 0, binding = 1) buffer Y0B { float Y0[]; };
+layout(set = 0, binding = 2) readonly buffer W1B { uint W1[]; };
+layout(set = 0, binding = 3) buffer Y1B { float Y1[]; };
+layout(set = 0, binding = 4) readonly buffer W2B { uint W2[]; };
+layout(set = 0, binding = 5) buffer Y2B { float Y2[]; };
+layout(set = 0, binding = 6) readonly buffer XB { float x[]; };
+
+layout(push_constant) uniform PC { int R0; int R1; int R2; int C; } pc;
+
+shared float sh[64];
+shared uint tl[256];
+
+const uint P3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
+
+// One row of one tensor. `w` is the tensor's packed blocks, `bpr` its blocks per row.
+// Written as a macro so the buffer is statically known in each expansion.
+#define DECODE_ROW(W, ROW, BPR, NTB)                                        \
+    float acc = 0.0;                                                        \
+    for (int bi = lane; bi < (NTB); bi += 64) {                             \
+        int blk = bi / 26;                                                  \
+        int off = bi - blk * 26;                                            \
+        int w0 = ((ROW) * (BPR) + blk) * 28 + off;                          \
+        uint raw = (W[w0 >> 2] >> (8u * uint(w0 & 3))) & 0xFFu;             \
+        int s0 = ((ROW) * (BPR) + blk) * 28 + 26;                           \
+        uint dlo = (W[s0 >> 2] >> (8u * uint(s0 & 3))) & 0xFFu;             \
+        uint dhi = (W[(s0 + 1) >> 2] >> (8u * uint((s0 + 1) & 3))) & 0xFFu; \
+        float s = unpackHalf2x16(dlo | (dhi << 8)).x;                       \
+        int base = blk << 7;                                                \
+        uint pk = tl[raw];                                                  \
+        float sub = 0.0;                                                    \
+        if (off < 16) {                                                     \
+            for (int n = 0; n < 5; ++n) {                                   \
+                int tr = int((pk >> (2 * n)) & 3u);                         \
+                sub += float(tr - 1) * x[base + off + (n << 4)];            \
+            }                                                               \
+        } else if (off < 24) {                                              \
+            int j = off - 16;                                               \
+            for (int n = 0; n < 5; ++n) {                                   \
+                int tr = int((pk >> (2 * n)) & 3u);                         \
+                sub += float(tr - 1) * x[base + 80 + j + (n << 3)];         \
+            }                                                               \
+        } else {                                                            \
+            int j = off - 24;                                               \
+            for (int n = 0; n < 4; ++n) {                                   \
+                int tr = int((pk >> (2 * n)) & 3u);                         \
+                sub += float(tr - 1) * x[base + 120 + (n << 1) + j];        \
+            }                                                               \
+        }                                                                   \
+        acc += s * sub;                                                     \
+    }
+
+// Tree reduction, identical to g5ptq_byte, so results are bit-identical.
+#define REDUCE_STORE(Y, ROW)                                                \
+    sh[lane] = acc;                                                         \
+    barrier();                                                              \
+    for (int st = 32; st > 0; st >>= 1) {                                   \
+        if (lane < st) sh[lane] += sh[lane + st];                           \
+        barrier();                                                          \
+    }                                                                       \
+    if (lane == 0) (Y)[ROW] = sh[0];
+
+void main() {
+    int gid = int(gl_WorkGroupID.x);
+    int R0 = pc.R0, R1 = pc.R1, R2 = pc.R2;
+    if (gid >= R0 + R1 + R2) return;
+
+    int lane = int(gl_LocalInvocationID.x);
+    int C = pc.C;
+    int bpr = C >> 7;            // 128-weight blocks per row
+    int ntb = bpr * 26;          // trit-bearing bytes per row (26 of the 28)
+
+    // The byte -> 5-trit table. Identical for every row, rebuilt per workgroup.
+    for (int e = lane; e < 256; e += 64) {
+        uint b = uint(e), pk = 0u;
+        for (int n = 0; n < 5; ++n) {
+            uint tr = (((b * P3[n]) & 0xFFu) * 3u) >> 8;
+            pk |= tr << (2 * n);
+        }
+        tl[e] = pk;
+    }
+    barrier();
+
+    // One branch for the whole workgroup, then a statically-known buffer.
+    if (gid < R0) {
+        int row = gid;
+        DECODE_ROW(W0, row, bpr, ntb)
+        REDUCE_STORE(Y0, row)
+    } else if (gid < R0 + R1) {
+        int row = gid - R0;
+        DECODE_ROW(W1, row, bpr, ntb)
+        REDUCE_STORE(Y1, row)
+    } else {
+        int row = gid - R0 - R1;
+        DECODE_ROW(W2, row, bpr, ntb)
+        REDUCE_STORE(Y2, row)
+    }
+}

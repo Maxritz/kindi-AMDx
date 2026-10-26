@@ -40,6 +40,51 @@ host total     : 12.44 ms
 Per token: **device 10.4 ms, inter-dispatch drain 21.6 ms, host 0.3 ms.**
 Wall marginal 27.5 ms/token.
 
+## Fusing sibling projections: 1.5%, because only 6% of dispatches are siblings
+
+The obvious next move after the barrier result was to fuse same-input projections into
+one dispatch. `g5ptq_byte3` does that for up to three PTQ1_0 tensors: concatenated row
+space, one 64-thread workgroup per row, same decode and same tree reduction as
+`g5ptq_byte`, so results are bit-identical (`--selftest` asserts 0.000e+00 on all three
+outputs). It fires on `attn_q`/`attn_k`/`attn_v` and on `attn_qkv`/`attn_gate`.
+
+| | dispatches | device | wall | tok/s |
+|---|---|---|---|---|
+| separate launches | 26660 | 4707 ms | 6114 ms | 3.271 |
+| fused, per-byte buffer select | 25060 | 4789 ms | 6082 ms | 3.288 |
+| fused, branch hoisted | 25060 | 4728 ms | 6007 ms | 3.329 |
+
+Two things to learn from this.
+
+**The dynamic buffer select is expensive.** The first version picked the tensor per byte
+with `(t==0) ? W0[i] : (t==1) ? W1[i] : W2[i]`, and measured 772 us/op against 563 for
+the single-tensor shader, making fusion a net loss on device time. That is the same
+mistake the abandoned `g4.comp` made. The row's tensor is uniform across the workgroup,
+so the branch belongs outside the loop; hoisting it to three static arms took the fused
+kernel to 722 us/op and recovered 61 ms.
+
+**But the ceiling is low.** Fusion removes 1600 of 26660 dispatches, 6%. At the measured
+44 us per dispatch that is ~70 ms, and the observed wall gain is 107 ms. Roughly
+proportional, as the barrier experiment predicted.
+
+The reason the ceiling is low is the shape of the workload, not the implementation:
+
+| | dispatches/token | device ms/token | barrier cost at 44 us |
+|---|---|---|---|
+| `g5ptq_byte` (the GEMVs) | 401 | 225.7 | 17.6 ms |
+| everything else | 932 | 9.7 | 41.0 ms |
+
+The 932 non-GEMV dispatches do 9.7 ms of work and pay 41 ms of barrier. The worst
+offender is `fwht_hi`: 257 dispatches per token at 3.6 us each, because `fold_hi` is
+called from both `rmsfold` and `smfold` and is a separate dispatch each time. That is
+11.3 ms/token of drain for 0.9 ms/token of work.
+
+**So the barrier cost is dominated by the many small shaders, not the big GEMVs.** Fusing
+projections was the intuitive target and it was the wrong one. The right target is
+merging `fold_hi` into `rmsfold`/`smfold` (which already have the data in registers) and
+the other small continuations: `gdn_gates` into `gdn_conv`, `rope` into the norm, and
+`attn_comb` into `attn_vg`. Those are 500+ dispatches per token at 44 us each.
+
 ## Barriers: 1180 ms of wall time, and why narrowing them does not help
 
 Wall was 6100 ms against device 4707 ms, leaving a 1393 ms gap that the host code could

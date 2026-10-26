@@ -1056,6 +1056,10 @@ int main(int argc, char**argv){
     //   KINDI_G5=byte4 -> g5ptq_byte4 (4 rows per 256-thread workgroup, subgroupAdd)
     // Unset keeps the shipped g5ptq. Used to attribute the gap to geometry vs decode.
     Pipe pg5b =mkpipe((shdir+"/g5ptq_byte.comp.spv").c_str(),3,8);
+    // Up to three PTQ1_0 tensors sharing one input, in one launch. Same decode and
+    // same tree reduction as g5ptq_byte, so the values are bit-identical and the
+    // spec bit-identity guarantee still holds.
+    Pipe pg5b3=mkpipe((shdir+"/g5ptq_byte3.comp.spv").c_str(),7,16);
     Pipe pg5b4=mkpipe((shdir+"/g5ptq_byte4.comp.spv").c_str(),3,8);
     Pipe pg5M=mkpipe((shdir+"/g5ptqM.comp.spv").c_str(),3,16);  // batched native PTQ1_0
     Pipe pdeq5=mkpipe((shdir+"/deq_emb5.comp.spv").c_str(),3,12);
@@ -1297,6 +1301,40 @@ int main(int argc, char**argv){
         dispatch(pg4m,G.q0,G.cp,(uint32_t)((total+3)/4),1,1,&pc,16);
         return true;
     };
+    // Up to three PTQ1_0 tensors with the SAME input in one launch. This is the
+    // 5-trit counterpart of gemv3, which never fires here because it requires
+    // scalebufs and excludes native_names. Removing the barriers between sibling
+    // projections is the only lever that works: narrowing a barrier's scope was
+    // measured at 0% (PERFORMANCE.md), because a COMPUTE to COMPUTE barrier drains
+    // the producer regardless of its access masks. Fusing removes the dispatch.
+    auto gemv3n=[&](Buf&xbuf, const std::string&n0, Buf*o0,
+                              const std::string&n1, Buf*o1,
+                              const std::string&n2, Buf*o2)->bool{
+        auto usable=[&](const std::string&n){ return !n.empty() && native_names.count(n)
+                    && tinfo.count(n); };
+        std::vector<std::string> ns; std::vector<Buf*> os;
+        for(int i=0;i<3;++i){
+            const std::string&n = i==0?n0:(i==1?n1:n2);
+            Buf*o = i==0?o0:(i==1?o1:o2);
+            if(n.empty()) continue;
+            if(!usable(n)) return false;
+            if(!ns.empty() && tinfo[n].second != tinfo[ns[0]].second) return false;
+            ns.push_back(n); os.push_back(o);
+        }
+        if(ns.size()<2) return false;
+        const int C = tinfo[ns[0]].second;
+        int R[3]={0,0,0};
+        for(size_t i=0;i<ns.size();++i) R[i]=tinfo[ns[i]].first;
+        std::vector<Buf> bufs={
+            codebufs[ns[0]], *os[0],
+            codebufs[ns.size()>1?ns[1]:ns[0]], *(os.size()>1?os[1]:os[0]),
+            codebufs[ns.size()>2?ns[2]:ns[0]], *(os.size()>2?os[2]:os[0]),
+            xbuf };
+        bindbufs(pg5b3,bufs);
+        struct{int R0,R1,R2,C;}pc{R[0],R[1],R[2],C};
+        dispatch(pg5b3,G.q0,G.cp,(uint32_t)(R[0]+R[1]+R[2]),1,1,&pc,16);
+        return true;
+    };
     // T tokens against ONE weight stream (g4lutM). x is token-major [T][C], y is [T][R].
     // With T=1 this is arithmetically identical to gemv on the 4-trit path, which is the
     // regression gate for the batched path.
@@ -1429,7 +1467,8 @@ int main(int argc, char**argv){
         // by default, and 1920 of 26660 barriers is only 7% of them, so the linear
         // ceiling for this approach is about 694 ms of the 1180 ms NO_BARRIER win.
         const bool g5sib = getenv("KINDI_SIB_BARRIER") != nullptr;
-        if(!gemv3(xp, p+"attn_qkv.weight",&qkv, p+"attn_gate.weight",&zv, "", nullptr)){
+        if(!gemv3(xp, p+"attn_qkv.weight",&qkv, p+"attn_gate.weight",&zv, "", nullptr)
+           && !gemv3n(xp, p+"attn_qkv.weight",&qkv, p+"attn_gate.weight",&zv, "", nullptr)){
             if(g5sib){
                 // gemv() ends in dispatch(); set the flag so the first one keeps its
                 // barrier (it follows the norm) and the second does not need one.
@@ -1522,7 +1561,8 @@ int main(int argc, char**argv){
     auto attn=[&](int il, int pos, int kvi){
         std::string p="blk."+std::to_string(il)+".";
         rmsfold(h, part, h2, xn, xp, p+"attn_norm.weight", D, HB);
-        if(!gemv3(xp, p+"attn_q.weight",&qn, p+"attn_k.weight",&kro, p+"attn_v.weight",&qkvbuf)){
+        if(!gemv3(xp, p+"attn_q.weight",&qn, p+"attn_k.weight",&kro, p+"attn_v.weight",&qkvbuf)
+           && !gemv3n(xp, p+"attn_q.weight",&qn, p+"attn_k.weight",&kro, p+"attn_v.weight",&qkvbuf)){
             gemv(p+"attn_q.weight", xp, qn);
             gemv(p+"attn_k.weight", xp, kro);
             gemv(p+"attn_v.weight", xp, qkvbuf);
@@ -2405,6 +2445,35 @@ int main(int argc, char**argv){
                 fprintf(stderr,"selftest PTQ1_0 byte: %s\n", o5b ? "PASS (bit-identical)" : "FAIL");
                 ok = ok && o5b;
                 freebuf(z1); freebuf(z2);
+
+                // The fused 3-tensor shader must equal three separate launches.
+                // Same tensor in all three slots is the strongest form of the check:
+                // any row/offset mixup in the concatenated row space shows up here.
+                Buf fu1=mkbuf((VkDeviceSize)R*4,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                Buf fu2=mkbuf((VkDeviceSize)R*4,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                Buf fu3=mkbuf((VkDeviceSize)R*4,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                Buf fu0=mkbuf((VkDeviceSize)R*4,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                { std::vector<Buf> b={codebufs[n5],xb,fu0}; bindbufs(pg5b,b);
+                  struct{int R,C;}pc{R,C}; dispatch(pg5b,G.q0,G.cp,(uint32_t)R,1,1,&pc,8); }
+                batch_flush();
+                { std::vector<Buf> b={codebufs[n5],fu1,codebufs[n5],fu2,codebufs[n5],fu3,xb};
+                  bindbufs(pg5b3,b);
+                  struct{int R0,R1,R2,C;}pc{R,R,R,C};
+                  dispatch(pg5b3,G.q0,G.cp,(uint32_t)(3*R),1,1,&pc,16); }
+                batch_flush();
+                auto v0=rd(fu0,R), v1=rd(fu1,R), v2=rd(fu2,R), v3=rd(fu3,R);
+                double fg1e=0,fg2e=0,fg3e=0;
+                for(int i=0;i<R;++i){
+                    double d;
+                    d=std::fabs(v0[i]-v1[i]); if(d>fg1e) fg1e=d;
+                    d=std::fabs(v0[i]-v2[i]); if(d>fg2e) fg2e=d;
+                    d=std::fabs(v0[i]-v3[i]); if(d>fg3e) fg3e=d;
+                }
+                fprintf(stderr,"selftest PTQ1_0 fused3: max|dy0|=%.3e |dy1|=%.3e |dy2|=%.3e\n", fg1e,fg2e,fg3e);
+                bool o5c = (fg1e == 0.0) && (fg2e == 0.0) && (fg3e == 0.0);
+                fprintf(stderr,"selftest PTQ1_0 fused3: %s\n", o5c ? "PASS (bit-identical)" : "FAIL");
+                ok = ok && o5c;
+                freebuf(fu0); freebuf(fu1); freebuf(fu2); freebuf(fu3);
             }
             freebuf(y1); freebuf(y2);
         }
