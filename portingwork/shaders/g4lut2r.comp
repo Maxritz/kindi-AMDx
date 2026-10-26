@@ -1,0 +1,117 @@
+// g4lut2r.comp - 4-trit GEMV, RPW rows per wave, float LUT.
+//
+// The 27B's 5-trit path got two wins that the 4-trit path never had:
+//
+//   1. a FLOAT LUT. g4lut2 stores the byte -> 4-trit table as four trits packed into a
+//      uint's four bytes, then does (shift, and, int->float, subtract 1) per trit. Four
+//      LDS loads of already-converted floats replace all sixteen integer ops.
+//   2. ROWS PER WAVE. One row per wave means each lane runs a single dependent
+//      accumulator and loads every x element for that row only. RPW rows share each x
+//      load and give the scheduler RPW independent FMA chains.
+//
+// Compiled per width (-DRPW=n) and selected from the device's wave size:
+// wave128 -> 1, wave64 -> 2, wave32 -> 4.
+//
+// Bit-identity: each row's accumulator sees the same FMAs in the same order as
+// g4lut2's, namely ((t0*x0 + t1*x1) + t2*x2) + t3*x3 per byte, accumulated over bytes.
+// The reduction stays subgroupAdd per wave, so each row's sum is bit-identical to what
+// g4lut2 produces. --selftest gates on it.
+//
+// 4-trit layout (same as g4lut2): one byte per 4 weights, 2 bits each, value 0/1/2
+// meaning weight -1/0/+1. codes is a packed uint array (4 bytes per uint); scales is
+// one fp16 bit pattern per 128-weight block.
+//
+// Push: { int R; int C; }
+// Bindings: 0 codes, 1 scales, 2 x, 3 y
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#ifndef RPW
+#define RPW 2
+#endif
+#define WGS 256
+#define NSUB (WGS / 64)
+
+layout(local_size_x = WGS) in;
+
+layout(set = 0, binding = 0) readonly buffer CB { uint codes[]; };
+layout(set = 0, binding = 1) readonly buffer SB { uint scales[]; };
+layout(set = 0, binding = 2) readonly buffer XB { float x[]; };
+layout(set = 0, binding = 3) buffer YB { float y[]; };
+
+layout(push_constant) uniform PC { int R; int C; } pc;
+
+// trit - 1 as a float, four per byte: 4 KB of LDS.
+shared float lutf[1024];
+
+const uint P3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    int R = pc.R, C = pc.C;
+
+    // byte -> 4 trit floats, one entry per thread
+    if (tid < 256u) {
+        uint b = tid;
+        lutf[b * 4u + 0u] = float(int(b % 3u) - 1);
+        lutf[b * 4u + 1u] = float(int((b / 3u) % 3u) - 1);
+        lutf[b * 4u + 2u] = float(int((b / 9u) % 3u) - 1);
+        lutf[b * 4u + 3u] = float(int((b / 27u) % 3u) - 1);
+    }
+    barrier();
+
+    uint sgsz = gl_SubgroupSize;
+    uint nsub = uint(gl_WorkGroupSize.x) / sgsz;
+    int sub = int(gl_SubgroupID);
+    uint lane = gl_SubgroupInvocationID;
+
+    int row0 = (int(gl_WorkGroupID.x) * int(nsub) + sub) * RPW;
+    int ra = row0, rb = row0 + 1;
+    // Clamp, never return: every invocation must reach every barrier().
+    bool ka = ra < R;
+    bool kb = (RPW >= 2) && (rb < R);
+    if (!ka) ra = 0;
+    if (!kb) rb = 0;
+
+    int nq     = C >> 7;          // 128-weight blocks per row (one fp16 scale each)
+    int nbytes = C >> 2;          // bytes per row (4 weights per byte)
+
+    float accA = 0.0, accB = 0.0;
+    for (int kb2 = int(lane); kb2 < nbytes; kb2 += int(sgsz)) {
+        uint biA = uint(ra) * uint(nbytes) + uint(kb2);
+        uint byteA = (codes[biA >> 2] >> (8u * (biA & 3u))) & 0xFFu;
+        float scA = unpackHalf2x16(scales[ra * nq + (kb2 >> 5)]).x;
+
+        uint byteB = 0u;
+        float scB = 0.0;
+        if (RPW >= 2) {
+            uint biB = uint(rb) * uint(nbytes) + uint(kb2);
+            byteB = (codes[biB >> 2] >> (8u * (biB & 3u))) & 0xFFu;
+            scB = unpackHalf2x16(scales[rb * nq + (kb2 >> 5)]).x;
+        }
+
+        int k = kb2 << 2;
+        float x0 = x[k], x1 = x[k + 1], x2 = x[k + 2], x3 = x[k + 3];
+
+        int bA = int(byteA) * 4;
+        // Same association as g4lut2: ((t0*x0 + t1*x1) + t2*x2) + t3*x3
+        float sA = ((lutf[bA + 0] * x0 + lutf[bA + 1] * x1)
+                  + lutf[bA + 2] * x2) + lutf[bA + 3] * x3;
+        accA += scA * sA;
+
+        if (RPW >= 2) {
+            int bB = int(byteB) * 4;
+            float sB = ((lutf[bB + 0] * x0 + lutf[bB + 1] * x1)
+                      + lutf[bB + 2] * x2) + lutf[bB + 3] * x3;
+            accB += scB * sB;
+        }
+    }
+
+    accA = subgroupAdd(accA);
+    if (RPW >= 2) accB = subgroupAdd(accB);
+    if (lane == 0u) {
+        if (ka) y[ra] = accA;
+        if (kb) y[rb] = accB;
+    }
+}

@@ -1,0 +1,122 @@
+// g4lutMr.comp - 4-trit GEMV, 4 tokens x RPW rows per wave. Prefill only.
+//
+// The 4-trit counterpart of g5ptq_pf2r, and the batched kernel chunked prefill uses for
+// the 2B. Two reuse axes composed:
+//
+//   across tokens: one weight decode feeds four accumulators (what g4lutM did)
+//   across rows:   one x load feeds RPW accumulators (what was missing)
+//
+// x is COLUMN-major [C][4] (xpose.comp produces it), so the four token values for one
+// column are contiguous and RPW*4 FMAs come from 4 loads. With token-major x the four
+// values are C floats apart, which measured 3.16x slower on the 5-trit path.
+//
+// This kernel is only valid for T == 4. Other token counts keep using g4lutM, which has
+// a generic T loop; the caller selects.
+//
+// Accumulators are explicit scalars: an array indexed by a runtime loop variable lands
+// in scratch memory on GCN.
+//
+// Compiled per width (-DRPW=n): wave128 -> 1, wave64 -> 2, wave32 -> 4.
+//
+// Bit-identity: each (row, token) accumulator sees the same FMAs in the same order as
+// g4lutM's, namely ((t0*x0 + t1*x1) + t2*x2) + t3*x3 per byte accumulated over bytes,
+// and the reduction stays subgroupAdd per wave.
+//
+// Push: { int R; int C; int T; int xstride; }   T must be 4; xstride unused
+// Bindings: 0 codes, 1 scales, 2 y ([4][R]), 3 x ([C][4])   same order as g4lutM
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#ifndef RPW
+#define RPW 2
+#endif
+#define WGS 256
+#define NSUB (WGS / 64)
+
+layout(local_size_x = WGS) in;
+
+layout(set = 0, binding = 0) readonly buffer CB { uint codes[]; };
+layout(set = 0, binding = 1) readonly buffer SB { uint scales[]; };
+layout(set = 0, binding = 2) buffer YB { float Y[]; };
+layout(set = 0, binding = 3) readonly buffer XB { float X[]; };
+
+layout(push_constant) uniform PC { int R; int C; int T; int xstride; } pc;
+
+shared float lutf[1024];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    int R = pc.R, C = pc.C;
+
+    if (tid < 256u) {
+        uint b = tid;
+        lutf[b * 4u + 0u] = float(int(b % 3u) - 1);
+        lutf[b * 4u + 1u] = float(int((b / 3u) % 3u) - 1);
+        lutf[b * 4u + 2u] = float(int((b / 9u) % 3u) - 1);
+        lutf[b * 4u + 3u] = float(int((b / 27u) % 3u) - 1);
+    }
+    barrier();
+
+    uint sgsz = gl_SubgroupSize;
+    uint nsub = uint(gl_WorkGroupSize.x) / sgsz;
+    int sub = int(gl_SubgroupID);
+    uint lane = gl_SubgroupInvocationID;
+
+    int nq = C >> 7;
+    int nbytes = C >> 2;
+
+    int row0 = (int(gl_WorkGroupID.x) * int(nsub) + sub) * RPW;
+    int ra = row0, rb = row0 + 1;
+    bool ka = ra < R;
+    bool kb = (RPW >= 2) && (rb < R);
+    if (!ka) ra = 0;
+    if (!kb) rb = 0;
+
+    float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+    float b0 = 0.0, b1 = 0.0, b2 = 0.0, b3 = 0.0;
+
+    for (int kbi = int(lane); kbi < nbytes; kbi += int(sgsz)) {
+        uint biA = uint(ra) * uint(nbytes) + uint(kbi);
+        uint byteA = (codes[biA >> 2] >> (8u * (biA & 3u))) & 0xFFu;
+        float scA = unpackHalf2x16(scales[ra * nq + (kbi >> 5)]).x;
+        uint byteB = 0u; float scB = 0.0;
+        if (RPW >= 2) {
+            uint biB = uint(rb) * uint(nbytes) + uint(kbi);
+            byteB = (codes[biB >> 2] >> (8u * (biB & 3u))) & 0xFFu;
+            scB = unpackHalf2x16(scales[rb * nq + (kbi >> 5)]).x;
+        }
+
+        int k = kbi << 2;
+        // column-major [C][4]: x[col*4 + token]
+        float x00 = X[k * 4 + 0],     x01 = X[k * 4 + 1],     x02 = X[k * 4 + 2],     x03 = X[k * 4 + 3];
+        float x10 = X[(k+1) * 4 + 0], x11 = X[(k+1) * 4 + 1], x12 = X[(k+1) * 4 + 2], x13 = X[(k+1) * 4 + 3];
+        float x20 = X[(k+2) * 4 + 0], x21 = X[(k+2) * 4 + 1], x22 = X[(k+2) * 4 + 2], x23 = X[(k+2) * 4 + 3];
+        float x30 = X[(k+3) * 4 + 0], x31 = X[(k+3) * 4 + 1], x32 = X[(k+3) * 4 + 2], x33 = X[(k+3) * 4 + 3];
+
+        int bA = int(byteA) * 4;
+        float w0 = lutf[bA + 0], w1 = lutf[bA + 1], w2 = lutf[bA + 2], w3 = lutf[bA + 3];
+        a0 += scA * (((w0 * x00 + w1 * x10) + w2 * x20) + w3 * x30);
+        a1 += scA * (((w0 * x01 + w1 * x11) + w2 * x21) + w3 * x31);
+        a2 += scA * (((w0 * x02 + w1 * x12) + w2 * x22) + w3 * x32);
+        a3 += scA * (((w0 * x03 + w1 * x13) + w2 * x23) + w3 * x33);
+
+        if (RPW >= 2) {
+            int bB = int(byteB) * 4;
+            float v0 = lutf[bB + 0], v1 = lutf[bB + 1], v2 = lutf[bB + 2], v3 = lutf[bB + 3];
+            b0 += scB * (((v0 * x00 + v1 * x10) + v2 * x20) + v3 * x30);
+            b1 += scB * (((v0 * x01 + v1 * x11) + v2 * x21) + v3 * x31);
+            b2 += scB * (((v0 * x02 + v1 * x12) + v2 * x22) + v3 * x32);
+            b3 += scB * (((v0 * x03 + v1 * x13) + v2 * x23) + v3 * x33);
+        }
+    }
+
+    a0 = subgroupAdd(a0); a1 = subgroupAdd(a1);
+    a2 = subgroupAdd(a2); a3 = subgroupAdd(a3);
+    b0 = subgroupAdd(b0); b1 = subgroupAdd(b1);
+    b2 = subgroupAdd(b2); b3 = subgroupAdd(b3);
+    if (lane == 0u) {
+        if (ka) { Y[ra] = a0; Y[R + ra] = a1; Y[2 * R + ra] = a2; Y[3 * R + ra] = a3; }
+        if (kb) { Y[rb] = b0; Y[R + rb] = b1; Y[2 * R + rb] = b2; Y[3 * R + rb] = b3; }
+    }
+}

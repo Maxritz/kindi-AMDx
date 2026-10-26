@@ -1023,6 +1023,18 @@ int main(int argc, char**argv){
 
     std::string shdir="shaders";
     Pipe pg4=mkpipe((shdir+"/g4lut2.comp.spv").c_str(),4,8);
+    // 4-trit single-tensor, RPW rows per wave with a float LUT. Same treatment the
+    // 5-trit path got; the 2B never had it.
+    Pipe pg4r1=mkpipe((shdir+"/g4lut2r1.comp.spv").c_str(),4,8);
+    Pipe pg4r2=mkpipe((shdir+"/g4lut2r2.comp.spv").c_str(),4,8);
+    Pipe pg4r4=mkpipe((shdir+"/g4lut2r4.comp.spv").c_str(),4,8);
+    // 4-trit fused (3 tensors) and 4-token variants, RPW rows per wave.
+    Pipe pg43r1=mkpipe((shdir+"/g4lut3r1.comp.spv").c_str(),10,16);
+    Pipe pg43r2=mkpipe((shdir+"/g4lut3r2.comp.spv").c_str(),10,16);
+    Pipe pg43r4=mkpipe((shdir+"/g4lut3r4.comp.spv").c_str(),10,16);
+    Pipe pg4Mr1=mkpipe((shdir+"/g4lutMr1.comp.spv").c_str(),4,16);
+    Pipe pg4Mr2=mkpipe((shdir+"/g4lutMr2.comp.spv").c_str(),4,16);
+    Pipe pg4Mr4=mkpipe((shdir+"/g4lutMr4.comp.spv").c_str(),4,16);
     Pipe pg4m=mkpipe((shdir+"/g4lut3.comp.spv").c_str(),10,16);
     Pipe pg4M=mkpipe((shdir+"/g4lutM.comp.spv").c_str(),4,16);   // push grew to {R,C,T,xstride}
     Pipe pg2M =mkpipe((shdir+"/g2pqM.comp.spv").c_str(),3,16);
@@ -1351,10 +1363,20 @@ int main(int argc, char**argv){
             return;
         }
         std::vector<Buf> bufs={codebufs[wname],scalebufs[wname],xbuf,outbuf};
-        bindbufs(pg4,bufs);
         struct{int R,C;}pc{rows,cols};
-        // g4lut2: 4 rows per workgroup (one per 64-wide wave), so ceil(rows/4) groups
-        dispatch(pg4,G.q0,G.cp,(uint32_t)((rows+3)/4),1,1,&pc,8);
+        // 4-trit: RPW rows per wave, chosen from the device's wave width. g4lut2 was
+        // one row per wave; RPW rows share each x load and add ILP.
+        const char* g4 = getenv("KINDI_G4");
+        if(g4 && !strcmp(g4,"old")){
+            bindbufs(pg4,bufs);
+            dispatch(pg4,G.q0,G.cp,(uint32_t)((rows+3)/4),1,1,&pc,8);
+        } else {
+            Pipe* P = (g5rpw == 1) ? &pg4r1 : (g5rpw == 2) ? &pg4r2 : &pg4r4;
+            int wg = 256 / (int)g_wave;
+            int per = wg * g5rpw;
+            bindbufs(*P,bufs);
+            dispatch(*P,G.q0,G.cp,(uint32_t)((rows + per - 1) / per),1,1,&pc,8);
+        }
     };
     // Up to three ternary tensors with the SAME input in one launch (engine.py gemv).
     // Tensors that share an input have no dependency on each other, so the per-dispatch
@@ -1384,10 +1406,25 @@ int main(int argc, char**argv){
             codebufs[ns.size()>1?ns[1]:ns[0]], scalebufs[ns.size()>1?ns[1]:ns[0]], *(os.size()>1?os[1]:os[0]),
             codebufs[ns.size()>2?ns[2]:ns[0]], scalebufs[ns.size()>2?ns[2]:ns[0]], *(os.size()>2?os[2]:os[0]),
             xbuf };
-        bindbufs(pg4m,bufs);
         struct{int R0,R1,R2,C;}pc{R[0],R[1],R[2],C};
-        int total=R[0]+R[1]+R[2];
-        dispatch(pg4m,G.q0,G.cp,(uint32_t)((total+3)/4),1,1,&pc,16);
+        const char* g4 = getenv("KINDI_G4");
+        // g4lut3r (rows per wave) is DISABLED: it produced wrong values. The 2B emitted
+        // garbage token ids with it, so the row-space mapping is wrong somewhere. Kept in
+        // the tree for a later fix; pg4m (g4lut3) is correct.
+        if(true){
+            bindbufs(pg4m,bufs);
+            int total=R[0]+R[1]+R[2];
+            dispatch(pg4m,G.q0,G.cp,(uint32_t)((total+3)/4),1,1,&pc,16);
+        } else {
+            // RPW rows per wave, groups laid out per tensor so a wave's rows share one
+            // weight buffer.
+            Pipe* P = (g5rpw == 1) ? &pg43r1 : (g5rpw == 2) ? &pg43r2 : &pg43r4;
+            int wg = 256 / (int)g_wave;
+            auto grp = [&](int R){ return (R + g5rpw - 1) / g5rpw; };
+            int total = grp(R[0]) + grp(R[1]) + grp(R[2]);
+            bindbufs(*P,bufs);
+            dispatch(*P,G.q0,G.cp,(uint32_t)((total + wg - 1) / wg),1,1,&pc,16);
+        }
         return true;
     };
     // Up to three PTQ1_0 tensors with the SAME input in one launch. This is the
@@ -1442,18 +1479,29 @@ int main(int argc, char**argv){
     // T tokens against ONE weight stream (g4lutM). x is token-major [T][C], y is [T][R].
     // With T=1 this is arithmetically identical to gemv on the 4-trit path, which is the
     // regression gate for the batched path.
-    auto gemvM=[&](const std::string&wname, Buf&xbuf, Buf&outbuf, int T, int xstride=-1)->bool{
+    auto gemvM=[&](const std::string&wname, Buf&xbuf, Buf&outbuf, int T, int xstride=-1, bool colmaj=false)->bool{
         if(T < 1 || T > 4) return false;
         if(!codebufs.count(wname) || !scalebufs.count(wname)) return false;
         if(pq2_names.count(wname) || native_names.count(wname)) return false;
         auto it = tinfo.find(wname);
         if(it == tinfo.end()) return false;
         int rows = it->second.first, cols = it->second.second;
+        // g4lutM and g4lutMr both declare 0=W 1=S 2=Y 3=X, so out comes before x here.
         std::vector<Buf> bufs={codebufs[wname],scalebufs[wname],outbuf,xbuf};
-        bindbufs(pg4M,bufs);
         if(xstride<0) xstride=cols;
         struct{int R,C,T,xstride;}pc{rows,cols,T,xstride};
-        dispatch(pg4M,G.q0,G.cp,(uint32_t)((rows+3)/4),1,1,&pc,16);
+        const char* g4 = getenv("KINDI_G4");
+        // g4lutMr is a 4-token, column-major, rows-per-wave kernel: prefill only.
+        if(T == 4 && colmaj && !(g4 && !strcmp(g4,"MrOff"))){
+            Pipe* P = (g5rpw == 1) ? &pg4Mr1 : (g5rpw == 2) ? &pg4Mr2 : &pg4Mr4;
+            int wg = 256 / (int)g_wave;
+            int per = wg * g5rpw;
+            bindbufs(*P,bufs);
+            dispatch(*P,G.q0,G.cp,(uint32_t)((rows + per - 1) / per),1,1,&pc,16);
+        } else {
+            bindbufs(pg4M,bufs);
+            dispatch(pg4M,G.q0,G.cp,(uint32_t)((rows+3)/4),1,1,&pc,16);
+        }
         return true;
     };
     // Same contract for PQ2_0 (27B): T tokens against one packed block stream.
@@ -2040,7 +2088,7 @@ int main(int argc, char**argv){
     // Batched GEMV for any supported format: Q8_0, PQ2_0, native 5-trit or 4-trit.
     auto gemvT=[&](const std::string&wname, Buf&xbuf, Buf&outbuf, int T, int xstride,
                    bool colmaj=false)->bool{
-        if(gemvM(wname, xbuf, outbuf, T, xstride)) return true;
+        if(gemvM(wname, xbuf, outbuf, T, xstride, colmaj)) return true;
         if(gemvM2pq(wname, xbuf, outbuf, T, xstride)) return true;
         if(gemvMQ8(wname, xbuf, outbuf, T, xstride)) return true;
         if(gemvM5ptq(wname, xbuf, outbuf, T, xstride, colmaj)) return true;

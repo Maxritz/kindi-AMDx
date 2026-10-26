@@ -1,0 +1,125 @@
+// g4lut3r.comp - 4-trit GEMV, up to THREE tensors sharing one input, RPW rows per wave.
+//
+// The 4-trit counterpart of g5ptq_byte3nr: fusion and rows-per-wave together.
+//
+//   fusion: three tensors that read the same x in ONE dispatch, so the barrier between
+//           them disappears
+//   RPW:    the same x load feeds RPW row accumulators
+//   float LUT: byte -> four trit floats in LDS, so the inner loop is LDS loads and FMAs
+//           instead of (shift, and, int->float, subtract) per trit
+//
+// Groups are laid out per tensor so a wave's RPW rows always share one weight buffer.
+// The tensor branch is taken once per wave; a 3-way buffer select inside the inner loop
+// cost 772 us/op against 563 in an earlier version of the 5-trit kernel.
+//
+// Compiled per width (-DRPW=n), selected from the device's wave size:
+// wave128 -> 1, wave64 -> 2, wave32 -> 4.
+//
+// Bit-identity: each row's accumulator sees the same FMAs in the same order as
+// g4lut3's, and the reduction stays subgroupAdd per wave.
+//
+// Push: { int R0; int R1; int R2; int C; }
+// Bindings: 0 W0 1 S0 2 Y0 3 W1 4 S1 5 Y1 6 W2 7 S2 8 Y2 9 X
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#ifndef RPW
+#define RPW 2
+#endif
+#define WGS 256
+#define NSUB (WGS / 64)
+
+layout(local_size_x = WGS) in;
+
+layout(set = 0, binding = 0) readonly buffer W0B { uint W0[]; };
+layout(set = 0, binding = 1) readonly buffer S0B { uint S0[]; };
+layout(set = 0, binding = 2) buffer Y0B { float Y0[]; };
+layout(set = 0, binding = 3) readonly buffer W1B { uint W1[]; };
+layout(set = 0, binding = 4) readonly buffer S1B { uint S1[]; };
+layout(set = 0, binding = 5) buffer Y1B { float Y1[]; };
+layout(set = 0, binding = 6) readonly buffer W2B { uint W2[]; };
+layout(set = 0, binding = 7) readonly buffer S2B { uint S2[]; };
+layout(set = 0, binding = 8) buffer Y2B { float Y2[]; };
+layout(set = 0, binding = 9) readonly buffer XB { float x[]; };
+
+layout(push_constant) uniform PC { int R0; int R1; int R2; int C; } pc;
+
+shared float lutf[1024];
+
+// One tensor's RPW rows. W = codes, S = scales, Y = out, G = group index, RR = rows.
+#define DO_TENSOR(W, S, Y, G, RR, NQ, NBYTES)                                 \
+    {                                                                         \
+        int base_row = (G) * RPW;                                             \
+        int ra = base_row, rb = base_row + 1;                                 \
+        bool ka = ra < (RR), kb = (RPW >= 2) && (rb < (RR));                  \
+        if (!ka) ra = 0;                                                      \
+        if (!kb) rb = 0;                                                      \
+        float accA = 0.0, accB = 0.0;                                         \
+        for (int kbi = int(lane); kbi < (NBYTES); kbi += int(sgsz)) {         \
+            uint biA = uint(ra) * uint(NBYTES) + uint(kbi);                   \
+            uint byteA = (W[biA >> 2] >> (8u * (biA & 3u))) & 0xFFu;          \
+            float scA = unpackHalf2x16(S[ra * (NQ) + (kbi >> 5)]).x;          \
+            uint byteB = 0u; float scB = 0.0;                                 \
+            if (RPW >= 2) {                                                   \
+                uint biB = uint(rb) * uint(NBYTES) + uint(kbi);               \
+                byteB = (W[biB >> 2] >> (8u * (biB & 3u))) & 0xFFu;           \
+                scB = unpackHalf2x16(S[rb * (NQ) + (kbi >> 5)]).x;            \
+            }                                                                 \
+            int k = kbi << 2;                                                 \
+            float x0 = x[k], x1 = x[k + 1], x2 = x[k + 2], x3 = x[k + 3];     \
+            int bA = int(byteA) * 4;                                          \
+            float sA = ((lutf[bA + 0] * x0 + lutf[bA + 1] * x1)               \
+                      + lutf[bA + 2] * x2) + lutf[bA + 3] * x3;               \
+            accA += scA * sA;                                                 \
+            if (RPW >= 2) {                                                   \
+                int bB = int(byteB) * 4;                                      \
+                float sB = ((lutf[bB + 0] * x0 + lutf[bB + 1] * x1)           \
+                          + lutf[bB + 2] * x2) + lutf[bB + 3] * x3;           \
+                accB += scB * sB;                                             \
+            }                                                                 \
+        }                                                                     \
+        accA = subgroupAdd(accA);                                             \
+        if (RPW >= 2) accB = subgroupAdd(accB);                               \
+        if (lane == 0u) {                                                     \
+            if (ka) (Y)[ra] = accA;                                           \
+            if (kb) (Y)[rb] = accB;                                           \
+        }                                                                     \
+    }
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    int C = pc.C;
+
+    if (tid < 256u) {
+        uint b = tid;
+        lutf[b * 4u + 0u] = float(int(b % 3u) - 1);
+        lutf[b * 4u + 1u] = float(int((b / 3u) % 3u) - 1);
+        lutf[b * 4u + 2u] = float(int((b / 9u) % 3u) - 1);
+        lutf[b * 4u + 3u] = float(int((b / 27u) % 3u) - 1);
+    }
+    barrier();
+
+    uint sgsz = gl_SubgroupSize;
+    uint nsub = uint(gl_WorkGroupSize.x) / sgsz;
+    int sub = int(gl_SubgroupID);
+    uint lane = gl_SubgroupInvocationID;
+
+    int nq = C >> 7;
+    int nbytes = C >> 2;
+
+    int G0 = (pc.R0 + RPW - 1) / RPW;
+    int G1 = (pc.R1 + RPW - 1) / RPW;
+    int G2 = (pc.R2 + RPW - 1) / RPW;
+
+    int gid = int(gl_WorkGroupID.x) * int(nsub) + sub;
+
+    // One branch per wave, then a statically-known weight buffer.
+    if (gid < G0) {
+        DO_TENSOR(W0, S0, Y0, gid, pc.R0, nq, nbytes)
+    } else if (gid < G0 + G1) {
+        DO_TENSOR(W1, S1, Y1, gid - G0, pc.R1, nq, nbytes)
+    } else if (gid < G0 + G1 + G2) {
+        DO_TENSOR(W2, S2, Y2, gid - G0 - G1, pc.R2, nq, nbytes)
+    }
+}
