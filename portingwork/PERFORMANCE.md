@@ -79,11 +79,56 @@ offender is `fwht_hi`: 257 dispatches per token at 3.6 us each, because `fold_hi
 called from both `rmsfold` and `smfold` and is a separate dispatch each time. That is
 11.3 ms/token of drain for 0.9 ms/token of work.
 
-**So the barrier cost is dominated by the many small shaders, not the big GEMVs.** Fusing
-projections was the intuitive target and it was the wrong one. The right target is
-merging `fold_hi` into `rmsfold`/`smfold` (which already have the data in registers) and
-the other small continuations: `gdn_gates` into `gdn_conv`, `rope` into the norm, and
-`attn_comb` into `attn_vg`. Those are 500+ dispatches per token at 44 us each.
+I first concluded from that table that the barrier cost was dominated by the small
+shaders. **That was wrong, and the experiment that disproved it is below.** Barrier cost
+scales with the work in flight at the barrier, not with the barrier's existence.
+
+## Fusing ffn_gate/ffn_up, and why barrier count is the wrong metric
+
+Two more fusions were tried, and they disagree, which is the useful part.
+
+**ffn_gate + ffn_up, fused.** These are 128 dispatches per token, and they sit between
+two large GEMVs (17408 rows each). `gemv3n` now covers this site:
+
+| | dispatches | device | wall | tok/s |
+|---|---|---|---|---|
+| before | 25060 | 4728 ms | 6007 ms | 3.329 |
+| ffn pair fused | 23780 | 4723 ms | 5948 ms | 3.362 |
+
+**The second FWHT stage, folded inline. `KINDI_FOLD_INLINE=1`.** For HB > 512 (the 27B,
+HB=1024) the fold is two stages: `rmsfold`/`smfold`/`fold_fwht` do one unscaled 512-chunk
+FWHT, then `fwht_hi` is a *separate dispatch* that combines the chunks and scales. All
+three shaders already carry a generic-HB path that does the whole FWHT in one workgroup,
+so passing HB removes that dispatch entirely. It works, and it is token-identical:
+
+| | dispatches | device | wall | tok/s |
+|---|---|---|---|---|
+| two-stage (default) | 25060 | 4743 ms | 6038 ms | 3.312 |
+| inline, no fwht_hi | 19920 | 4802 ms | 6102 ms | 3.277 |
+
+5140 dispatches removed, 20% of the total, and wall got **worse**. Tokens identical
+either way, so it is a valid path, but it is not a win and it is opt-in.
+
+### What that pair of results means
+
+Removing 1280 barriers between large GEMVs bought 59 ms. Removing 5140 barriers after
+3.6 us shaders bought nothing, and cost 59 ms in device time because the generic HB path
+halves the workgroup count for the FWHT (5 workgroups instead of 10 for D=5120).
+
+So the per-barrier cost is not a constant. A barrier after a kernel that barely fills a
+36-CU card has nothing in flight to drain and is nearly free. A barrier between two
+kernels that both saturate the card forces a real drain and restart. The 44 us figure
+from `KINDI_NO_BARRIER` is the *average over all barriers* when every one is removed, and
+it does not predict what removing a subset will do.
+
+This also explains the sibling result: eliding two barriers per GDN layer bought 50 ms,
+because those sat between the large qkv/gate GEMVs.
+
+**Practical consequence: fuse between big kernels, not around small ones.** GEMV fusion
+is now exhausted, because the three same-input groups (q/k/v, qkv/gate, gate/up) are all
+fused and the remaining 129 GEMV dispatches per token are `ssm_out`, `attn_output`,
+`ffn_down` and the head, each of which is the sole consumer of its input and cannot be
+fused with anything.
 
 ## Barriers: 1180 ms of wall time, and why narrowing them does not help
 

@@ -1075,7 +1075,24 @@ int main(int argc, char**argv){
     // 512-point chunks (HB = -512) and fwht_hi then combines the HB/512 chunks and applies
     // 1/sqrt(HB). 2B has HB=512 (single stage); 27B has HB=1024 (needs the second stage).
     const int hbArg = (HB > 512) ? -512 : HB;
-    auto foldGrid=[&](int width){ int ch=(hbArg<0?512:hbArg); return width/ch; };
+    // The FWHT is split into two stages for models with HB > 512 (the 27B, HB=1024):
+    // rmsfold/smfold/fold_fwht do one unscaled 512-chunk FWHT, then fold_hi is a
+    // SEPARATE DISPATCH that combines the HB/512 chunks and scales by 1/sqrt(HB).
+    //
+    // That second dispatch is 257 per token (129 rmsfold + 48 gdn smfold + 16 attn
+    // fold_fwht + 64 ffn smfold) at the measured 44 us per dispatch barrier, which is
+    // 11.3 ms/token of drain for 0.9 ms/token of work.
+    //
+    // It is unnecessary: all three shaders already carry a generic-HB path that does
+    // the whole HB-point FWHT in one workgroup, in shared memory. A radix-2 FWHT with
+    // butterflies in increasing stride applies the h=512 butterfly (the chunk combine)
+    // last, which is exactly the decomposition the two-stage form spells out, so the
+    // summation order per output element is the same.
+    //
+    // KINDI_FOLD_TWO_STAGE=1 restores the old path for A/B.
+    const bool fold_two_stage = getenv("KINDI_FOLD_INLINE") == nullptr;
+    const int foldHB = fold_two_stage ? hbArg : HB;
+    auto foldGrid=[&](int width){ int ch=(foldHB<0?512:foldHB); return width/ch; };
     auto fold_hi=[&](Buf&buf, int width){
         if(HB <= 512) return;
         std::vector<Buf> bufs={buf};
@@ -1445,9 +1462,9 @@ int main(int argc, char**argv){
         std::vector<Buf> bufs={x,resbuf,xw,f32bufs[wname],sDb,xn,xo};
         bindbufs(prmsfold,bufs);
         (void)HBv;
-        struct{int Cc,add,HB;}pc{C,pending,hbArg};
+        struct{int Cc,add,HB;}pc{C,pending,foldHB};
         dispatch(prmsfold,G.q0,G.cp,foldGrid(C),1,1,&pc,12);
-        fold_hi(xo, C);
+        if(fold_two_stage) fold_hi(xo, C);
         if(pending>0){ std::swap(h,h2); }
         pending=0;
     };
@@ -1542,11 +1559,11 @@ int main(int argc, char**argv){
             // exactly smfold's src = hd + perm_hd*(nk + perm_nk*rep) with
             // perm_hd = HK = 128, perm_rep = NV/NK = 3, perm_nk = NK = 16.
             // The 2B has NV == NK, so perm_rep = 1 and the branch is identity there.
-            struct{int HB,phd,pnk,prep;}pc{hbArg, HK, NK, NV/NK};
+            struct{int HB,phd,pnk,prep;}pc{foldHB, HK, NK, NV/NK};
             dispatch(psmfold,G.q0,G.cp,foldGrid(NV*HK),1,1,&pc,16);
             if(dump&&il==0) dumpv("gdn_swiglu_unfolded",xp,NV*HK);
             if(il==0){ dumpfull("swiglu_unfolded",xp,NV*HK); }
-            fold_hi(xp, NV*HK);
+            if(fold_two_stage) fold_hi(xp, NV*HK);
             if(dump&&il==0) dumpv("gdn_folded",xp,NV*HK);
             if(il==0){ dumpfull("gdn_folded",xp,NV*HK); }
         }
@@ -1670,9 +1687,9 @@ int main(int argc, char**argv){
         {
             std::vector<Buf> bufs={att, sAb, xp};
             bindbufs(pfwh,bufs);
-            struct{int v;}pc{hbArg};
+            struct{int v;}pc{foldHB};
             dispatch(pfwh,G.q0,G.cp,foldGrid(NH*HD),1,1,&pc,4);
-            fold_hi(xp, NH*HD);
+            if(fold_two_stage) fold_hi(xp, NH*HD);
         }
         if(!gemvM(p+"attn_output.weight", xp, y, 1)) gemv(p+"attn_output.weight", xp, y);
         pending=1;
@@ -1682,7 +1699,8 @@ int main(int argc, char**argv){
     auto ffn=[&](int il){
         std::string p="blk."+std::to_string(il)+".";
         rmsfold(h, part, h2, xn, xp, p+"post_attention_norm.weight", D, HB);
-        if(!gemv3(xp, p+"ffn_gate.weight",&ffg, p+"ffn_up.weight",&ffu, "", nullptr)){
+        if(!gemv3(xp, p+"ffn_gate.weight",&ffg, p+"ffn_up.weight",&ffu, "", nullptr)
+           && !gemv3n(xp, p+"ffn_gate.weight",&ffg, p+"ffn_up.weight",&ffu, "", nullptr)){
             gemv(p+"ffn_gate.weight", xp, ffg);
             gemv(p+"ffn_up.weight", xp, ffu);
         }
@@ -1691,9 +1709,9 @@ int main(int argc, char**argv){
         {
             std::vector<Buf> bufs={ffg, ffu, sFb, fo6};
             bindbufs(psmfold,bufs);
-            struct{int HB,phd,pnk,prep;}pc{hbArg, 0, 0, 0};
+            struct{int HB,phd,pnk,prep;}pc{foldHB, 0, 0, 0};
             dispatch(psmfold,G.q0,G.cp,foldGrid(NFF),1,1,&pc,16);
-            fold_hi(fo6, NFF);
+            if(fold_two_stage) fold_hi(fo6, NFF);
         }
         if(dump&&il==0) dumpv("ffn_swiglu_folded",fo6,NFF);
         if(!gemvM(p+"ffn_down.weight", fo6, y, 1)) gemv(p+"ffn_down.weight", fo6, y);
@@ -1849,9 +1867,9 @@ int main(int argc, char**argv){
         {
             std::vector<Buf> bufs={mtp_hnorm, sDb, mtp_hfold};
             bindbufs(pfwh,bufs);
-            struct{int v;}pc{hbArg};
+            struct{int v;}pc{foldHB};
             dispatch(pfwh,G.q0,G.cp,foldGrid(D),1,1,&pc,4);
-            fold_hi(mtp_hfold, D);
+            if(fold_two_stage) fold_hi(mtp_hfold, D);
         }
         if(dumpvec&&pos==4) dumpfull("mtp_hfold4",mtp_hfold,D);
         gemv(head_name, mtp_hfold, mtp_logits);
