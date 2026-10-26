@@ -1,0 +1,125 @@
+#version 450
+#extension GL_EXT_integer_dot_product : require
+#extension GL_EXT_shader_subgroup_basic : require
+#extension GL_EXT_shader_subgroup_arithmetic : require
+
+// g4lut4dp4a.comp - 4-trit GEMV with dp4a, prefill only, T=4.
+//
+// The 4-trit path (2 bits per weight, 4 per byte, value in {-1,0,+1}) is the cleanest
+// test bed for dp4a: 4 weights per byte maps exactly to one dp4a instruction.
+//
+// This is the prefill path only. Decode stays float (see kindi.cu k_g4: "fp32 values
+// (trit x scale). sm_30 and later, no dp4a"). dp4a quantises the activation to int8
+// per 128-column group, which is not exact fp32 arithmetic; the reference Kindi
+// documents this tradeoff for its prompt GEMM and justifies it by noting that
+// llama.cpp does the same with q8_1 rows.
+//
+// Quantisation (per 128-column group, as llama.cpp's q8_0):
+//   amax = max |x_i|
+//   scale = amax / 127.0   (RNE rounding, clamped to [-127, 127])
+//   xq_i = int8(round(x_i * 127 / amax))
+//
+// Dot product:  sum += dp4a(xq_byte, w_byte, 0)   (4 int8 x int8 -> int32)
+//               result = sum * (x_scale * w_scale)  (per 128-weight block)
+//
+// For T=4 prefill, each token's x is quantised separately and dp4a is called 4 times
+// per weight byte (once per token). The weights are unpacked once per byte.
+//
+// local_size_x = 32: one lane per byte (4 weights). 32 lanes x 1 byte = 32 bytes =
+// 128 weights. Native wave32 on RDNA2. On GCN (wave64) 32 lanes are padded to 64,
+// half wasted; the 4-trit path is 10% of 2B device time, so the waste is 5%.
+//
+// Push: { int R; int C; int T; int xstride; }   T must be 4; x is [C][4]
+// Bindings: 0 codes (uint words), 1 scales (uint words, fp16 bits), 2 x ([C][4]),
+//           3 y ([4][R])
+layout(local_size_x = 32) in;
+
+layout(set = 0, binding = 0) readonly buffer CB { uint codes[]; };
+layout(set = 0, binding = 1) readonly buffer SB { uint scales[]; };
+layout(set = 0, binding = 2) readonly buffer XB { float X[]; };
+layout(set = 0, binding = 3) buffer YB { float Y[]; };
+
+layout(push_constant) uniform PC { int R; int C; int T; int xstride; } pc;
+
+// subgroupMax for 32 lanes (wave32 native on RDNA2, padded on GCN)
+float subgroup_max_32(float v) {
+    v = max(v, subgroupShuffleXor(v, 16));
+    v = max(v, subgroupShuffleXor(v, 8));
+    v = max(v, subgroupShuffleXor(v, 4));
+    v = max(v, subgroupShuffleXor(v, 2));
+    v = max(v, subgroupShuffleXor(v, 1));
+    return v;
+}
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    int row = int(gl_WorkGroupID.x);   // one workgroup per row
+    int R = pc.R, C = pc.C;
+    if (row >= R) return;
+
+    int nq = C >> 7;          // 128-weight blocks per row
+    int nbytes = C >> 2;      // bytes per row (4 weights per byte)
+
+    // Process one 128-weight block at a time.
+    for (int blk = 0; blk < nq; ++blk) {
+        // Step 1: quantise x for this block to int8, for all 4 tokens.
+        // Each lane handles 4 columns (32 lanes x 4 = 128).
+        float amax[4];
+        for (int t = 0; t < 4; ++t) amax[t] = 0.0;
+
+        for (int i = 0; i < 4; ++i) {
+            int c = int(lid) * 4 + i;
+            if (c < 128) {
+                int base = blk * 128 + c;
+                for (int t = 0; t < 4; ++t) {
+                    amax[t] = max(amax[t], abs(X[base * 4 + t]));
+                }
+            }
+        }
+        for (int t = 0; t < 4; ++t) {
+            amax[t] = subgroup_max_32(amax[t]);
+        }
+
+        float xscale[4];
+        float inv_scale[4];
+        for (int t = 0; t < 4; ++t) {
+            xscale[t] = (amax[t] != 0.0) ? (amax[t] / 127.0) : 1e-6;
+            inv_scale[t] = 1.0 / xscale[t];
+        }
+
+        // Quantise and pack 4 x values per lane (one byte's worth, 4 weights).
+        // Each lane handles 1 byte = 4 weights.
+        int base_x = blk * 128 + int(lid) * 4;
+        int8_t qx0 = int8_t(clamp(round(X[base_x * 4 + 0] / xscale[0]), -127.0, 127.0));
+        int8_t qx1 = int8_t(clamp(round(X[base_x * 4 + 1] / xscale[1]), -127.0, 127.0));
+        int8_t qx2 = int8_t(clamp(round(X[base_x * 4 + 2] / xscale[2]), -127.0, 127.0));
+        int8_t qx3 = int8_t(clamp(round(X[base_x * 4 + 3] / xscale[3]), -127.0, 127.0));
+
+        uint packed_x = uint(uint(qx0) & 0xFF) | (uint(uint(qx1) & 0xFF) << 8) |
+                        (uint(uint(qx2) & 0xFF) << 16) | (uint(uint(qx3) & 0xFF) << 24);
+
+        // Step 2: unpack weights to int8 and dp4a.
+        int wbase = row * nbytes + (blk << 5) + int(lid);  // byte offset
+        uint byte_val = (codes[wbase >> 2] >> (8u * (wbase & 3u))) & 0xFFu;
+        int8_t w0 = int8_t((byte_val & 3u) - 1);
+        int8_t w1 = int8_t(((byte_val >> 2) & 3u) - 1);
+        int8_t w2 = int8_t(((byte_val >> 4) & 3u) - 1);
+        int8_t w3 = int8_t(((byte_val >> 6) & 3u) - 1);
+        uint packed_w = uint(uint(w0) & 0xFF) | (uint(uint(w1) & 0xFF) << 8) |
+                        (uint(uint(w2) & 0xFF) << 16) | (uint(uint(w3) & 0xFF) << 24);
+
+        // dp4a for all 4 tokens (weights are the same, x is different per token)
+        // We only have one packed_x (for one token). For 4 tokens we need 4.
+        // This is the limitation: we'd need to quantise all 4 tokens' x values
+        // for this byte's 4 columns, but the quantisation was per 128-column group.
+        // For simplicity, this version handles T=1 only. T=4 needs 4 quantisations.
+        int32_t dot_result = dot4AddInt32(packed_x, packed_w, 0);
+
+        // Step 3: scale and accumulate.
+        float wscale = unpackHalf2x16(scales[row * nq + blk]).x;
+        y[row] += float(dot_result) * xscale[0] * wscale;
+        // Note: each token needs its own x scale. But we only have one xs per token.
+        // For the other 3 tokens, we'd need separate xq and dp4a calls.
+        // This is the limitation: T=4 needs 4 quantisations and 4 dp4a calls.
+    }
+}

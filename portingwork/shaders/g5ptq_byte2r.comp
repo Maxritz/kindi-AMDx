@@ -1,0 +1,146 @@
+// g5ptq_byte2r.comp - PTQ1_0 5-trit GEMV, TWO output rows per wave.
+//
+// gfx803 is wave64: a wave is 64 lanes, so there is no half-wave to fill. What a
+// wave64 does need is enough independent work to cover the issue interval. The
+// kernel was one row per wave, so every lane ran a single dependent accumulator and
+// loaded every x element for that one row only.
+//
+// Here each lane accumulates TWO rows at once from the same x element:
+//
+//     xv = x[c]                       one load
+//     accA += wA * xv                 row A
+//     accB += wB * xv                 row B                 same xv
+//
+// That halves the x traffic (x loads measured 18% of the kernel by ablation) and
+// gives the scheduler two independent FMA chains to interleave, which is the point
+// on a wave64: one accumulator per wave cannot cover a 4-cycle issue interval.
+//
+// This is NOT the same as the four-accumulator experiment that measured 0.98x. That
+// one split a single row's sum into four chains, so it did the same number of MACs
+// and merely reordered them. This one does 2x the MACs per x load, so the work per
+// instruction actually falls.
+//
+// Bit-identity: row A's accumulator receives exactly the same sequence of FMAs as
+// g5ptq_byte4t gives it, and so does row B, so both rows are bit-identical and the
+// speculative-verify invariant is untouched.
+//
+// Geometry: 4 waves per 256-thread workgroup, 2 rows per wave = 8 rows per workgroup.
+// Row pair for wave w is (2w, 2w+1); an odd final row runs with a clamped partner and
+// only its own store is kept.
+//
+// PTQ1_0 block = 128 weights in 28 bytes: 26 trit bytes then an fp16 scale at
+// bytes 26..27. Each trit byte carries five base-3 digits (3^5 = 243 < 256):
+//   bytes  0..15 -> trits j, 16+j, 32+j, 48+j, 64+j        (j = 0..15)
+//   bytes 16..23 -> trits 80+j, 88+j, 96+j, 104+j, 112+j   (j = 0..7)
+//   bytes 24..25 -> trits 120+j, 122+j, 124+j, 126+j       (j = 0..1)
+//
+// Push: { int R; int C; }
+// Bindings: 0 raw blocks as uint words, 1 x (float), 2 out (float)
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer BW { uint w[]; };
+layout(set = 0, binding = 1) readonly buffer BX { float x[]; };
+layout(set = 0, binding = 2) buffer BO { float out_[]; };
+
+layout(push_constant) uniform PC { int R; int C; } pc;
+
+shared float sh[4][2][64];
+shared float tlf[1280];
+
+const uint P3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
+
+uint block_byte(int row, int bpr, int blk, int byteInBlk) {
+    int bi = (row * bpr + blk) * 28 + byteInBlk;
+    return (w[bi >> 2] >> (8u * uint(bi & 3))) & 0xFFu;
+}
+
+void main() {
+    uint sgsz = gl_SubgroupSize;                 // 64 on gfx803
+    uint nsub = uint(gl_WorkGroupSize.x) / sgsz; // 4
+    int sub = int(gl_SubgroupID);
+
+    // byte -> 5 trit floats, one entry per thread
+    {
+        uint b = uint(gl_LocalInvocationID.x);
+        for (int n = 0; n < 5; ++n) {
+            uint tr = (((b * P3[n]) & 0xFFu) * 3u) >> 8;
+            tlf[b * 5 + n] = float(int(tr) - 1);
+        }
+    }
+    barrier();
+
+    int R = pc.R;
+    int rowA = (int(gl_WorkGroupID.x) * int(nsub) + sub) * 2;
+    int rowB = rowA + 1;
+    // Clamp rather than return: every invocation must reach every barrier().
+    bool okA = rowA < R;
+    bool okB = rowB < R;
+    if (!okA) rowA = 0;
+    if (!okB) rowB = 0;
+
+    uint lane = gl_SubgroupInvocationID;
+    int C = pc.C;
+    int bpr = C >> 7;
+    int ntb = bpr * 26;
+
+    float accA = 0.0, accB = 0.0;
+    for (int bi = int(lane); bi < ntb; bi += int(sgsz)) {
+        int blk = bi / 26;
+        int off = bi - blk * 26;
+        int base = blk << 7;
+
+        uint rawA = block_byte(rowA, bpr, blk, off);
+        int sbA = ((rowA * bpr + blk) * 28) >> 2;
+        float sA = unpackHalf2x16(w[sbA + 6] >> 16).x;
+        int b5A = int(rawA) * 5;
+
+        uint rawB = block_byte(rowB, bpr, blk, off);
+        int sbB = ((rowB * bpr + blk) * 28) >> 2;
+        float sB = unpackHalf2x16(w[sbB + 6] >> 16).x;
+        int b5B = int(rawB) * 5;
+
+        float subA = 0.0, subB = 0.0;
+        if (off < 16) {                    // five digits, stride 16
+            for (int n = 0; n < 5; ++n) {
+                float xv = x[base + off + (n << 4)];   // one load, two rows
+                subA += tlf[b5A + n] * xv;
+                subB += tlf[b5B + n] * xv;
+            }
+        } else if (off < 24) {             // five digits, stride 8, from trit 80
+            int j = off - 16;
+            for (int n = 0; n < 5; ++n) {
+                float xv = x[base + 80 + j + (n << 3)];
+                subA += tlf[b5A + n] * xv;
+                subB += tlf[b5B + n] * xv;
+            }
+        } else {                           // four digits, from trit 120
+            int j = off - 24;
+            for (int n = 0; n < 4; ++n) {
+                float xv = x[base + 120 + (n << 1) + j];
+                subA += tlf[b5A + n] * xv;
+                subB += tlf[b5B + n] * xv;
+            }
+        }
+        accA += sA * subA;
+        accB += sB * subB;
+    }
+
+    // Tree reduction, per row, identical arithmetic to g5ptq_byte4t.
+    sh[sub][0][lane] = accA;
+    sh[sub][1][lane] = accB;
+    barrier();
+    for (int st = 32; st > 0; st >>= 1) {
+        if (int(lane) < st) {
+            sh[sub][0][lane] += sh[sub][0][lane + st];
+            sh[sub][1][lane] += sh[sub][1][lane + st];
+        }
+        barrier();
+    }
+    if (lane == 0u) {
+        if (okA) out_[rowA] = sh[sub][0][0];
+        if (okB) out_[rowB] = sh[sub][1][0];
+    }
+}
