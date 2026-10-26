@@ -390,6 +390,21 @@ static void bindbufs(Pipe&P, const std::vector<Buf>& bufs, const std::vector<VkD
 static uint64_t pipe_bytes(const Pipe&P){
     uint64_t b=0; for(uint32_t i=0;i<P.nbind && i<16;++i) b+=P.brange[i]; return b;
 }
+// Set by dispatch_nb() for the next dispatch only.
+//
+// The barrier after every dispatch is a COMPUTE -> COMPUTE pipeline barrier. It has
+// to drain the producer before the consumer starts, and on this driver the cost is
+// the barrier itself, not its scope: measured 6156 ms wall with a full VkMemoryBarrier,
+// 6163 with SHADER_WRITE->SHADER_READ only, and 6139 with a buffer-scoped
+// VkBufferMemoryBarrier. All the same. Removing barriers altogether gives 4919 ms, so
+// 1180 ms (44 us per dispatch) is the drain, and the only way to recover it is to not
+// emit a barrier where there is no dependency.
+//
+// dispatch_nb() is therefore only safe where the following dispatch provably does not
+// read anything this one writes. The sibling projections after a norm are that case:
+// they all read the norm output and write disjoint outputs.
+static bool g_nobar_next = false;
+
 static void dispatch(const Pipe&P, VkQueue q, VkCommandPool pool, uint32_t gx,uint32_t gy,uint32_t gz, const void*push,uint32_t psz){
     const bool tr = ktrace::enabled();
     double th0 = tr ? ktrace::now_us() : 0.0;
@@ -403,7 +418,8 @@ static void dispatch(const Pipe&P, VkQueue q, VkCommandPool pool, uint32_t gx,ui
     if(tr) ktrace::mark_before(cb,pair);
     vkCmdDispatch(cb,gx,gy,gz);
     if(tr) ktrace::mark_after(cb,pair);
-    batch_barrier(cb);
+    if(!g_nobar_next) batch_barrier(cb);
+    g_nobar_next = false;
     g_batch_ops++;
     if(tr){
         double th1 = ktrace::now_us();
@@ -417,6 +433,16 @@ static void dispatch(const Pipe&P, VkQueue q, VkCommandPool pool, uint32_t gx,ui
         const char* e=getenv("KINDI_BATCH_MAX"); return e?(uint64_t)atoll(e):(uint64_t)2048; }();
     if(no_batch || g_batch_ops >= BATCH_MAX) batch_flush();
 }
+// Dispatch with no trailing barrier. Only for a dispatch whose output is not read
+// until after the next explicit barrier_now().
+static void dispatch_nb(const Pipe&P, VkQueue q, VkCommandPool pool, uint32_t gx,uint32_t gy,uint32_t gz, const void*push,uint32_t psz){
+    g_nobar_next = true;
+    dispatch(P,q,pool,gx,gy,gz,push,psz);
+}
+
+// Emit one barrier at the point where a real dependency exists.
+static void barrier_now(){ batch_barrier(g_bcb); }
+
 static void upload(Buf*dst, const void*data, size_t nb){
     double _tx0 = ktrace::enabled() ? ktrace::now_us() : 0.0;
     // One persistent staging buffer, grown on demand. A fresh alloc/free per tensor
@@ -1393,20 +1419,42 @@ int main(int argc, char**argv){
         std::string p="blk."+std::to_string(il)+".";
         rmsfold(h, part, h2, xn, xp, p+"attn_norm.weight", D, HB);
         if(dump&&il==0){ dumpv("xn",xn,D); dumpv("xp",xp,D); }
+        // Three independent dispatches. qkv and z both read xp; the gate scalars read
+        // xn. None of them reads another's output, so they need no barrier between
+        // them: one barrier after the group covers the consumers below (gdn_conv reads
+        // qkv, gdn_delta reads gb/gg). On the 5-trit path gemv3 never fires because it
+        // requires scalebufs, so without this the 27B paid a drain per projection.
+        // Opt-in only. Measured 6082 vs 6132 ms, 0.8%, for removing two barriers
+        // per GDN layer. Too small to justify dropping a memory-ordering guarantee
+        // by default, and 1920 of 26660 barriers is only 7% of them, so the linear
+        // ceiling for this approach is about 694 ms of the 1180 ms NO_BARRIER win.
+        const bool g5sib = getenv("KINDI_SIB_BARRIER") != nullptr;
         if(!gemv3(xp, p+"attn_qkv.weight",&qkv, p+"attn_gate.weight",&zv, "", nullptr)){
-            gemv(p+"attn_qkv.weight", xp, qkv);
-            gemv(p+"attn_gate.weight", xp, zv);
+            if(g5sib){
+                // gemv() ends in dispatch(); set the flag so the first one keeps its
+                // barrier (it follows the norm) and the second does not need one.
+                g_nobar_next = false;
+                gemv(p+"attn_qkv.weight", xp, qkv);
+                g_nobar_next = true;
+                gemv(p+"attn_gate.weight", xp, zv);
+                g_nobar_next = false;
+            } else {
+                gemv(p+"attn_qkv.weight", xp, qkv);
+                gemv(p+"attn_gate.weight", xp, zv);
+            }
         }
         if(dump&&il==0){ dumpv("qkv",qkv,CONV_CH); dumpv("z",zv,NV*HK); }
-        // gdn_gates
+        // gdn_gates: reads xn only, so it is the third member of the same group.
         {
             std::vector<Buf> bufs={xn, f32bufs[p+"ssm_beta.weight"], f32bufs[p+"ssm_alpha.weight"],
                 f32bufs[p+"ssm_dt.bias"], f32bufs[p+"ssm_a"], gb, gg};
             bindbufs(pgates,bufs);
             struct{int n;}pc{D};
-            dispatch(pgates,G.q0,G.cp,NV,1,1,&pc,4);
+            if(g5sib) dispatch_nb(pgates,G.q0,G.cp,NV,1,1,&pc,4);
+            else      dispatch(pgates,G.q0,G.cp,NV,1,1,&pc,4);
             if(dump&&il==0){ dumpv("beta",gb,NV); dumpv("gate",gg,NV); }
         }
+        if(g5sib) barrier_now();
         // gdn_conv
         {
             std::vector<Buf> bufs={qkv, convv[il], f32bufs[p+"ssm_conv1d.weight"], cs};

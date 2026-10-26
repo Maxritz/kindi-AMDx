@@ -40,6 +40,65 @@ host total     : 12.44 ms
 Per token: **device 10.4 ms, inter-dispatch drain 21.6 ms, host 0.3 ms.**
 Wall marginal 27.5 ms/token.
 
+## Barriers: 1180 ms of wall time, and why narrowing them does not help
+
+Wall was 6100 ms against device 4707 ms, leaving a 1393 ms gap that the host code could
+not account for (host total is 14 ms). The gap is pipeline barriers.
+
+`batch_barrier()` runs after every dispatch, so the command stream is
+`dispatch, barrier, dispatch, barrier, ...` for 26660 dispatches. The default path is a
+full `VkMemoryBarrier`: `src SHADER_WRITE`, `dst SHADER_READ | SHADER_WRITE`, stage
+COMPUTE to COMPUTE.
+
+Removing them entirely (`KINDI_NO_BARRIER=1`, diagnostic only, results are wrong):
+
+| | wall | device | gap | tok/s |
+|---|---|---|---|---|
+| barriers on | 6099.8 ms | 4707 ms | 1392 ms | 3.279 |
+| no barrier | 4919.4 ms | 4655 ms | 265 ms | 4.066 |
+
+1180 ms, 19% of wall, 44.3 us per dispatch. Device time barely moved, and `g5ptq_byte`
+actually got 12 us/op *slower* (562.7 to 574.7), so the win is entirely from not
+draining between dispatches.
+
+### Narrowing the barrier does nothing
+
+The engine already had two narrower modes. Both were measured on the same 20-token run:
+
+| mode | wall | device | gap | tok/s | tokens |
+|---|---|---|---|---|---|
+| default full `VkMemoryBarrier` | 6156 ms | 4760 ms | 1396 ms | 3.249 | ok |
+| `KINDI_BARRIER=readonly` (no WAR/WAW) | 6163 ms | 4764 ms | 1400 ms | 3.245 | ok |
+| `KINDI_BARRIER=buffer` (scoped to bound buffers) | 6139 ms | 4769 ms | 1370 ms | 3.258 | ok |
+
+All within noise. The cost is the **existence** of a COMPUTE to COMPUTE pipeline
+barrier, not its access masks or buffer scope: the producer has to drain before the
+consumer can start regardless of which buffers the barrier names. So "use a scoped
+`VkBufferMemoryBarrier` instead of a full `VkMemoryBarrier`" is not a fix here.
+
+### Removing individual barriers scales, but the ceiling is ~694 ms
+
+The one place a barrier is provably unnecessary is the sibling group after a norm: in a
+GDN layer, `attn_qkv`, `attn_gate` and the gate scalars all read the norm output and
+write disjoint outputs, so one barrier after the group is enough. Eliding the other two
+(`KINDI_SIB_BARRIER=1`, opt-in):
+
+| | wall | tok/s | tokens |
+|---|---|---|---|
+| default | 6132 ms | 3.261 | ok |
+| sibling elision | 6082 ms | 3.288 | ok |
+
+50 ms, 0.8%. That is 1920 of 26660 barriers, 7.2% of them, so the effect is roughly
+proportional and the linear ceiling for barrier removal is about 694 ms rather than
+1180. The rest of the `NO_BARRIER` win is cross-dispatch overlap filling the machine,
+which cannot be reclaimed one barrier at a time. It is opt-in because 0.8% does not
+justify dropping a memory-ordering guarantee by default.
+
+**Conclusion: the remaining barrier cost needs fewer dispatches, not cheaper barriers.**
+That means fusing same-input projections into one dispatch. The 4-trit path already does
+this in `g4lut3`, but `gemv3` requires `scalebufs` and excludes `native_names`, so it
+never fires on the 27B's PTQ1_0 tensors and the 27B pays a drain per projection.
+
 ## The 27B 5-trit GEMV: 2643 -> 563 us/op, 4.7x
 
 `g5ptq` (single token) and `g5ptqM` (batched) were 98% of a 27B decode step. Five
