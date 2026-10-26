@@ -103,7 +103,16 @@ are actually prefilled.
 |---|---|---|---|---|
 | 2B PTQ1_0 | 39.3 tok/s | 69.0 tok/s | 32-34 tok/s | n/a (no MTP head) |
 | 27B PQ2_0 | 1.71 tok/s | 3.03 tok/s | 1.5 tok/s | n/a (no MTP head) |
-| 27B PTQ1_0 + MTP | 1.7 tok/s | 3.0 tok/s | 0.85 tok/s | **1.25 tok/s** |
+| 27B PTQ1_0 + MTP | 1.7 tok/s | 3.0 tok/s | **1.45 tok/s** | **1.25 tok/s** |
+
+The 27B PTQ1_0 generation figure is 1.45 tok/s after the 5-trit GEMV rewrite
+(`g5ptq`), which took the kernel from 2643 to 1469 us per launch, 1.80x. Two costs
+were in the inner loop: decoding the fp16 scale once per weight instead of once per
+128-weight block, and a data-dependent `3^n` multiply chain per weight. The scale is
+now widened once at load time into its own buffer, and `3^n` is a lookup. Output is
+token-identical and `--selftest` passes. The `--spec` column was measured before this
+change; both paths use the same kernel, so the ratio should hold, but the absolute
+numbers will be re-measured.
 
 Chunked prefill buys 1.76x on the 2B and 1.77x on the 27B. Token generation is not
 affected, because decode is always a single token per pass. It is off by default; set the

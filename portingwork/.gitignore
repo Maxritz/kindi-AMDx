@@ -16,3 +16,7 @@ d2.txt
 ref27.txt
 __pycache__/
 *.pyc
+
+# local zip staging (the shipped zip is committed at the portingwork root)
+bundle/
+zt/

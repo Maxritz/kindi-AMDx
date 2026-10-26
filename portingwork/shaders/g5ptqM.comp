@@ -12,28 +12,25 @@
 //     bytes 16..23 -> out[80 + n*8 + j]  n=0..4, j=0..7
 //     bytes 24..25 -> out[120 + n*2 + j] n=0..3, j=0..1
 //
+// The scale is widened once at load time into binding 3 and 3^n is a lookup, for the
+// same reasons as g5ptq (see the comment there). blk = c>>7 is uniform across a wave,
+// so the scale read is a broadcast.
+//
 // Push: { int R; int C; int T; int xstride; }   x is token-major [T][xstride]
-// Bindings: 0 raw blocks as uint words, 1 x (float), 2 out (float, [T][R])
+// Bindings: 0 raw blocks as uint words, 1 x (float), 2 out (float, [T][R]), 3 scales
 #version 450
 layout(local_size_x = 64) in;
 
 layout(set = 0, binding = 0) readonly buffer BW { uint w[]; };
 layout(set = 0, binding = 1) readonly buffer BX { float x[]; };
 layout(set = 0, binding = 2) buffer BO { float out_[]; };
+layout(set = 0, binding = 3) readonly buffer BS { float sc[]; };
 
 layout(push_constant) uniform PC { int R; int C; int T; int xstride; } pc;
 
 shared float sh[4][64];
 
-float fp16_to_f32(uint bits) {
-    uint sign = (bits >> 15) & 1u;
-    uint exp  = (bits >> 10) & 0x1Fu;
-    uint mant = bits & 0x3FFu;
-    if (exp == 0u) { float v = float(mant)/1024.0*(1.0/16384.0); return sign==1u ? -v : v; }
-    if (exp == 31u) return sign==1u ? -3.0e38 : 3.0e38;
-    float v = (1.0 + float(mant)/1024.0) * exp2(float(int(exp) - 15));
-    return sign==1u ? -v : v;
-}
+const uint P3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
 
 uint block_byte(int row, int bpr, int blk, int byteInBlk) {
     int bi = (row * bpr + blk) * 28 + byteInBlk;
@@ -45,18 +42,15 @@ int block_trit(int row, int bpr, int blk, int i) {
     if (i < 80) {
         int n = i >> 4, j = i & 15;
         uint raw = block_byte(row, bpr, blk, j);
-        uint p = 1u; for (int t = 0; t < n; ++t) p *= 3u;
-        q = (raw * p) & 0xFFu;
+        q = (raw * P3[n]) & 0xFFu;
     } else if (i < 120) {
         int k = i - 80, n = k >> 3, j = k & 7;
         uint raw = block_byte(row, bpr, blk, 16 + j);
-        uint p = 1u; for (int t = 0; t < n; ++t) p *= 3u;
-        q = (raw * p) & 0xFFu;
+        q = (raw * P3[n]) & 0xFFu;
     } else {
         int k = i - 120, n = k >> 1, j = k & 1;
         uint raw = block_byte(row, bpr, blk, 24 + j);
-        uint p = 1u; for (int t = 0; t < n; ++t) p *= 3u;
-        q = (raw * p) & 0xFFu;
+        q = (raw * P3[n]) & 0xFFu;
     }
     return int((q * 3u) >> 8);
 }
@@ -74,10 +68,8 @@ void main() {
         int blk = c >> 7, i = c & 127;
         int trit = block_trit(row, bpr, blk, i);
         if (trit != 1) {                                  // trit 1 -> weight 0, skip
-            uint dlo = block_byte(row, bpr, blk, 26);
-            uint dhi = block_byte(row, bpr, blk, 27);
-            float sc = fp16_to_f32(dlo | (dhi << 8));
-            float wv = float(trit - 1) * sc;
+            float s = sc[row * bpr + blk];
+            float wv = float(trit - 1) * s;
             for (int t = 0; t < T && t < 4; ++t) acc[t] += wv * x[t * pc.xstride + c];
         }
     }

@@ -1,0 +1,77 @@
+// q4f.comp - Q4_0 weight row x float activation, batched over T tokens.
+//
+// The MTP block in the "Abliterated ... MTP-Q4_0" model is Q4_0 rather than Q8_0. Same
+// situation as the Q8_0 blocker: without this path a Q4_0 tensor falls through to the
+// 4-trit branch and produces garbage.
+//
+// block_q4_0 (ggml-common.h) = { ggml_half d; uint8_t qs[16]; }, 32 weights in 18 bytes.
+// dequantize_row_q4_0:
+//     y[j]      = ((qs[j] & 0x0F) - 8) * d
+//     y[j + 16] = ((qs[j] >>   4) - 8) * d
+// so the low nibble of byte j is weight j and the high nibble is weight j+16.
+//
+// The raw 18-byte blocks are kept verbatim (like g5ptq keeps its 28-byte blocks), so the
+// device footprint is exactly the file size rather than one byte per weight.
+//
+// One 64-wide wave owns one output row, matching g5ptq's mapping and reduction so the
+// arithmetic order is the same as the other PTQ path. Tokens are looped inside, so each
+// weight byte is decoded once for the whole chunk.
+//
+// Push: { int R; int C; int T; int xstride; }
+// Bindings: 0 raw blocks as uint words 1 X (token-major) 2 Y (token-major)
+#version 450
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer BW { uint w[]; };
+layout(set = 0, binding = 1) readonly buffer BX { float x[]; };
+layout(set = 0, binding = 2) buffer BO { float out_[]; };
+
+layout(push_constant) uniform PC { int R; int C; int T; int xstride; } pc;
+
+shared float sh[4][64];
+
+float fp16_to_f32(uint bits) {
+    uint sign = (bits >> 15) & 1u;
+    uint exp  = (bits >> 10) & 0x1Fu;
+    uint mant = bits & 0x3FFu;
+    if (exp == 0u) { float v = float(mant)/1024.0*(1.0/16384.0); return sign==1u ? -v : v; }
+    if (exp == 31u) return sign==1u ? -3.0e38 : 3.0e38;
+    float v = (1.0 + float(mant)/1024.0) * exp2(float(int(exp) - 15));
+    return sign==1u ? -v : v;
+}
+
+uint blk_byte(int row, int bpr, int blk, int byteInBlk) {
+    int bi = (row * bpr + blk) * 18 + byteInBlk;
+    return (w[bi >> 2] >> (8u * uint(bi & 3))) & 0xFFu;
+}
+
+void main() {
+    int row = int(gl_WorkGroupID.x);
+    if (row >= pc.R) return;
+    int lane = int(gl_LocalInvocationID.x);
+    int C = pc.C;
+    int T = pc.T;
+    int bpr = C >> 5;
+
+    float acc[4] = float[4](0.0, 0.0, 0.0, 0.0);
+    for (int c = lane; c < C; c += 64) {
+        int blk = c >> 5;
+        int j   = c & 15;
+        uint b  = blk_byte(row, bpr, blk, 2 + j);
+        int nib = (c & 16) != 0 ? int(b >> 4) : int(b & 0xFu);
+        float d = fp16_to_f32(blk_byte(row, bpr, blk, 0) | (blk_byte(row, bpr, blk, 1) << 8));
+        float wv = float(nib - 8) * d;
+        for (int t = 0; t < T && t < 4; ++t) acc[t] += wv * x[t * pc.xstride + c];
+    }
+    for (int t = 0; t < T && t < 4; ++t) sh[t][lane] = acc[t];
+    barrier();
+    for (int s = 32; s > 0; s >>= 1) {
+        for (int t = 0; t < T && t < 4; ++t) {
+            if (lane < s) sh[t][lane] += sh[t][lane + s];
+        }
+        barrier();
+    }
+    for (int t = 0; t < T && t < 4; ++t) {
+        if (lane == 0) out_[t * pc.R + row] = sh[t][0];
+    }
+}

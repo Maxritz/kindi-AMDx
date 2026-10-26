@@ -61,6 +61,8 @@ struct State {
     bool on = false;
     bool floor_only = false;
     bool json = false;
+    bool reset_at_decode = false;   // --trace-decode: start the table at decode, not prefill
+    bool decode_only = false;       // set once the reset happened, for the report header
     const char* json_path = nullptr;
     const char* label = "";
     const char* tag = "";   // per-phase prefix, e.g. "mtp:"
@@ -209,6 +211,39 @@ inline void resolve() {
 // Phase tag for the trace ("" clears it). The engine sets "mtp:" around draft work.
 inline void set_tag(const char* t) { st().tag = t ? t : ""; }
 
+// Drop everything recorded so far and restart the tables from here.
+//
+// Prefill and decode have very different shapes (one T-token pass vs a chain of
+// single-token passes), so a table that sums both answers neither question. Called
+// at the first decode step under --trace-decode. The query pool is reused from index
+// 0, which is safe because the old timestamps are no longer read.
+inline void reset_ops() {
+    State& s = st();
+    s.ops.clear();
+    s.dev_ticks.clear();
+    s.pairs = 0;
+    s.host_total_us = 0;
+    s.allocs = 0; s.alloc_bytes = 0; s.frees = 0;
+    s.xfers = 0; s.xfer_bytes = 0; s.xfer_us = 0;
+    s.submits = 0; s.fence_waits = 0; s.queue_wait_us = 0; s.flushes = 0;
+    s.token_hash = 1469598103934665603ULL; s.token_count = 0;
+}
+
+// One-shot: true the first time it is called after --trace-decode was given.
+inline bool take_reset() {
+    State& s = st();
+    if (!s.reset_at_decode) return false;
+    s.reset_at_decode = false;
+    return true;
+}
+
+// Convenience for the engine: call at the first decode step.
+inline void mark_decode_start() {
+    if (!take_reset()) return;
+    reset_ops();
+    st().decode_only = true;
+}
+
 inline void count_alloc(uint64_t bytes) { if (st().on) { st().allocs++; st().alloc_bytes += bytes; } }
 inline void count_free()               { if (st().on) st().frees++; }
 inline void count_xfer(uint64_t bytes, double us) {
@@ -268,7 +303,8 @@ inline void dump() {
     std::sort(v.begin(), v.end(), [](const Agg& a, const Agg& b) { return a.dev > b.dev; });
     double tot = 0; for (auto& a : v) tot += a.dev;
 
-    fprintf(stderr, "\n===== TRACE %s =====\n", s.label);
+    fprintf(stderr, "\n===== TRACE %s =====%s\n", s.label,
+            s.decode_only ? "  (decode only: prefill dropped)" : "");
     if (s.cores.cu)
         fprintf(stderr, "     compute cores: %u CU x %u SIMD x %u wavefronts = %u wave slots "
                         "(wave size %u, %u threads/CU)\n",
@@ -378,6 +414,7 @@ inline void dump() {
 inline bool parse_arg(int argc, char** argv, int& i) {
     State& s = st();
     if (!strcmp(argv[i], "--trace")) { s.on = true; return true; }
+    if (!strcmp(argv[i], "--trace-decode")) { s.on = true; s.reset_at_decode = true; return true; }
     if (!strcmp(argv[i], "--trace-label") && i + 1 < argc) { s.label = argv[++i]; return true; }
     if (!strcmp(argv[i], "--trace-json") && i + 1 < argc) {
         s.on = true; s.json = true; s.json_path = argv[++i]; return true;

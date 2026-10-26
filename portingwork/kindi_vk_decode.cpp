@@ -768,6 +768,10 @@ int main(int argc, char**argv){
     }
 
     std::map<std::string,Buf> codebufs, scalebufs, f32bufs;
+    // PTQ1_0 native blocks carry an fp16 scale at bytes 26..27 of every 28-byte block.
+    // Widening it once here removes an fp16 decode (two byte loads plus two branches)
+    // from the inner loop, where an ablation measured it at 25% of g5ptq.
+    std::map<std::string,Buf> scale5bufs;
     std::map<std::string,std::pair<int,int>> tinfo;
 
     uint32_t pow3[6] = {1,3,9,27,81,243};
@@ -792,8 +796,9 @@ int main(int argc, char**argv){
         float out; memcpy(&out, &f, 4); return out;
     };
 
-    size_t n_tern=0, n_q8=0;
+    size_t n_tern=0, n_q8=0, n_q4=0;
     std::set<std::string> q8names;
+    std::set<std::string> q4names;
     std::set<std::string> native_names;
     std::set<std::string> pq2_names;
     size_t n_pq2=0;
@@ -825,9 +830,37 @@ int main(int argc, char**argv){
             Buf cb = mkbuf(words.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
             upload(&cb, words.data(), words.size() * 4);
             codebufs[gt.name] = cb;
+            // Widen the per-block fp16 scale to float once, [row*bpr + blk].
+            std::vector<uint32_t> sc5((size_t)r * bpr, 0u);
+            for (int row = 0; row < r; ++row) {
+                for (int b = 0; b < bpr; ++b) {
+                    const unsigned char* blk = data + ((size_t)row * bpr + b) * 28;
+                    uint16_t sv; memcpy(&sv, blk + 26, 2);
+                    float f = half_to_float(sv);
+                    uint32_t bits; memcpy(&bits, &f, 4);
+                    sc5[(size_t)row * bpr + b] = bits;
+                }
+            }
+            Buf sb5 = mkbuf(sc5.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            upload(&sb5, sc5.data(), sc5.size() * 4);
+            scale5bufs[gt.name] = sb5;
             tinfo[gt.name] = std::make_pair(r, c);
             native_names.insert(gt.name);
             n_tern++;
+        } else if (gt.type == 2) {
+            // Q4_0: block = { fp16 d; uint8 qs[16] } (18 bytes, 32 weights). Kept as the raw
+            // blocks; q4f decodes on the device. The MTP block of the "...MTP-Q4_0" model is
+            // Q4_0, so without this it falls through to the 4-trit branch and is garbage.
+            int bpr = c / 32;
+            size_t nbytes = (size_t)r * bpr * 18;
+            std::vector<uint32_t> words((nbytes + 3) / 4, 0u);
+            memcpy(words.data(), data, nbytes);
+            Buf cb = mkbuf(words.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            upload(&cb, words.data(), words.size() * 4);
+            codebufs[gt.name] = cb;
+            tinfo[gt.name] = std::make_pair(r, c);
+            q4names.insert(gt.name);
+            n_q4++;
         } else if (gt.type == 8) {
             // Q8_0: 32 signed bytes + fp16 scale per block (34 bytes). Split into
             // a byte-packed uint code array and a uint scale array (fp16 bits, low half).
@@ -938,7 +971,7 @@ int main(int argc, char**argv){
             return 1;
         }
     }
-    fprintf(stderr,"weights uploaded: %zu ternary + %zu f32 + %zu q8_0 + %zu pq2_0\n", n_tern, f32bufs.size(), n_q8, n_pq2);
+    fprintf(stderr,"weights uploaded: %zu ternary + %zu f32 + %zu q8_0 + %zu q4_0 + %zu pq2_0\n", n_tern, f32bufs.size(), n_q8, n_q4, n_pq2);
     {
         // Context-sized buffers are allocated next. Clamp the context to what is actually
         // left on the device-local heap rather than trusting the pre-load estimate: the
@@ -976,6 +1009,7 @@ int main(int argc, char**argv){
     Pipe pg4M=mkpipe((shdir+"/g4lutM.comp.spv").c_str(),4,16);   // push grew to {R,C,T,xstride}
     Pipe pg2M =mkpipe((shdir+"/g2pqM.comp.spv").c_str(),3,16);
     Pipe pq8f =mkpipe((shdir+"/q8f.comp.spv").c_str(),4,16);
+    Pipe pq4f =mkpipe((shdir+"/q4f.comp.spv").c_str(),3,16);
     Pipe paddv =mkpipe((shdir+"/addv.comp.spv").c_str(),3,4);      // residual add
     Pipe psilu =mkpipe((shdir+"/silu_mul.comp.spv").c_str(),3,4);   // fold-free SwiGLU
     // T-token variants for the chunked prefill path (KINDI_CHUNK)
@@ -1004,8 +1038,8 @@ int main(int argc, char**argv){
     Pipe pcpq=mkpipe((shdir+"/cpq.comp.spv").c_str(),2,8);
     Pipe psumparts=mkpipe((shdir+"/sumparts.comp.spv").c_str(),2,8);
     Pipe pq8=mkpipe((shdir+"/g4q8.comp.spv").c_str(),4,8);
-    Pipe pg5=mkpipe((shdir+"/g5ptq.comp.spv").c_str(),3,8);
-    Pipe pg5M=mkpipe((shdir+"/g5ptqM.comp.spv").c_str(),3,16);  // batched native PTQ1_0
+    Pipe pg5=mkpipe((shdir+"/g5ptq.comp.spv").c_str(),4,8);
+    Pipe pg5M=mkpipe((shdir+"/g5ptqM.comp.spv").c_str(),4,16);  // batched native PTQ1_0
     Pipe pdeq5=mkpipe((shdir+"/deq_emb5.comp.spv").c_str(),3,12);
     Pipe pfwhi=mkpipe((shdir+"/fwht_hi.comp.spv").c_str(),1,8);
     Pipe pg2=mkpipe((shdir+"/g2pq.comp.spv").c_str(),3,8);
@@ -1074,7 +1108,7 @@ int main(int argc, char**argv){
     Buf logitsbuf=mkbuf((size_t)VOCAB*4,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     Buf sbuf=Z(NH*ctx), apart=Z(((ctx+255)/256)*NH*HD);
 
-    // ---- MTP draft head (blk.<NL>, Q8_0 weights) ----
+    // ---- MTP draft head (blk.<NL>; Q8_0 in the procreations file, Q4_0 in the MTP-Q4_0 one) ----
     // A full attention + FFN layer whose activations are NOT Hadamard-folded: the reference
     // feeds the plain normalised vector to its GEMVs (no signs, no FWHT), unlike the ternary
     // trunk. embed() already returns the primal-basis embedding (deq_emb* applies the inverse
@@ -1094,7 +1128,16 @@ int main(int argc, char**argv){
     Buf VcM=mkbuf(have_mtp?(VkDeviceSize)ctx*NHKV*HD*2:4,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     Buf mtp_aout=mkbuf(64,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     fillbuf(mtp_hprev); fillbuf(KcM); fillbuf(VcM);
-    if(have_mtp) fprintf(stderr,"MTP draft head: %s (Q8_0, unfolded basis, own KV cache)\n", mtp_p.c_str());
+    if(have_mtp){
+        // The MTP block's dtype varies by file (Q8_0 in the procreations model, Q4_0 in the
+        // Abliterated MTP-Q4_0 one). Report what was actually loaded rather than a guess.
+        const std::string aq = mtp_p+"attn_q.weight";
+        const char* fmt = q4names.count(aq) ? "Q4_0"
+                        : q8names.count(aq) ? "Q8_0"
+                        : native_names.count(aq) ? "PTQ1_0"
+                        : pq2_names.count(aq) ? "PQ2_0" : "4-trit";
+        fprintf(stderr,"MTP draft head: %s (%s, unfolded basis, own KV cache)\n", mtp_p.c_str(), fmt);
+    }
 
     std::vector<Buf> M, convv, Kc, Vc;
     for(int i=0;i<NATT;++i){ Kc.push_back(mkbuf((size_t)ctx*NHKV*HD*2,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)); Vc.push_back(mkbuf((size_t)ctx*NHKV*HD*2,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)); }
@@ -1162,10 +1205,17 @@ int main(int argc, char**argv){
             return;
         }
         if(native_names.count(wname)){
-            std::vector<Buf> bufs={codebufs[wname],xbuf,outbuf};
+            std::vector<Buf> bufs={codebufs[wname],xbuf,outbuf,scale5bufs[wname]};
             bindbufs(pg5,bufs);
             struct{int R,C;}pc{rows,cols};
             dispatch(pg5,G.q0,G.cp,rows,1,1,&pc,8);
+            return;
+        }
+        if(q4names.count(wname)){
+            std::vector<Buf> bufs={codebufs[wname],xbuf,outbuf};
+            bindbufs(pq4f,bufs);
+            struct{int R,C,T,xstride;}pc{rows,cols,1,cols};
+            dispatch(pq4f,G.q0,G.cp,rows,1,1,&pc,16);
             return;
         }
         if(q8names.count(wname)){
@@ -1736,6 +1786,20 @@ int main(int argc, char**argv){
         dispatch(pq8f,G.q0,G.cp,(uint32_t)((rows+3)/4),1,1,&pc,16);
         return true;
     };
+    // Batched Q4_0 GEMV (the MTP block of the Abliterated MTP-Q4_0 model).
+    auto gemvMQ4=[&](const std::string&wname, Buf&xbuf, Buf&outbuf, int T, int xstride)->bool{
+        if(T < 1 || T > 4) return false;
+        if(!q4names.count(wname)) return false;
+        auto it = tinfo.find(wname);
+        if(it == tinfo.end()) return false;
+        int rows = it->second.first, cols = it->second.second;
+        if(xstride<0) xstride=cols;
+        std::vector<Buf> bufs={codebufs[wname],xbuf,outbuf};
+        bindbufs(pq4f,bufs);
+        struct{int R,C,T,xstride;}pc{rows,cols,T,xstride};
+        dispatch(pq4f,G.q0,G.cp,(uint32_t)rows,1,1,&pc,16);
+        return true;
+    };
     // Batched native PTQ1_0 GEMV (27B). Mirrors g5ptq exactly, so T=1 matches it bit
     // for bit and row t of a T>1 launch matches a separate T=1 launch.
     auto gemvM5ptq=[&](const std::string&wname, Buf&xbuf, Buf&outbuf, int T, int xstride)->bool{
@@ -1745,7 +1809,7 @@ int main(int argc, char**argv){
         if(it == tinfo.end()) return false;
         int rows = it->second.first, cols = it->second.second;
         if(xstride<0) xstride=cols;
-        std::vector<Buf> bufs={codebufs[wname],xbuf,outbuf};
+        std::vector<Buf> bufs={codebufs[wname],xbuf,outbuf,scale5bufs[wname]};
         bindbufs(pg5M,bufs);
         struct{int R,C,T,xstride;}pc{rows,cols,T,xstride};
         dispatch(pg5M,G.q0,G.cp,(uint32_t)rows,1,1,&pc,16);
@@ -1757,6 +1821,7 @@ int main(int argc, char**argv){
         if(gemvM2pq(wname, xbuf, outbuf, T, xstride)) return true;
         if(gemvMQ8(wname, xbuf, outbuf, T, xstride)) return true;
         if(gemvM5ptq(wname, xbuf, outbuf, T, xstride)) return true;
+        if(gemvMQ4(wname, xbuf, outbuf, T, xstride)) return true;
         return false;
     };
 
@@ -2185,6 +2250,53 @@ int main(int argc, char**argv){
             ok = ok && o3;
         }
 
+        // ---- Q4_0 GEMV (the MTP block of the MTP-Q4_0 model) ----
+        std::string q4n;
+        for(auto&kv:codebufs){ if(q4names.count(kv.first) && tinfo.count(kv.first)){ q4n=kv.first; break; } }
+        if(q4n.empty()){
+            fprintf(stderr,"selftest Q4_0: skipped (no Q4_0 tensor)\n");
+        } else {
+            int R=tinfo[q4n].first, C=tinfo[q4n].second;
+            fprintf(stderr,"selftest Q4_0 on %s  R=%d C=%d\n", q4n.c_str(), R, C);
+            Buf xb; mkx(C, xb);
+            Buf y1=mkbuf((VkDeviceSize)R*4,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            Buf y2=mkbuf((VkDeviceSize)R*2*4,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            { std::vector<Buf> b={codebufs[q4n],xb,y1}; bindbufs(pq4f,b);
+              struct{int R,C,T,xstride;}pc{R,C,1,C}; dispatch(pq4f,G.q0,G.cp,(uint32_t)R,1,1,&pc,16); }
+            batch_flush();
+            { std::vector<Buf> b={codebufs[q4n],xb,y2}; bindbufs(pq4f,b);
+              struct{int R,C,T,xstride;}pc{R,C,2,C}; dispatch(pq4f,G.q0,G.cp,(uint32_t)R,1,1,&pc,16); }
+            batch_flush();
+            auto gv=rd(y1,R), gv2=rd(y2,R*2);
+            // host reference straight from the GGUF: block_q4_0 = { fp16 d; uint8 qs[16] }
+            const GT* g4=nullptr;
+            for(auto&g:gtensors) if(g.name==q4n) g4=&g;
+            std::vector<float> xv((size_t)C);
+            for(int i=0;i<C;++i) xv[i]=std::sin(0.01f*(float)i)*0.5f;
+            const int bpr=C/32;
+            double worst=0, worst2=0; int nz=0;
+            for(int r=0;r<R;r+=97){
+                const unsigned char* rp=filebase + data_start + g4->offset + (size_t)r*bpr*18;
+                double h=0;
+                for(int k=0;k<C;++k){
+                    const unsigned char* blk=rp + (size_t)(k>>5)*18;
+                    uint16_t hb; memcpy(&hb, blk, 2);
+                    float d=half_to_float(hb);
+                    uint8_t byte=blk[2+(k&15)];
+                    int nib=(k&16)?(byte>>4):(byte&0xF);
+                    h += (double)((float)(nib-8)*d)*xv[k];
+                }
+                double e=std::fabs(h-gv[r]); if(e>worst) worst=e;
+                double e2=std::fabs(h-gv2[r]); if(e2>worst2) worst2=e2;
+                nz++;
+            }
+            fprintf(stderr,"selftest Q4_0: sampled %d rows, max abs err vs host = %.4e (T=2 row0 %.4e)\n", nz, worst, worst2);
+            bool o6 = worst < 5e-3 && worst2 < 5e-3;
+            fprintf(stderr,"selftest Q4_0: %s\n", o6 ? "PASS" : "FAIL");
+            ok = ok && o6;
+            freebuf(y1); freebuf(y2);
+        }
+
         // ---- native PTQ1_0 batched GEMV (g5ptqM): T=1 must equal g5ptq exactly ----
         std::string n5;
         for(auto&kv:codebufs){ if(native_names.count(kv.first) && tinfo.count(kv.first)
@@ -2197,10 +2309,10 @@ int main(int argc, char**argv){
             Buf xb; mkx(C, xb);
             Buf y1=mkbuf((VkDeviceSize)R*4,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
             Buf y2=mkbuf((VkDeviceSize)R*2*4,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            { std::vector<Buf> b={codebufs[n5],xb,y1}; bindbufs(pg5,b);
+            { std::vector<Buf> b={codebufs[n5],xb,y1,scale5bufs[n5]}; bindbufs(pg5,b);
               struct{int R,C;}pc{R,C}; dispatch(pg5,G.q0,G.cp,(uint32_t)R,1,1,&pc,8); }
             batch_flush();
-            { std::vector<Buf> b={codebufs[n5],xb,y2}; bindbufs(pg5M,b);
+            { std::vector<Buf> b={codebufs[n5],xb,y2,scale5bufs[n5]}; bindbufs(pg5M,b);
               struct{int R,C,T,xstride;}pc{R,C,2,C}; dispatch(pg5M,G.q0,G.cp,(uint32_t)R,1,1,&pc,16); }
             batch_flush();
             auto a=rd(y1,R), bb=rd(y2,R*2);
@@ -2422,6 +2534,7 @@ int main(int argc, char**argv){
             bool did_work = (int)ids.size()-1 > shared;
             if(prefix_cache && (int)ids.size()>=64 && (did_work || !pc.valid)) pc_save(ids);
 
+            ktrace::mark_decode_start();   // --trace-decode: table starts here
             double t1=ktrace::now_us();
             int pos=(int)ids.size()-1;
             int cur=ids.back();          // `tok` is the tokenizer, so the token is `cur`
@@ -2815,6 +2928,7 @@ int main(int argc, char**argv){
         // mtp_hin already holds rms(h_{N-2}, output_norm) from the prefill catch-up, and
         // the MTP KV holds positions 0..N-2. The draft at p writes position p.
         int nacc=0, ndraft=0, npass=0, ntok_spec=0;
+        ktrace::mark_decode_start();   // --trace-decode: table starts here
         double t0=ktrace::now_us();
         double t_draft=0, t_verify=0, t_head=0, t_commit=0, t_snap=0;
         auto tick=[&](){ return ktrace::now_us(); };
@@ -2901,6 +3015,7 @@ int main(int argc, char**argv){
         Buf* hp=&mtp_hin;
         int nacc=0, ndraft=0;
         double t_draft=0, t_trunk=0;
+        ktrace::mark_decode_start();   // --trace-decode: table starts here
         fprintf(stderr,"mtp: acceptance harness, k=1, greedy (draft at p predicts p+1)\n");
         fprintf(stderr,"  %5s %8s %8s %6s\n","pos","draft","trunk","hit");
         for(int k=0;k<mtp_accept;++k){
@@ -2944,6 +3059,7 @@ int main(int argc, char**argv){
         ktrace::dump();
         return 0;
     }
+    ktrace::mark_decode_start();   // --trace-decode: table starts here
     double g0=ktrace::now_us();
     int next=step(ids.back(), pos-1);
     out.push_back(next); ktrace::accuracy_token(next);
