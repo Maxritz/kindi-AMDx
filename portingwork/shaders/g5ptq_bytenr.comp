@@ -1,0 +1,217 @@
+// g5ptq_bytenr.comp - PTQ1_0 5-trit GEMV, RPW output rows per wave.
+//
+// Compiled once per rows-per-wave width (-DRPW=n) and selected at runtime from the
+// device's actual subgroup size, so the wave is filled correctly on wave32, wave64 or
+// wave128 hardware instead of assuming 64.
+//
+//   wave 128 -> RPW 1   (a wave already holds a full row's worth of lanes)
+//   wave  64 -> RPW 2   (gfx803 / RX 580: the case this was written for)
+//   wave  32 -> RPW 4   (RDNA and earlier 32-wide parts)
+//
+// The point is not "use both halves of a wave64" - a wave64 has no half to fill. The
+// point is independent work per wave. With one row per wave every lane runs a single
+// dependent accumulator and loads every x element for that one row. With RPW rows the
+// same x load feeds RPW accumulators:
+//
+//     xv = x[c]                    one load
+//     acc0 += w0 * xv
+//     acc1 += w1 * xv              same xv
+//
+// so x traffic falls by RPW and the scheduler gets RPW independent FMA chains. That
+// matters because the kernel is issue-throughput bound: splitting a SINGLE row into
+// four accumulators measured 0.98x (same MACs, only reordered), whereas this does RPW
+// times the MACs per x load.
+//
+// The accumulators are explicit scalars, not arrays indexed by a loop variable. An
+// array indexed at runtime lands in scratch memory on GCN: that mistake made the T=2
+// batched kernel 5.7x slower once already.
+//
+// Bit-identity: each row's accumulator receives exactly the sequence of FMAs the
+// single-row kernel gives it, so every row is bit-identical and the speculative-verify
+// invariant is untouched.
+//
+// PTQ1_0 block = 128 weights in 28 bytes: 26 trit bytes then an fp16 scale at
+// bytes 26..27. Each trit byte carries five base-3 digits (3^5 = 243 < 256):
+//   bytes  0..15 -> trits j, 16+j, 32+j, 48+j, 64+j        (j = 0..15)
+//   bytes 16..23 -> trits 80+j, 88+j, 96+j, 104+j, 112+j   (j = 0..7)
+//   bytes 24..25 -> trits 120+j, 122+j, 124+j, 126+j       (j = 0..1)
+//
+// Push: { int R; int C; }
+// Bindings: 0 raw blocks as uint words, 1 x (float), 2 out (float)
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+
+#ifndef RPW
+#define RPW 2
+#endif
+#define WGS 256
+#define NSUB (WGS / 64)
+
+layout(local_size_x = WGS) in;
+
+layout(set = 0, binding = 0) readonly buffer BW { uint w[]; };
+layout(set = 0, binding = 1) readonly buffer BX { float x[]; };
+layout(set = 0, binding = 2) buffer BO { float out_[]; };
+
+layout(push_constant) uniform PC { int R; int C; } pc;
+
+shared float sh[NSUB][RPW][64];
+shared float tlf[1280];
+
+const uint P3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
+
+uint block_byte(int row, int bpr, int blk, int byteInBlk) {
+    int bi = (row * bpr + blk) * 28 + byteInBlk;
+    return (w[bi >> 2] >> (8u * uint(bi & 3))) & 0xFFu;
+}
+
+// scale for block <blk> of <row>: bytes 26..27, and a block starts at a multiple of
+// 28, so byte 26 is the high half of word (base/4 + 6)
+float block_scale(int row, int bpr, int blk) {
+    int sb = ((row * bpr + blk) * 28) >> 2;
+    return unpackHalf2x16(w[sb + 6] >> 16).x;
+}
+
+// one digit n of <byte> as a float in {-1,0,1}
+#define TRIT(B5, N) tlf[(B5) + (N)]
+
+void main() {
+    uint sgsz = gl_SubgroupSize;
+    uint nsub = uint(gl_WorkGroupSize.x) / sgsz;
+    int sub = int(gl_SubgroupID);
+
+    for (uint e = gl_LocalInvocationID.x; e < 256u; e += uint(gl_WorkGroupSize.x)) {
+        for (int n = 0; n < 5; ++n) {
+            uint tr = (((e * P3[n]) & 0xFFu) * 3u) >> 8;
+            tlf[e * 5u + uint(n)] = float(int(tr) - 1);
+        }
+    }
+    barrier();
+
+    int R = pc.R;
+    int row0 = (int(gl_WorkGroupID.x) * int(nsub) + sub) * RPW;
+
+    // clamp instead of return: every invocation must reach every barrier()
+    int r0 = row0,     r1 = row0 + 1, r2 = row0 + 2, r3 = row0 + 3;
+    bool k0 = r0 < R,  k1 = false,    k2 = false,    k3 = false;
+#if RPW >= 2
+    k1 = r1 < R;
+#endif
+#if RPW >= 4
+    k2 = r2 < R; k3 = r3 < R;
+#endif
+    if (!k0) r0 = 0;
+    if (!k1) r1 = 0;
+    if (!k2) r2 = 0;
+    if (!k3) r3 = 0;
+
+    uint lane = gl_SubgroupInvocationID;
+    int C = pc.C;
+    int bpr = C >> 7;
+    int ntb = bpr * 26;
+
+    float acc0 = 0.0, acc1 = 0.0, acc2 = 0.0, acc3 = 0.0;
+
+    for (int bi = int(lane); bi < ntb; bi += int(sgsz)) {
+        int blk = bi / 26;
+        int off = bi - blk * 26;
+        int base = blk << 7;
+
+        int b50 = int(block_byte(r0, bpr, blk, off)) * 5;
+        float sc0 = block_scale(r0, bpr, blk);
+#if RPW >= 2
+        int b51 = int(block_byte(r1, bpr, blk, off)) * 5;
+        float sc1 = block_scale(r1, bpr, blk);
+#endif
+#if RPW >= 4
+        int b52 = int(block_byte(r2, bpr, blk, off)) * 5;
+        float sc2 = block_scale(r2, bpr, blk);
+        int b53 = int(block_byte(r3, bpr, blk, off)) * 5;
+        float sc3 = block_scale(r3, bpr, blk);
+#endif
+
+        float p0 = 0.0, p1 = 0.0, p2 = 0.0, p3 = 0.0;
+
+        if (off < 16) {                    // five digits, stride 16
+            for (int n = 0; n < 5; ++n) {
+                float xv = x[base + off + (n << 4)];
+                p0 += TRIT(b50, n) * xv;
+#if RPW >= 2
+                p1 += TRIT(b51, n) * xv;
+#endif
+#if RPW >= 4
+                p2 += TRIT(b52, n) * xv;
+                p3 += TRIT(b53, n) * xv;
+#endif
+            }
+        } else if (off < 24) {             // five digits, stride 8, from trit 80
+            int j = off - 16;
+            for (int n = 0; n < 5; ++n) {
+                float xv = x[base + 80 + j + (n << 3)];
+                p0 += TRIT(b50, n) * xv;
+#if RPW >= 2
+                p1 += TRIT(b51, n) * xv;
+#endif
+#if RPW >= 4
+                p2 += TRIT(b52, n) * xv;
+                p3 += TRIT(b53, n) * xv;
+#endif
+            }
+        } else {                           // four digits, from trit 120
+            int j = off - 24;
+            for (int n = 0; n < 4; ++n) {
+                float xv = x[base + 120 + (n << 1) + j];
+                p0 += TRIT(b50, n) * xv;
+#if RPW >= 2
+                p1 += TRIT(b51, n) * xv;
+#endif
+#if RPW >= 4
+                p2 += TRIT(b52, n) * xv;
+                p3 += TRIT(b53, n) * xv;
+#endif
+            }
+        }
+        acc0 += sc0 * p0;
+#if RPW >= 2
+        acc1 += sc1 * p1;
+#endif
+#if RPW >= 4
+        acc2 += sc2 * p2;
+        acc3 += sc3 * p3;
+#endif
+    }
+
+    // Tree reduction per row, identical arithmetic to the single-row kernel.
+    sh[sub][0][lane] = acc0;
+#if RPW >= 2
+    sh[sub][1][lane] = acc1;
+#endif
+#if RPW >= 4
+    sh[sub][2][lane] = acc2;
+    sh[sub][3][lane] = acc3;
+#endif
+    barrier();
+    for (int st = 32; st > 0; st >>= 1) {
+        if (int(lane) < st) {
+            sh[sub][0][lane] += sh[sub][0][lane + st];
+#if RPW >= 2
+            sh[sub][1][lane] += sh[sub][1][lane + st];
+#endif
+#if RPW >= 4
+            sh[sub][2][lane] += sh[sub][2][lane + st];
+            sh[sub][3][lane] += sh[sub][3][lane + st];
+#endif
+        }
+        barrier();
+    }
+    if (lane == 0u) {
+        if (k0) out_[r0] = sh[sub][0][0];
+#if RPW >= 2
+        if (k1) out_[r1] = sh[sub][1][0];
+#endif
+#if RPW >= 4
+        if (k2) out_[r2] = sh[sub][2][0];
+        if (k3) out_[r3] = sh[sub][3][0];
+#endif
+    }
+}

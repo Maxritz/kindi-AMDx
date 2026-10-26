@@ -1,0 +1,163 @@
+// g5ptq_byte3nr.comp - PTQ1_0 5-trit GEMV, up to THREE tensors sharing one input,
+// RPW rows per wave.
+//
+// Combines the two independent wins on this path:
+//   - fusion: up to three tensors that read the same x in ONE dispatch, so the
+//     COMPUTE->COMPUTE barrier between them disappears
+//   - rows per wave: the same x load feeds RPW row accumulators, so x traffic falls
+//     by RPW and the scheduler gets RPW independent FMA chains
+//
+// Compiled per width (-DRPW=n) and selected from the device's wave size, like the
+// single-tensor kernel: wave128 -> 1, wave64 -> 2, wave32 -> 4.
+//
+// Layout of the wave space: the groups are laid out per tensor, so a wave's RPW rows
+// always belong to the SAME tensor. That keeps the weight-buffer choice outside the
+// inner loop. A first version of the fused kernel selected the buffer per byte with a
+// 3-way ternary and measured 772 us/op against 563; the branch has to be per wave.
+//
+//     tensor0 groups: ceil(R0/RPW)
+//     tensor1 groups: ceil(R1/RPW)
+//     tensor2 groups: ceil(R2/RPW)
+//
+// Each row's accumulator receives exactly the FMA sequence the single-tensor kernel
+// gives it, so every row is bit-identical and the spec invariant is untouched.
+//
+// PTQ1_0 block = 128 weights in 28 bytes: 26 trit bytes then an fp16 scale at
+// bytes 26..27. Each trit byte carries five base-3 digits (3^5 = 243 < 256):
+//   bytes  0..15 -> trits j, 16+j, 32+j, 48+j, 64+j        (j = 0..15)
+//   bytes 16..23 -> trits 80+j, 88+j, 96+j, 104+j, 112+j   (j = 0..7)
+//   bytes 24..25 -> trits 120+j, 122+j, 124+j, 126+j       (j = 0..1)
+//
+// Push: { int R0; int R1; int R2; int C; }
+// Bindings: 0 W0 1 Y0 2 W1 3 Y1 4 W2 5 Y2 6 X
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+
+#ifndef RPW
+#define RPW 2
+#endif
+#define WGS 256
+#define NSUB (WGS / 64)
+
+layout(local_size_x = WGS) in;
+
+layout(set = 0, binding = 0) readonly buffer W0B { uint W0[]; };
+layout(set = 0, binding = 1) buffer Y0B { float Y0[]; };
+layout(set = 0, binding = 2) readonly buffer W1B { uint W1[]; };
+layout(set = 0, binding = 3) buffer Y1B { float Y1[]; };
+layout(set = 0, binding = 4) readonly buffer W2B { uint W2[]; };
+layout(set = 0, binding = 5) buffer Y2B { float Y2[]; };
+layout(set = 0, binding = 6) readonly buffer XB { float x[]; };
+
+layout(push_constant) uniform PC { int R0; int R1; int R2; int C; } pc;
+
+// Always 4 slots wide: GLSL bounds-checks a constant index even inside a branch
+// that RPW makes dead, so a [1][64] array cannot be named with sh[sub][1].
+// 4*4*64*4 = 4 KB of the 32 KB available.
+shared float sh[NSUB][4][64];
+shared float tlf[1280];
+
+const uint P3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
+
+#define TRIT(B5, N) tlf[(B5) + (N)]
+
+// One tensor's row-pair. W is the weight buffer, Y the output, G the group index
+// within this tensor, RR the row count of this tensor.
+#define DO_TENSOR(W, Y, G, RR, BPR, NTB)                                    \
+    {                                                                       \
+        int base_row = (G) * RPW;                                           \
+        int ra = base_row, rb = base_row + 1;                               \
+        bool ka = ra < (RR), kb = (RPW >= 2) && (rb < (RR));                \
+        if (!ka) ra = 0;                                                    \
+        if (!kb) rb = 0;                                                    \
+        float accA = 0.0, accB = 0.0;                                       \
+        for (int bi = int(lane); bi < (NTB); bi += int(sgsz)) {             \
+            int blk = bi / 26;                                              \
+            int off = bi - blk * 26;                                        \
+            int bs = blk << 7;                                              \
+            int wa = ((ra) * (BPR) + blk) * 7 + 6;                          \
+            float sa = unpackHalf2x16(W[wa] >> 16).x;                       \
+            int b5a = int((W[(((ra)*(BPR)+blk)*28+off) >> 2] >>               \
+                        (8u*uint((((ra)*(BPR)+blk)*28+off) & 3))) & 0xFFu) * 5; \
+            int wb = 0, b5b = 0; float sb = 0.0;                            \
+            if (RPW >= 2) {                                                 \
+                wb = ((rb) * (BPR) + blk) * 7 + 6;                          \
+                sb = unpackHalf2x16(W[wb] >> 16).x;                         \
+                b5b = int((W[(((rb)*(BPR)+blk)*28+off) >> 2] >>               \
+                         (8u*uint((((rb)*(BPR)+blk)*28+off) & 3))) & 0xFFu) * 5; \
+            }                                                               \
+            float pA = 0.0, pB = 0.0;                                       \
+            if (off < 16) {                                                 \
+                for (int n = 0; n < 5; ++n) {                               \
+                    float xv = x[bs + off + (n << 4)];                      \
+                    pA += TRIT(b5a, n) * xv;                                \
+                    if (RPW >= 2) pB += TRIT(b5b, n) * xv;                  \
+                }                                                           \
+            } else if (off < 24) {                                          \
+                int j = off - 16;                                           \
+                for (int n = 0; n < 5; ++n) {                               \
+                    float xv = x[bs + 80 + j + (n << 3)];                   \
+                    pA += TRIT(b5a, n) * xv;                                \
+                    if (RPW >= 2) pB += TRIT(b5b, n) * xv;                  \
+                }                                                           \
+            } else {                                                        \
+                int j = off - 24;                                           \
+                for (int n = 0; n < 4; ++n) {                               \
+                    float xv = x[bs + 120 + (n << 1) + j];                  \
+                    pA += TRIT(b5a, n) * xv;                                \
+                    if (RPW >= 2) pB += TRIT(b5b, n) * xv;                  \
+                }                                                           \
+            }                                                               \
+            accA += sa * pA;                                                \
+            if (RPW >= 2) accB += sb * pB;                                  \
+        }                                                                   \
+        sh[sub][0][lane] = accA;                                            \
+        if (RPW >= 2) sh[sub][1][lane] = accB;                              \
+        barrier();                                                          \
+        for (int st = 32; st > 0; st >>= 1) {                               \
+            if (int(lane) < st) {                                           \
+                sh[sub][0][lane] += sh[sub][0][lane + st];                  \
+                if (RPW >= 2) sh[sub][1][lane] += sh[sub][1][lane + st];    \
+            }                                                               \
+            barrier();                                                      \
+        }                                                                   \
+        if (lane == 0u) {                                                   \
+            if (ka) (Y)[ra] = sh[sub][0][0];                                \
+            if (kb) (Y)[rb] = sh[sub][1][0];                                \
+        }                                                                   \
+    }
+
+void main() {
+    uint sgsz = gl_SubgroupSize;
+    uint nsub = uint(gl_WorkGroupSize.x) / sgsz;
+    int sub = int(gl_SubgroupID);
+    uint lane = gl_SubgroupInvocationID;
+
+    for (uint e = gl_LocalInvocationID.x; e < 256u; e += uint(gl_WorkGroupSize.x)) {
+        for (int n = 0; n < 5; ++n) {
+            uint tr = (((e * P3[n]) & 0xFFu) * 3u) >> 8;
+            tlf[e * 5u + uint(n)] = float(int(tr) - 1);
+        }
+    }
+    barrier();
+
+    int R0 = pc.R0, R1 = pc.R1, R2 = pc.R2;
+    int C = pc.C;
+    int bpr = C >> 7;
+    int ntb = bpr * 26;
+
+    int G0 = (R0 + RPW - 1) / RPW;
+    int G1 = (R1 + RPW - 1) / RPW;
+    int G2 = (R2 + RPW - 1) / RPW;
+
+    int gid = int(gl_WorkGroupID.x) * int(nsub) + sub;
+
+    // One branch per wave; the weight buffer is then statically known.
+    if (gid < G0) {
+        DO_TENSOR(W0, Y0, gid, R0, bpr, ntb)
+    } else if (gid < G0 + G1) {
+        DO_TENSOR(W1, Y1, gid - G0, R1, bpr, ntb)
+    } else if (gid < G0 + G1 + G2) {
+        DO_TENSOR(W2, Y2, gid - G0 - G1, R2, bpr, ntb)
+    }
+}

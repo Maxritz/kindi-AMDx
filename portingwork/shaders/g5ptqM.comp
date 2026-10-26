@@ -90,9 +90,10 @@ void main() {
             int blk = bi / 26;
             int off = bi - blk * 26;
             uint raw = block_byte(row, bpr, blk, off);
-            uint dlo = block_byte(row, bpr, blk, 26);
-            uint dhi = block_byte(row, bpr, blk, 27);
-            float s = unpackHalf2x16(dlo | (dhi << 8)).x;
+            // Bytes 26..27 of a 28-byte block; a block starts at a multiple of 28,
+            // so byte 26 is the high half of word (base/4 + 6).
+            int sb = ((row * bpr + blk) * 28) >> 2;
+            float s = unpackHalf2x16(w[sb + 6] >> 16).x;
             int base = blk << 7;
             uint pk = tl[raw];
             float s0 = 0.0, s1 = 0.0;
@@ -116,9 +117,10 @@ void main() {
             int blk = bi / 26;
             int off = bi - blk * 26;
             uint raw = block_byte(row, bpr, blk, off);
-            uint dlo = block_byte(row, bpr, blk, 26);
-            uint dhi = block_byte(row, bpr, blk, 27);
-            float s = unpackHalf2x16(dlo | (dhi << 8)).x;
+            // Bytes 26..27 of a 28-byte block; a block starts at a multiple of 28,
+            // so byte 26 is the high half of word (base/4 + 6).
+            int sb = ((row * bpr + blk) * 28) >> 2;
+            float s = unpackHalf2x16(w[sb + 6] >> 16).x;
             int base = blk << 7;
             uint pk = tl[raw];
             int nlo = (off < 24) ? 5 : 4;

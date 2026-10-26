@@ -7,15 +7,28 @@ Correctness gate: 2B token ids `314 279 69377 314 3000`, 27B ` of Rayleigh scatt
 
 ## Headline
 
-| stage | 2B tokens/s | change |
-|---|---|---|
-| original (per-dispatch fence, g4simple) | ~3.3 |  -  |
-| + dispatch batching | 5.5 | 1.7x |
-| + g4lut (256-entry LUT, 4 trits/byte) | 26.0 | 4.7x |
-| + g4lut2 (4 rows/workgroup, subgroup reduce) | 34.5 | 1.3x |
-| + gemv3 (3 tensors per launch) | **36.3** | 1.05x |
+Generation speed, RX 580 8 GB, greedy, tokens verified identical at every step.
 
-**~11x overall.** All steps verified token-identical.
+| stage | 2B tok/s | 27B tok/s |
+|---|---|---|
+| original (per-dispatch fence, g4simple) | ~3.3 | 0.848 |
+| + dispatch batching | 5.5 | - |
+| + g4lut (256-entry LUT, 4 trits/byte) | 26.0 | - |
+| + g4lut2 (4 rows/workgroup, subgroup reduce) | 34.5 | - |
+| + gemv3 (3 tensors per launch) | 36.3 | - |
+| + byte-granular 5-trit decode | - | 3.29 |
+| + fusion, tiling, float LUT, one-word scale | - | 3.90 |
+| + rows per wave, serial | - | **5.19** |
+| + rows per wave, `--spec` | - | **6.29** |
+| current, 40 tokens | **32.88** | - |
+
+**27B: 7.4x, 0.848 -> 6.29 tok/s with speculative decode.** 2B: 32.88 tok/s, and it
+has NOT had the rows-per-wave treatment yet (its `g4lut2`/`g4lut3` are still one row
+per wave).
+
+The 2B table above is the historical progression and its numbers were measured with a
+144-token prompt; the 27B column is the same 20-token prompt throughout. All steps
+verified token-identical.
 
 ## Where the time goes now (2B, n=40, --trace)
 
@@ -82,6 +95,84 @@ called from both `rmsfold` and `smfold` and is a separate dispatch each time. Th
 I first concluded from that table that the barrier cost was dominated by the small
 shaders. **That was wrong, and the experiment that disproved it is below.** Barrier cost
 scales with the work in flight at the barrier, not with the barrier's existence.
+
+## Rows per wave: 2 rows in flight per wave, 3.90 -> 5.19 tok/s
+
+This is the largest single win after the decode rewrite, and it came from asking the
+right question: a wave64 is 64 lanes, so there is no half-wave to fill. What a wave
+needs is independent work. One row per wave means every lane runs a single dependent
+accumulator and loads every x element for that one row only.
+
+Two rows per wave shares each x load across both rows:
+
+```glsl
+float xv = x[c];          // one load
+accA += tlf[b5A + n] * xv;
+accB += tlf[b5B + n] * xv;  // same xv
+```
+
+x loads were 18% of the kernel by ablation, and this halves them while giving the
+scheduler two independent FMA chains. Measured on the 27B:
+
+| kernel | 1 row/wave | 2 rows/wave | gain |
+|---|---|---|---|
+| `g5ptq_byte4t` -> `g5ptq_bytenr2` | 510.6 us/op | **343.2 us/op** | **1.49x** |
+| `g5ptq_byte3t` -> `g5ptq_byte3nr2` | 918.3 us/op | **660.9 us/op** | **1.39x** |
+| `g5ptqM` -> `g5ptqM2r2` (spec) | 1022 us/op | **449.2 us/op** | **2.28x** |
+
+### It is selected from the device, not assumed
+
+`vulkaninfo` on this card reports `subgroupSize = 64` with `minSubgroupSize =
+maxSubgroupSize = 64`, so no wave-width choice exists here. The shader is one source
+compiled at three widths with `-DRPW=n` and the engine picks from the wave size it
+queries at startup:
+
+| wave | RPW | reasoning |
+|---|---|---|
+| 128 | 1 | a wave already holds a full row's worth of lanes |
+| 64 | 2 | gfx803: fill the issue interval with a second row |
+| 32 | 4 | RDNA and earlier 32-wide parts |
+
+### Not the same as the four-accumulator experiment that failed
+
+Splitting a single row's sum into four accumulators measured 0.98x, because it did the
+same MACs and only reordered them. This does RPW times the MACs per x load, so the work
+per instruction actually falls. The distinction matters: one is a scheduling change, the
+other is a traffic and ILP change.
+
+### Spec was left behind, then fixed
+
+After the serial kernel got rows-per-wave, `--spec` became a net **loss**: 3.74 tok/s
+against serial's 5.19, because `g5ptqM` still ran one row per wave at ~511 us/token.
+`g5ptqM2r2` gives the batched kernel the same treatment, keeping the two reuse axes
+independent: one weight decode feeds T token accumulators, and one x load feeds RPW row
+accumulators.
+
+| | tok/s |
+|---|---|
+| serial, rows-per-wave | 5.19 |
+| spec, before `g5ptqM2r2` | 3.74 |
+| spec, after `g5ptqM2r2` | **6.29** |
+
+### Two implementation traps, both hit
+
+**Arrays indexed by a runtime loop variable land in scratch memory on GCN.** The first
+version used `acc[RPW]` and `sh[sub][r][64]`, and disassembly showed the same 9 float ops
+for RPW=1, 2 and 4: the loops had not been unrolled. Rewriting with explicit scalars and
+`#if RPW >= n` gave 9, 18 and 36 float ops, which is what the change was supposed to do.
+
+**GLSL bounds-checks a constant index even inside a branch the preprocessor makes dead.**
+`shared float sh[NSUB][RPW][64]` at RPW=1 is `[1][64]`, and the macro still names
+`sh[sub][1]`, which fails to compile. Declared at a fixed width of 4 slots instead: 4 KB
+of the 32 KB of LDS.
+
+### Clamp, never return
+
+`barrier()` must be reached by every invocation in the workgroup. Both kernels originally
+wrote `if (row >= R) return;` before the reduction, which is a whole-wave exit and leaves
+the surviving waves waiting on a barrier the exited waves never reach. It worked only
+because every 27B row count is divisible by the workgroup's row count. The shipped
+version clamps the row and suppresses only the store.
 
 ## The scale is one word, not two bytes: 1.04x
 

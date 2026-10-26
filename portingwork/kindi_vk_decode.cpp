@@ -34,6 +34,11 @@ using json = nlohmann::json;
 struct DeviceCtx { VkInstance inst; VkPhysicalDevice phys; VkDevice dev; VkQueue q0,q1,qt; uint32_t cf,tf; VkCommandPool cp,tp; VkPhysicalDeviceMemoryProperties mp; VkPhysicalDeviceProperties pp; };
 static DeviceCtx G;
 static uint32_t findmt(uint32_t bits, VkMemoryPropertyFlags f){ for(uint32_t i=0;i<G.mp.memoryTypeCount;++i) if(((bits>>i)&1)&&((G.mp.memoryTypes[i].propertyFlags&f)==f)) return i; fprintf(stderr,"nomemtype\n");exit(1);}
+// Wave width reported by the device. Decides how many output rows one wave handles in
+// the PTQ1_0 GEMV: a wave128 already holds a full row of lanes, a wave64 wants two rows
+// per wave to fill its issue interval, a wave32 wants four.
+static uint32_t g_wave = 64;
+
 struct Buf { VkBuffer buf=VK_NULL_HANDLE; VkDeviceMemory mem=VK_NULL_HANDLE; VkDeviceSize size=0; void* mapped=nullptr; };
 // live device allocation total: the context fit needs to know what the weights actually
 // took, which is only known after they are uploaded
@@ -211,6 +216,7 @@ static void initdev(){
             gp2(G.phys,&p2);
             uint32_t cu = sc.shaderEngineCount * sc.shaderArraysPerEngineCount * sc.computeUnitsPerShaderArray;
             uint32_t ws = v11.subgroupSize;
+            g_wave = ws;
             ktrace::set_cores(cu, sc.simdPerComputeUnit, sc.wavefrontsPerSimd, ws);
             fprintf(stderr,"shader cores: %u SE x %u array x %u CU = %u CU, %u SIMD/CU, "
                            "%u wavefronts/SIMD (wave %u)\n",
@@ -1060,8 +1066,28 @@ int main(int argc, char**argv){
     // same tree reduction as g5ptq_byte, so the values are bit-identical and the
     // spec bit-identity guarantee still holds.
     Pipe pg5b3=mkpipe((shdir+"/g5ptq_byte3.comp.spv").c_str(),7,16);
+    // 4 rows per 256-thread workgroup, TREE reduction kept so the values stay
+    // bit-identical to g5ptq_byte. KINDI_G5=byte4t selects it for A/B.
+    Pipe pg5b4t=mkpipe((shdir+"/g5ptq_byte4t.comp.spv").c_str(),3,8);
+    // Fused 3-tensor variant with the same 4-rows-per-workgroup geometry.
+    Pipe pg5b3t=mkpipe((shdir+"/g5ptq_byte3t.comp.spv").c_str(),7,16);
     Pipe pg5b4=mkpipe((shdir+"/g5ptq_byte4.comp.spv").c_str(),3,8);
-    Pipe pg5M=mkpipe((shdir+"/g5ptqM.comp.spv").c_str(),3,16);  // batched native PTQ1_0
+    // One source compiled at three rows-per-wave widths; the device's wave size picks
+    // which one runs. See g5ptq_bytenr.comp.
+    const int g5rpw = (g_wave >= 128) ? 1 : (g_wave >= 64) ? 2 : 4;
+    Pipe pg5nr1=mkpipe((shdir+"/g5ptq_bytenr1.comp.spv").c_str(),3,8);
+    Pipe pg5nr2=mkpipe((shdir+"/g5ptq_bytenr2.comp.spv").c_str(),3,8);
+    Pipe pg5nr4=mkpipe((shdir+"/g5ptq_bytenr4.comp.spv").c_str(),3,8);
+    // Fused 3-tensor variants at the same three widths.
+    Pipe pg53nr1=mkpipe((shdir+"/g5ptq_byte3nr1.comp.spv").c_str(),7,16);
+    Pipe pg53nr2=mkpipe((shdir+"/g5ptq_byte3nr2.comp.spv").c_str(),7,16);
+    Pipe pg53nr4=mkpipe((shdir+"/g5ptq_byte3nr4.comp.spv").c_str(),7,16);
+    fprintf(stderr,"PTQ1_0 GEMV: %d row(s) per wave (wave %u)\n", g5rpw, g_wave);
+    // Speculative-verify kernels: T tokens x RPW rows per wave, one per width.
+    Pipe pg5M1 =mkpipe((shdir+"/g5ptqM2r1.comp.spv").c_str(),3,16);
+    Pipe pg5M2 =mkpipe((shdir+"/g5ptqM2r2.comp.spv").c_str(),3,16);
+    Pipe pg5M4 =mkpipe((shdir+"/g5ptqM2r4.comp.spv").c_str(),3,16);
+    Pipe pg5M=mkpipe((shdir+"/g5ptqM.comp.spv").c_str(),3,16);  // previous, for A/B
     Pipe pdeq5=mkpipe((shdir+"/deq_emb5.comp.spv").c_str(),3,12);
     Pipe pfwhi=mkpipe((shdir+"/fwht_hi.comp.spv").c_str(),1,8);
     Pipe pg2=mkpipe((shdir+"/g2pq.comp.spv").c_str(),3,8);
@@ -1258,9 +1284,21 @@ int main(int argc, char**argv){
             } else if(g5 && !strcmp(g5,"old")){
                 bindbufs(pg5,bufs);
                 dispatch(pg5,G.q0,G.cp,rows,1,1,&pc,8);
-            } else {
+            } else if(g5 && !strcmp(g5,"byte1")){
                 bindbufs(pg5b,bufs);
                 dispatch(pg5b,G.q0,G.cp,rows,1,1,&pc,8);
+            } else if(g5 && !strcmp(g5,"byte4t")){
+                bindbufs(pg5b4t,bufs);
+                dispatch(pg5b4t,G.q0,G.cp,(uint32_t)((rows+3)/4),1,1,&pc,8);
+            } else {
+                // Default: rows per wave chosen from the device's wave width, so the
+                // wave is filled the same way on wave32, wave64 and wave128 parts.
+                // 256 threads / wave * rpw rows per workgroup.
+                Pipe* P = (g5rpw == 1) ? &pg5nr1 : (g5rpw == 2) ? &pg5nr2 : &pg5nr4;
+                int wg = 256 / (int)g_wave;
+                int per = wg * g5rpw;
+                bindbufs(*P,bufs);
+                dispatch(*P,G.q0,G.cp,(uint32_t)((rows + per - 1) / per),1,1,&pc,8);
             }
             return;
         }
@@ -1347,9 +1385,24 @@ int main(int argc, char**argv){
             codebufs[ns.size()>1?ns[1]:ns[0]], *(os.size()>1?os[1]:os[0]),
             codebufs[ns.size()>2?ns[2]:ns[0]], *(os.size()>2?os[2]:os[0]),
             xbuf };
-        bindbufs(pg5b3,bufs);
         struct{int R0,R1,R2,C;}pc{R[0],R[1],R[2],C};
-        dispatch(pg5b3,G.q0,G.cp,(uint32_t)(R[0]+R[1]+R[2]),1,1,&pc,16);
+        const char* g5 = getenv("KINDI_G5");
+        if(g5 && !strcmp(g5,"byte3")){
+            bindbufs(pg5b3,bufs);
+            dispatch(pg5b3,G.q0,G.cp,(uint32_t)(R[0]+R[1]+R[2]),1,1,&pc,16);
+        } else if(g5 && !strcmp(g5,"byte3t")){
+            bindbufs(pg5b3t,bufs);
+            dispatch(pg5b3t,G.q0,G.cp,(uint32_t)((R[0]+R[1]+R[2]+3)/4),1,1,&pc,16);
+        } else {
+            // Rows per wave from the device's wave width, groups laid out per tensor
+            // so a wave's rows always share one weight buffer.
+            Pipe* P = (g5rpw == 1) ? &pg53nr1 : (g5rpw == 2) ? &pg53nr2 : &pg53nr4;
+            int wg = 256 / (int)g_wave;
+            auto groups = [&](int R){ return (R + g5rpw - 1) / g5rpw; };
+            int total = groups(R[0]) + groups(R[1]) + groups(R[2]);
+            bindbufs(*P,bufs);
+            dispatch(*P,G.q0,G.cp,(uint32_t)((total + wg - 1) / wg),1,1,&pc,16);
+        }
         return true;
     };
     // T tokens against ONE weight stream (g4lutM). x is token-major [T][C], y is [T][R].
@@ -1922,9 +1975,20 @@ int main(int argc, char**argv){
         int rows = it->second.first, cols = it->second.second;
         if(xstride<0) xstride=cols;
         std::vector<Buf> bufs={codebufs[wname],xbuf,outbuf};
-        bindbufs(pg5M,bufs);
         struct{int R,C,T,xstride;}pc{rows,cols,T,xstride};
-        dispatch(pg5M,G.q0,G.cp,(uint32_t)rows,1,1,&pc,16);
+        const char* g5 = getenv("KINDI_G5");
+        if(g5 && !strcmp(g5,"Mold")){
+            bindbufs(pg5M,bufs);
+            dispatch(pg5M,G.q0,G.cp,(uint32_t)rows,1,1,&pc,16);
+        } else {
+            // Same rows-per-wave selection as the serial kernel, so spec keeps pace
+            // with it instead of falling behind.
+            Pipe* P = (g5rpw == 1) ? &pg5M1 : (g5rpw == 2) ? &pg5M2 : &pg5M4;
+            int wg = 256 / (int)g_wave;
+            int per = wg * g5rpw;
+            bindbufs(*P,bufs);
+            dispatch(*P,G.q0,G.cp,(uint32_t)((rows + per - 1) / per),1,1,&pc,16);
+        }
         return true;
     };
     // Batched GEMV for any supported format: Q8_0, PQ2_0, native 5-trit or 4-trit.
@@ -2424,8 +2488,12 @@ int main(int argc, char**argv){
             { std::vector<Buf> b={codebufs[n5],xb,y1}; bindbufs(pg5,b);
               struct{int R,C;}pc{R,C}; dispatch(pg5,G.q0,G.cp,(uint32_t)R,1,1,&pc,8); }
             batch_flush();
-            { std::vector<Buf> b={codebufs[n5],xb,y2}; bindbufs(pg5M,b);
-              struct{int R,C,T,xstride;}pc{R,C,2,C}; dispatch(pg5M,G.q0,G.cp,(uint32_t)R,1,1,&pc,16); }
+            { std::vector<Buf> b={codebufs[n5],xb,y2};
+              Pipe* P = (g5rpw == 1) ? &pg5M1 : (g5rpw == 2) ? &pg5M2 : &pg5M4;
+              int wg = 256 / (int)g_wave, per = wg * g5rpw;
+              bindbufs(*P,b);
+              struct{int R,C,T,xstride;}pc{R,C,2,C};
+              dispatch(*P,G.q0,G.cp,(uint32_t)((R+per-1)/per),1,1,&pc,16); }
             batch_flush();
             auto a=rd(y1,R), bb=rd(y2,R*2);
             double e0=0,e1=0;
@@ -2446,11 +2514,19 @@ int main(int argc, char**argv){
             {
                 Buf z1=mkbuf((VkDeviceSize)R*4,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
                 Buf z2=mkbuf((VkDeviceSize)R*2*4,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-                { std::vector<Buf> b={codebufs[n5],xb,z1}; bindbufs(pg5b,b);
-                  struct{int R,C;}pc{R,C}; dispatch(pg5b,G.q0,G.cp,(uint32_t)R,1,1,&pc,8); }
+                { std::vector<Buf> b={codebufs[n5],xb,z1};
+                  Pipe* P = (g5rpw == 1) ? &pg5nr1 : (g5rpw == 2) ? &pg5nr2 : &pg5nr4;
+                  int wg = 256 / (int)g_wave, per = wg * g5rpw;
+                  bindbufs(*P,b);
+                  struct{int R,C;}pc{R,C};
+                  dispatch(*P,G.q0,G.cp,(uint32_t)((R+per-1)/per),1,1,&pc,8); }
                 batch_flush();
-                { std::vector<Buf> b={codebufs[n5],xb,z2}; bindbufs(pg5M,b);
-                  struct{int R,C,T,xstride;}pc{R,C,2,C}; dispatch(pg5M,G.q0,G.cp,(uint32_t)R,1,1,&pc,16); }
+                { std::vector<Buf> b={codebufs[n5],xb,z2};
+                  Pipe* P = (g5rpw == 1) ? &pg5M1 : (g5rpw == 2) ? &pg5M2 : &pg5M4;
+                  int wg = 256 / (int)g_wave, per = wg * g5rpw;
+                  bindbufs(*P,b);
+                  struct{int R,C,T,xstride;}pc{R,C,2,C};
+                  dispatch(*P,G.q0,G.cp,(uint32_t)((R+per-1)/per),1,1,&pc,16); }
                 batch_flush();
                 auto c1=rd(z1,R), c2=rd(z2,R*2);
                 double f0=0,f1=0;
@@ -2458,9 +2534,11 @@ int main(int argc, char**argv){
                     double d0=std::fabs(c1[i]-c2[i]);   if(d0>f0) f0=d0;
                     double d1=std::fabs(c1[i]-c2[R+i]); if(d1>f1) f1=d1;
                 }
-                fprintf(stderr,"selftest PTQ1_0 byte T=2: max|y1-y2[0]|=%.3e  max|y1-y2[1]|=%.3e\n", f0,f1);
+                fprintf(stderr,"selftest PTQ1_0 rpw%d T=2: max|y1-y2[0]|=%.3e  max|y1-y2[1]|=%.3e\n",
+                        g5rpw, f0, f1);
                 bool o5b = (f0 == 0.0) && (f1 == 0.0);
-                fprintf(stderr,"selftest PTQ1_0 byte: %s\n", o5b ? "PASS (bit-identical)" : "FAIL");
+                fprintf(stderr,"selftest PTQ1_0 rpw%d: %s\n", g5rpw,
+                        o5b ? "PASS (bit-identical)" : "FAIL");
                 ok = ok && o5b;
                 freebuf(z1); freebuf(z2);
 
@@ -2471,13 +2549,20 @@ int main(int argc, char**argv){
                 Buf fu2=mkbuf((VkDeviceSize)R*4,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
                 Buf fu3=mkbuf((VkDeviceSize)R*4,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
                 Buf fu0=mkbuf((VkDeviceSize)R*4,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-                { std::vector<Buf> b={codebufs[n5],xb,fu0}; bindbufs(pg5b,b);
-                  struct{int R,C;}pc{R,C}; dispatch(pg5b,G.q0,G.cp,(uint32_t)R,1,1,&pc,8); }
+                { std::vector<Buf> b={codebufs[n5],xb,fu0};
+                  Pipe* P = (g5rpw == 1) ? &pg5nr1 : (g5rpw == 2) ? &pg5nr2 : &pg5nr4;
+                  int wg = 256 / (int)g_wave, per = wg * g5rpw;
+                  bindbufs(*P,b);
+                  struct{int R,C;}pc{R,C};
+                  dispatch(*P,G.q0,G.cp,(uint32_t)((R+per-1)/per),1,1,&pc,8); }
                 batch_flush();
                 { std::vector<Buf> b={codebufs[n5],fu1,codebufs[n5],fu2,codebufs[n5],fu3,xb};
-                  bindbufs(pg5b3,b);
+                  Pipe* P = (g5rpw == 1) ? &pg53nr1 : (g5rpw == 2) ? &pg53nr2 : &pg53nr4;
+                  int wg = 256 / (int)g_wave;
+                  int g = (R + g5rpw - 1) / g5rpw;
+                  bindbufs(*P,b);
                   struct{int R0,R1,R2,C;}pc{R,R,R,C};
-                  dispatch(pg5b3,G.q0,G.cp,(uint32_t)(3*R),1,1,&pc,16); }
+                  dispatch(*P,G.q0,G.cp,(uint32_t)((3*g + wg - 1) / wg),1,1,&pc,16); }
                 batch_flush();
                 auto v0=rd(fu0,R), v1=rd(fu1,R), v2=rd(fu2,R), v3=rd(fu3,R);
                 double fg1e=0,fg2e=0,fg3e=0;
@@ -2487,9 +2572,11 @@ int main(int argc, char**argv){
                     d=std::fabs(v0[i]-v2[i]); if(d>fg2e) fg2e=d;
                     d=std::fabs(v0[i]-v3[i]); if(d>fg3e) fg3e=d;
                 }
-                fprintf(stderr,"selftest PTQ1_0 fused3: max|dy0|=%.3e |dy1|=%.3e |dy2|=%.3e\n", fg1e,fg2e,fg3e);
+                fprintf(stderr,"selftest PTQ1_0 fused3r%d: max|dy0|=%.3e |dy1|=%.3e |dy2|=%.3e\n",
+                        g5rpw, fg1e,fg2e,fg3e);
                 bool o5c = (fg1e == 0.0) && (fg2e == 0.0) && (fg3e == 0.0);
-                fprintf(stderr,"selftest PTQ1_0 fused3: %s\n", o5c ? "PASS (bit-identical)" : "FAIL");
+                fprintf(stderr,"selftest PTQ1_0 fused3r%d: %s\n", g5rpw,
+                        o5c ? "PASS (bit-identical)" : "FAIL");
                 ok = ok && o5c;
                 freebuf(fu0); freebuf(fu1); freebuf(fu2); freebuf(fu3);
             }

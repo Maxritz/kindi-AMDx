@@ -81,7 +81,7 @@ To build from source instead of using the zip, run `portingwork/build.ps1`.
 ```
 
 27B PTQ1_0 with MTP head (Ternary-Bonsai-2-27B-PTQ1_0-mtp-procreations.gguf) - token-exact,
-and the only model here that drafts: add `--spec 20` for 1.47x
+5.19 tok/s, and the only model here that drafts: add `--spec 20` for 6.29 tok/s
 
 ```powershell
 .\kindi_vk_decode.exe --model C:\x\Ternary-Bonsai-2-27B-PTQ1_0-mtp-procreations.gguf `
@@ -103,16 +103,33 @@ are actually prefilled.
 |---|---|---|---|---|
 | 2B PTQ1_0 | 39.3 tok/s | 69.0 tok/s | 32-34 tok/s | n/a (no MTP head) |
 | 27B PQ2_0 | 1.71 tok/s | 3.03 tok/s | 1.5 tok/s | n/a (no MTP head) |
-| 27B PTQ1_0 + MTP | 1.7 tok/s | 3.0 tok/s | **1.45 tok/s** | **1.25 tok/s** |
+| 27B PTQ1_0 + MTP | 3.75 tok/s | 3.75 tok/s | **5.19 tok/s** | **6.29 tok/s** |
 
-The 27B PTQ1_0 generation figure is 1.45 tok/s after the 5-trit GEMV rewrite
-(`g5ptq`), which took the kernel from 2643 to 1469 us per launch, 1.80x. Two costs
-were in the inner loop: decoding the fp16 scale once per weight instead of once per
-128-weight block, and a data-dependent `3^n` multiply chain per weight. The scale is
-now widened once at load time into its own buffer, and `3^n` is a lookup. Output is
-token-identical and `--selftest` passes. The `--spec` column was measured before this
-change; both paths use the same kernel, so the ratio should hold, but the absolute
-numbers will be re-measured.
+The 27B PTQ1_0 generation figure is **5.19 tok/s**, and **6.29 with `--spec`**, against
+0.848 when this port started. That is 7.4x, and every step is token-identical.
+
+The work was on `g5ptq`, the PTQ1_0 GEMV that is 94% of a 27B token. It went from
+2643 us per launch to 343:
+
+- **byte-granular decode.** PTQ1_0 packs five base-3 digits per byte (3^5 = 243 < 256),
+  so one byte load now yields five weights instead of one.
+- **a float LUT.** The trits are pre-converted to floats in shared memory, so the inner
+  loop is one LDS load and one FMA per weight instead of a shift, an and, a convert and
+  a subtract.
+- **rows per wave.** Two output rows per wave share every x load and give the scheduler
+  two independent FMA chains. This was the largest single win, 1.49x.
+- **one-word scale.** A block starts at a multiple of 28 and 28 is a multiple of 4, so
+  the fp16 scale is always the high half of one word, not two separate byte loads.
+- **fusion.** Up to three tensors that read the same input run in one dispatch, so the
+  barrier between them disappears.
+
+The kernel is instruction-bound, not bandwidth-bound: making every weight read
+cache-resident changed the time by 2%. 5.19 tok/s needs ~19 instructions per weight on
+this card's 3.09 T lane-ops/s; 8 tok/s would need ~14.
+
+`--spec` uses a separate batched kernel (`g5ptqM2r2`), which gets the same rows-per-wave
+treatment so it stays ahead of the serial path: one weight decode feeds both tokens, and
+one x load feeds both rows.
 
 Chunked prefill buys 1.76x on the 2B and 1.77x on the 27B. Token generation is not
 affected, because decode is always a single token per pass. It is off by default; set the
