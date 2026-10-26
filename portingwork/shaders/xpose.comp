@@ -1,0 +1,31 @@
+// xpose.comp - transpose the prefill activation from token-major to column-major.
+//
+// Why this exists: the prefill GEMV reads four token values for the same weight, so it
+// wants them ADJACENT in memory. With token-major x ([T][C], stride C) the four values
+// for one weight are C floats apart - 24 KB on the 27B - which is four separate cache
+// streams per weight byte. Measured cost: 3.16x (1716 -> 543 us/op when all four chains
+// were made to read one stream).
+//
+// After this pass x is [C][T], so x[c*T + t] is contiguous and one 16-byte load serves
+// all four tokens.
+//
+// One dispatch per norm, against five GEMVs per norm, so the transpose is cheap.
+//
+// Push: { int C; int T; int inStride; }   in: [T][inStride]  out: [C][T]
+// Bindings: 0 in, 1 out
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer BIn { float xin[]; };
+layout(set = 0, binding = 1) buffer BOut { float xout[]; };
+
+layout(push_constant) uniform PC { int C; int T; int inStride; } pc;
+
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    int n = pc.C * pc.T;
+    if (i >= n) return;
+    int c = i / pc.T;          // column
+    int t = i - c * pc.T;      // token
+    xout[i] = xin[t * pc.inStride + c];
+}

@@ -1087,6 +1087,13 @@ int main(int argc, char**argv){
     Pipe pg5M1 =mkpipe((shdir+"/g5ptqM2r1.comp.spv").c_str(),3,16);
     Pipe pg5M2 =mkpipe((shdir+"/g5ptqM2r2.comp.spv").c_str(),3,16);
     Pipe pg5M4 =mkpipe((shdir+"/g5ptqM2r4.comp.spv").c_str(),3,16);
+    // Prefill kernel: T=4 token chains, one row per wave. One weight decode feeds four
+    // FMAs, which is the whole point of prefill.
+    Pipe pg5pf=mkpipe((shdir+"/g5ptq_pf.comp.spv").c_str(),3,16);
+    Pipe pxpose=mkpipe((shdir+"/xpose.comp.spv").c_str(),2,12);
+    // Prefill with rows per wave as well: 2 rows x 4 tokens = 8 chains per lane, all
+    // fed by the same four x loads (column-major) and one weight byte.
+    Pipe pg5pf2=mkpipe((shdir+"/g5ptq_pf2r2.comp.spv").c_str(),3,16);
     Pipe pg5M=mkpipe((shdir+"/g5ptqM.comp.spv").c_str(),3,16);  // previous, for A/B
     Pipe pdeq5=mkpipe((shdir+"/deq_emb5.comp.spv").c_str(),3,12);
     Pipe pfwhi=mkpipe((shdir+"/fwht_hi.comp.spv").c_str(),1,8);
@@ -1153,8 +1160,35 @@ int main(int argc, char**argv){
     // verify pass runs T=2 regardless of KINDI_CHUNK.
     const int CT = (CHUNK>2) ? CHUNK : ((spec_n>0) ? 2 : 1);
     Buf hT=Z(D*CT), xnT=Z(D*CT), xpT=Z(work*CT), zvT=Z(NV*HK*CT), outT=Z(NV*HK*CT);
+    // Column-major copy of xpT for the prefill GEMV: [C][T] instead of [T][C], so the T
+    // token values for one weight are adjacent and share cache lines. With four separate
+    // streams the prefill GEMV measured 3.16x slower (1716 vs 543 us/op).
+    Buf xpcT=Z(work*CT), fpcT=Z(NFF*CT);
+    // Transpose xpT ([T][work]) into xpcT ([work][T]) for the prefill GEMV. One dispatch
+    // per norm against five GEMVs, so it is cheap.
+    // Column-major x is only for the T=4 prefill kernel. The T=2 verify kernel reads
+    // token-major, so this is a no-op there and the callers pick the buffer by T.
+    auto xpose_pre=[&](int C, int T, int inStride){
+        if(T != 4) return;
+        std::vector<Buf> bufs={xpT, xpcT};
+        bindbufs(pxpose,bufs);
+        struct{int C,T,inStride;}pc{C,T,inStride};
+        int nn=C*T;
+        dispatch(pxpose,G.q0,G.cp,(uint32_t)((nn+255)/256),1,1,&pc,12);
+    };
     Buf qkvT=Z(CONV_CH*CT), csT=Z(CONV_CH*CT), gbT=Z(NV*CT), ggT=Z(NV*CT);
     Buf ffgT=Z(NFF*CT), ffuT=Z(NFF*CT), fo6T=Z(NFF*CT), yT=Z(VOCAB*CT);
+    // Same for fo6T (the SwiGLU output feeding ffn_down): it is token-major, so
+    // transposing it first is what lets ffn_down use the column-major kernel.
+    auto xpose_ff=[&](int C, int T, int inStride){
+        if(T != 4) return;
+        std::vector<Buf> bufs={fo6T, fpcT};
+        bindbufs(pxpose,bufs);
+        struct{int C,T,inStride;}pc{C,T,inStride};
+        int nn=C*T;
+        dispatch(pxpose,G.q0,G.cp,(uint32_t)((nn+255)/256),1,1,&pc,12);
+    };
+
     Buf logT = (spec_n>0) ? Z(VOCAB*CT) : Z(4);   // verify logits, one row per token
     Buf h2T=Z(D*CT), qkbufT=Z(2*NK*HK*CT), goutT=Z(NV*HK*CT);
     // per-layer copies of the GDN inputs a speculative verify pass must keep so the
@@ -1967,7 +2001,7 @@ int main(int argc, char**argv){
     };
     // Batched native PTQ1_0 GEMV (27B). Mirrors g5ptq exactly, so T=1 matches it bit
     // for bit and row t of a T>1 launch matches a separate T=1 launch.
-    auto gemvM5ptq=[&](const std::string&wname, Buf&xbuf, Buf&outbuf, int T, int xstride)->bool{
+    auto gemvM5ptq=[&](const std::string&wname, Buf&xbuf, Buf&outbuf, int T, int xstride, bool colmaj=false)->bool{
         if(T < 1 || T > 4) return false;
         if(!native_names.count(wname)) return false;
         auto it = tinfo.find(wname);
@@ -1977,12 +2011,19 @@ int main(int argc, char**argv){
         std::vector<Buf> bufs={codebufs[wname],xbuf,outbuf};
         struct{int R,C,T,xstride;}pc{rows,cols,T,xstride};
         const char* g5 = getenv("KINDI_G5");
-        // g5ptqM2r* has exactly two token chains, so it is only valid for T<=2. The
-        // speculative verify pass uses T=2; chunked prefill uses T=4. Sending T=4 to
-        // the 2-token kernel left tokens 2 and 3 uncomputed and prefill emitted
-        // different tokens from the serial path, so anything above 2 falls back to
-        // the generic batched kernel.
-        if(T > 2 || (g5 && !strcmp(g5,"Mold"))){
+        // Each kernel has a fixed number of token chains, so the token count picks it:
+        //   T=1  g5ptq_bytenr*   (rows per wave, decode)
+        //   T=2  g5ptqM2r*       (2 tokens x 2 rows, speculative verify)
+        //   T=4  g5ptq_pf        (4 token chains, prefill)
+        //   else g5ptqM          (generic fallback)
+        // Sending T=4 to the 2-token kernel left tokens 2 and 3 uncomputed and prefill
+        // emitted different tokens from the serial path.
+        if(T == 4 && colmaj && !(g5 && !strcmp(g5,"Mold"))){
+            // xbuf is column-major [C][T]. g5ptq_pf2r does 2 rows x 4 tokens, so the
+            // workgroup covers 8 rows.
+            bindbufs(pg5pf2,bufs);
+            dispatch(pg5pf2,G.q0,G.cp,(uint32_t)((rows+7)/8),1,1,&pc,16);
+        } else if(T > 2 || (g5 && !strcmp(g5,"Mold"))){
             bindbufs(pg5M,bufs);
             dispatch(pg5M,G.q0,G.cp,(uint32_t)rows,1,1,&pc,16);
         } else {
@@ -1997,11 +2038,12 @@ int main(int argc, char**argv){
         return true;
     };
     // Batched GEMV for any supported format: Q8_0, PQ2_0, native 5-trit or 4-trit.
-    auto gemvT=[&](const std::string&wname, Buf&xbuf, Buf&outbuf, int T, int xstride)->bool{
+    auto gemvT=[&](const std::string&wname, Buf&xbuf, Buf&outbuf, int T, int xstride,
+                   bool colmaj=false)->bool{
         if(gemvM(wname, xbuf, outbuf, T, xstride)) return true;
         if(gemvM2pq(wname, xbuf, outbuf, T, xstride)) return true;
         if(gemvMQ8(wname, xbuf, outbuf, T, xstride)) return true;
-        if(gemvM5ptq(wname, xbuf, outbuf, T, xstride)) return true;
+        if(gemvM5ptq(wname, xbuf, outbuf, T, xstride, colmaj)) return true;
         if(gemvMQ4(wname, xbuf, outbuf, T, xstride)) return true;
         return false;
     };
@@ -2149,6 +2191,7 @@ int main(int argc, char**argv){
                     struct{int Cc,add,HB,nchunk,stride,ostride;}pc{D,pending,hbArg,D/chunkLen,D,work};
                     dispatch(prmsfoldT,G.q0,G.cp,(uint32_t)(T*pc.nchunk),1,1,&pc,24);
                     for(int t=0;t<T;++t) fold_hi_off(xpT, D, t, work);
+                    xpose_pre(D, T, work);
                     if(pending>0) std::swap(hT,h2T);   // only when a residual was added
                     pending=0;
                 }
@@ -2158,8 +2201,12 @@ int main(int argc, char**argv){
                 Buf& Lqk  = cap ? qkL[il]  : qkbufT;
                 Buf& Lgg  = cap ? ggL[il]  : ggT;
                 Buf& Lgb  = cap ? gbL[il]  : gbT;
-                if(!gemvT(p+"attn_qkv.weight", xpT, Lqkv, T, work)) return false;
-                if(!gemvT(p+"attn_gate.weight", xpT, zvT, T, work)) return false;
+                {
+                    const bool cm = (T == 4);
+                    Buf& XG = cm ? xpcT : xpT;
+                    if(!gemvT(p+"attn_qkv.weight", XG, Lqkv, T, work, cm)) return false;
+                    if(!gemvT(p+"attn_gate.weight", XG, zvT, T, work, cm)) return false;
+                }
                 // gates
                 {
                     std::vector<Buf> bufs={xnT, f32bufs[p+"ssm_beta.weight"], f32bufs[p+"ssm_alpha.weight"],
@@ -2205,8 +2252,9 @@ int main(int argc, char**argv){
                     struct{int HB,phd,pnk,prep,nchunk,C,stride,ostride;}pc{hbArg,HK,NK,NV/NK,(NV*HK)/chunkLen,NV*HK,NV*HK,work};
                     dispatch(psmfoldT,G.q0,G.cp,(uint32_t)(T*pc.nchunk),1,1,&pc,32);
                     for(int t=0;t<T;++t) fold_hi_off(xpT, NV*HK, t, work);
+                    xpose_pre(NV*HK, T, work);
                 }
-                if(!gemvT(p+"ssm_out.weight", xpT, yT, T, work)) return false;
+                if(!gemvT(p+"ssm_out.weight", (T == 4) ? xpcT : xpT, yT, T, work, T == 4)) return false;
                 pending=1;
             } else {
                 // ---------------- attention layer, per token ----------------
@@ -2234,11 +2282,16 @@ int main(int argc, char**argv){
                 struct{int Cc,add,HB,nchunk,stride,ostride;}pc{D,pending,hbArg,D/chunkLen,D,work};
                 dispatch(prmsfoldT,G.q0,G.cp,(uint32_t)(T*pc.nchunk),1,1,&pc,24);
                 for(int t=0;t<T;++t) fold_hi_off(xpT, D, t, work);
+                xpose_pre(D, T, work);
                 if(pending>0) std::swap(hT,h2T);
                 pending=0;
             }
-            if(!gemvT(p+"ffn_gate.weight", xpT, ffgT, T, work)) return false;
-            if(!gemvT(p+"ffn_up.weight", xpT, ffuT, T, work)) return false;
+            {
+                const bool cm = (T == 4);
+                Buf& XG = cm ? xpcT : xpT;
+                if(!gemvT(p+"ffn_gate.weight", XG, ffgT, T, work, cm)) return false;
+                if(!gemvT(p+"ffn_up.weight", XG, ffuT, T, work, cm)) return false;
+            }
             {
                 std::vector<Buf> bufs={ffgT, ffuT, sFb, fo6T};
                 bindbufs(psmfoldT,bufs);
@@ -2246,8 +2299,9 @@ int main(int argc, char**argv){
                 struct{int HB,phd,pnk,prep,nchunk,C,stride,ostride;}pc{hbArg,0,0,0,NFF/chunkLen,NFF,NFF,NFF};
                 dispatch(psmfoldT,G.q0,G.cp,(uint32_t)(T*pc.nchunk),1,1,&pc,32);
                 for(int t=0;t<T;++t) fold_hi_off(fo6T, NFF, t, NFF);
+                xpose_ff(NFF, T, NFF);
             }
-            if(!gemvT(p+"ffn_down.weight", fo6T, yT, T, NFF)) return false;
+            if(!gemvT(p+"ffn_down.weight", (T == 4) ? fpcT : fo6T, yT, T, NFF, T == 4)) return false;
             pending=1;
         }
         return true;

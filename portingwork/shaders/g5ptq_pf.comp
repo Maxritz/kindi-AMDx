@@ -1,0 +1,163 @@
+// g5ptq_pf.comp - PTQ1_0 5-trit GEMV for prefill: T tokens against one weight stream.
+//
+// Prefill is a different shape from decode and needs a different kernel. In decode the
+// same weight is used for one MAC. In prefill the same weight is used for T MACs, so
+// the weight load and the trit decode amortise T times and only the FMAs scale:
+//
+//   decode   per weight: 1 weight load, 1 LDS, 1 FMA          ~19 ops per MAC
+//   prefill  per weight: 1 weight load, 1 LDS, T FMA          ~(2+T) ops for T MACs
+//
+// At T=4 that is 6 ops for 4 MACs, 1.5 per MAC, so prefill should approach the FMA
+// floor rather than the decode bound. The floor is 27G weights x 1 FMA at 3.09 T
+// lane-ops/s = 8.7 ms/token = 114 tok/s.
+//
+// No rows-per-wave here on purpose. RPW exists to give decode a second independent
+// chain; with T tokens there are already T independent chains, so one row per wave is
+// the right shape and keeps the register count down.
+//
+// Compiled per token count (-DTT=n) so the accumulators are explicit scalars. An array
+// indexed by a runtime loop variable lands in scratch memory on GCN: that mistake made
+// the T=2 kernel 5.7x slower once already.
+//
+// Bit-identity: each token's accumulator receives the same FMA sequence the
+// single-token kernel gives it, so prefill is bit-identical to serial and
+// `--selftest` can gate on it.
+//
+// PTQ1_0 block = 128 weights in 28 bytes: 26 trit bytes then an fp16 scale at
+// bytes 26..27. Each trit byte carries five base-3 digits (3^5 = 243 < 256):
+//   bytes  0..15 -> trits j, 16+j, 32+j, 48+j, 64+j        (j = 0..15)
+//   bytes 16..23 -> trits 80+j, 88+j, 96+j, 104+j, 112+j   (j = 0..7)
+//   bytes 24..25 -> trits 120+j, 122+j, 124+j, 126+j       (j = 0..1)
+//
+// x is COLUMN-major [C][TT]: the TT token values for one column are adjacent, so the
+// TT chains share cache lines. Token-major x cost 3.16x here (1716 -> 543 us/op with a
+// single stream), which is why xpose.comp runs once per norm before the GEMVs.
+//
+// Push: { int R; int C; int T; int xstride; }   xstride is unused; x is [C][TT]
+// Bindings: 0 raw blocks as uint words, 1 x, 2 out ([T][R])
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+
+#ifndef TT
+#define TT 4
+#endif
+#define WGS 256
+#define NSUB (WGS / 64)
+
+layout(local_size_x = WGS) in;
+
+layout(set = 0, binding = 0) readonly buffer BW { uint w[]; };
+layout(set = 0, binding = 1) readonly buffer BX { float x[]; };
+layout(set = 0, binding = 2) buffer BO { float out_[]; };
+
+layout(push_constant) uniform PC { int R; int C; int T; int xstride; } pc;
+
+// One row per wave, TT token sums per row.
+shared float sh[NSUB][TT][64];
+shared float tlf[1280];
+
+const uint P3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
+
+uint block_byte(int row, int bpr, int blk, int byteInBlk) {
+    int bi = (row * bpr + blk) * 28 + byteInBlk;
+    return (w[bi >> 2] >> (8u * uint(bi & 3))) & 0xFFu;
+}
+
+#define TRIT(B5, N) tlf[(B5) + (N)]
+
+void main() {
+    uint sgsz = gl_SubgroupSize;
+    uint nsub = uint(gl_WorkGroupSize.x) / sgsz;
+    int sub = int(gl_SubgroupID);
+    uint lane = gl_SubgroupInvocationID;
+
+    for (uint e = gl_LocalInvocationID.x; e < 256u; e += uint(gl_WorkGroupSize.x)) {
+        for (int n = 0; n < 5; ++n) {
+            uint tr = (((e * P3[n]) & 0xFFu) * 3u) >> 8;
+            tlf[e * 5u + uint(n)] = float(int(tr) - 1);
+        }
+    }
+    barrier();
+
+    int R = pc.R;
+    int C = pc.C;
+    int xs = pc.xstride;
+    int bpr = C >> 7;
+    int ntb = bpr * 26;
+
+    int row = int(gl_WorkGroupID.x) * int(nsub) + sub;
+    bool ok = row < R;
+    if (!ok) row = 0;          // clamp, never return: barriers must be reached
+
+    float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+
+    for (int bi = int(lane); bi < ntb; bi += int(sgsz)) {
+        int blk = bi / 26;
+        int off = bi - blk * 26;
+        int base = blk << 7;
+
+        int b5 = int(block_byte(row, bpr, blk, off)) * 5;
+        // Bytes 26..27 of a 28-byte block; a block starts at a multiple of 28, so
+        // byte 26 is the high half of word (base/4 + 6).
+        int sb = ((row * bpr + blk) * 28) >> 2;
+        float s = unpackHalf2x16(w[sb + 6] >> 16).x;
+
+        float p0 = 0.0, p1 = 0.0, p2 = 0.0, p3 = 0.0;
+        if (off < 16) {
+            for (int n = 0; n < 5; ++n) {
+                float wv = TRIT(b5, n);
+                int xi = (base + off + (n << 4)) * 4;
+                p0 += wv * x[xi];
+                p1 += wv * x[xi + 1];
+                p2 += wv * x[xi + 2];
+                p3 += wv * x[xi + 3];
+            }
+        } else if (off < 24) {
+            int j = off - 16;
+            for (int n = 0; n < 5; ++n) {
+                float wv = TRIT(b5, n);
+                int xi = (base + 80 + j + (n << 3)) * 4;
+                p0 += wv * x[xi];
+                p1 += wv * x[xi + 1];
+                p2 += wv * x[xi + 2];
+                p3 += wv * x[xi + 3];
+            }
+        } else {
+            int j = off - 24;
+            for (int n = 0; n < 4; ++n) {
+                float wv = TRIT(b5, n);
+                int xi = (base + 120 + (n << 1) + j) * 4;
+                p0 += wv * x[xi];
+                p1 += wv * x[xi + 1];
+                p2 += wv * x[xi + 2];
+                p3 += wv * x[xi + 3];
+            }
+        }
+        a0 += s * p0;
+        a1 += s * p1;
+        a2 += s * p2;
+        a3 += s * p3;
+    }
+
+    // Tree reduction per token, identical arithmetic to the single-token kernel.
+    sh[sub][0][lane] = a0;
+    sh[sub][1][lane] = a1;
+    sh[sub][2][lane] = a2;
+    sh[sub][3][lane] = a3;
+    barrier();
+    for (int st = 32; st > 0; st >>= 1) {
+        if (int(lane) < st) {
+            sh[sub][0][lane] += sh[sub][0][lane + st];
+            sh[sub][1][lane] += sh[sub][1][lane + st];
+            sh[sub][2][lane] += sh[sub][2][lane + st];
+            sh[sub][3][lane] += sh[sub][3][lane + st];
+        }
+        barrier();
+    }
+    if (lane == 0u && ok) {
+        out_[row] = sh[sub][0][0];
+        out_[R + row] = sh[sub][1][0];
+        out_[2 * R + row] = sh[sub][2][0];
+        out_[3 * R + row] = sh[sub][3][0];
+    }
+}

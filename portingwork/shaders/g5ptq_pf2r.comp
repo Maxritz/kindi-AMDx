@@ -1,0 +1,181 @@
+// g5ptq_pf.comp - PTQ1_0 5-trit GEMV for prefill: RPW rows x 4 tokens per wave.
+//
+// Prefill and decode amortise the weight decode along different axes, and this kernel
+// does both at once:
+//
+//   decode   one weight, one token, RPW rows   -> x shared across rows
+//   prefill  one weight, four tokens, 1 row    -> x shared across tokens
+//   here     one weight, four tokens, RPW rows -> x shared across BOTH
+//
+// Per digit the inner loop loads RPW*4 x values... except it does not: the x value for
+// (column, token) is the same for every row, so RPW*4 FMAs come from 4 loads:
+//
+//     xv0..xv3 = x[col*4 + 0..3]        four loads, column-major [C][T]
+//     accA0 += wA * xv0  ...  accA3 += wA * xv3
+//     accB0 += wB * xv0  ...  accB3 += wB * xv3
+//
+// That is 8 FMAs per 4 loads, against 4 FMAs per 4 loads for prefill alone and 2 per 1
+// for decode alone. The weight byte, the trit table lookup and the scale are all shared
+// across all 8.
+//
+// x is COLUMN-major [C][T] (xpose.comp runs once per norm before the GEMVs). With
+// token-major x the four token values are C floats apart, which measured 3.16x slower.
+//
+// Compiled per rows-per-wave width (-DRPW=n) and selected from the device's wave size:
+// wave128 -> 1, wave64 -> 2, wave32 -> 4.
+//
+// Bit-identity: each (row, token) accumulator receives the same FMA sequence the
+// single-token kernel gives it, so prefill is bit-identical to serial.
+//
+// PTQ1_0 block = 128 weights in 28 bytes: 26 trit bytes then an fp16 scale at
+// bytes 26..27. Each trit byte carries five base-3 digits (3^5 = 243 < 256):
+//   bytes  0..15 -> trits j, 16+j, 32+j, 48+j, 64+j        (j = 0..15)
+//   bytes 16..23 -> trits 80+j, 88+j, 96+j, 104+j, 112+j   (j = 0..7)
+//   bytes 24..25 -> trits 120+j, 122+j, 124+j, 126+j       (j = 0..1)
+//
+// Push: { int R; int C; int T; int xstride; }   x is [C][4], xstride unused
+// Bindings: 0 raw blocks as uint words, 1 x, 2 out ([T][R])
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+
+#ifndef RPW
+#define RPW 2
+#endif
+#define WGS 256
+#define NSUB (WGS / 64)
+
+layout(local_size_x = WGS) in;
+
+layout(set = 0, binding = 0) readonly buffer BW { uint w[]; };
+layout(set = 0, binding = 1) readonly buffer BX { float x[]; };
+layout(set = 0, binding = 2) buffer BO { float out_[]; };
+
+layout(push_constant) uniform PC { int R; int C; int T; int xstride; } pc;
+
+// Four slots per row for the four token sums; fixed width so a constant index is
+// always in range (GLSL bounds-checks even preprocessor-dead branches).
+shared float sh[NSUB][2][4][64];
+shared float tlf[1280];
+
+const uint P3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
+
+uint block_byte(int row, int bpr, int blk, int byteInBlk) {
+    int bi = (row * bpr + blk) * 28 + byteInBlk;
+    return (w[bi >> 2] >> (8u * uint(bi & 3))) & 0xFFu;
+}
+
+float block_scale(int row, int bpr, int blk) {
+    // Bytes 26..27; a block starts at a multiple of 28, so byte 26 is the high half of
+    // word (base/4 + 6).
+    int sb = ((row * bpr + blk) * 28) >> 2;
+    return unpackHalf2x16(w[sb + 6] >> 16).x;
+}
+
+#define TRIT(B5, N) tlf[(B5) + (N)]
+
+// The digit n loop for one byte group: stride in columns, plus the four-token offset.
+#define DIGITS(N, BASEEXPR, STRIDE)                                    \
+    for (int n = 0; n < (N); ++n) {                                    \
+        int xi = ((BASEEXPR) + n * (STRIDE)) * 4;                      \
+        float wvA = TRIT(b5a, n);                                      \
+        float wvB = TRIT(b5b, n);                                      \
+        float x0 = x[xi], x1 = x[xi + 1], x2 = x[xi + 2], x3 = x[xi + 3]; \
+        a0 += wvA * x0; a1 += wvA * x1; a2 += wvA * x2; a3 += wvA * x3; \
+        b0 += wvB * x0; b1 += wvB * x1; b2 += wvB * x2; b3 += wvB * x3; \
+    }
+
+void main() {
+    uint sgsz = gl_SubgroupSize;
+    uint nsub = uint(gl_WorkGroupSize.x) / sgsz;
+    int sub = int(gl_SubgroupID);
+    uint lane = gl_SubgroupInvocationID;
+
+    for (uint e = gl_LocalInvocationID.x; e < 256u; e += uint(gl_WorkGroupSize.x)) {
+        for (int n = 0; n < 5; ++n) {
+            uint tr = (((e * P3[n]) & 0xFFu) * 3u) >> 8;
+            tlf[e * 5u + uint(n)] = float(int(tr) - 1);
+        }
+    }
+    barrier();
+
+    int R = pc.R;
+    int C = pc.C;
+    int bpr = C >> 7;
+    int ntb = bpr * 26;
+
+    int row0 = (int(gl_WorkGroupID.x) * int(nsub) + sub) * RPW;
+    int ra = row0, rb = row0 + 1;
+    bool ka = ra < R;
+    bool kb = (RPW >= 2) && (rb < R);
+    if (!ka) ra = 0;
+    if (!kb) rb = 0;
+
+    float A0 = 0.0, A1 = 0.0, A2 = 0.0, A3 = 0.0;
+    float B0 = 0.0, B1 = 0.0, B2 = 0.0, B3 = 0.0;
+
+    for (int bi = int(lane); bi < ntb; bi += int(sgsz)) {
+        int blk = bi / 26;
+        int off = bi - blk * 26;
+        int base = blk << 7;
+
+        int b5a = int(block_byte(ra, bpr, blk, off)) * 5;
+        float sa = block_scale(ra, bpr, blk);
+        int b5b = 0;
+        float sb = 0.0;
+        if (RPW >= 2) {
+            b5b = int(block_byte(rb, bpr, blk, off)) * 5;
+            sb = block_scale(rb, bpr, blk);
+        }
+
+        float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+        float b0 = 0.0, b1 = 0.0, b2 = 0.0, b3 = 0.0;
+
+        if (off < 16) {
+            DIGITS(5, base + off, 16)
+        } else if (off < 24) {
+            DIGITS(5, base + 80 + (off - 16), 8)
+        } else {
+            DIGITS(4, base + 120 + (off - 24), 2)
+        }
+
+        A0 += sa * a0; A1 += sa * a1; A2 += sa * a2; A3 += sa * a3;
+        if (RPW >= 2) {
+            B0 += sb * b0; B1 += sb * b1; B2 += sb * b2; B3 += sb * b3;
+        }
+    }
+
+    // Tree reduction, one pass over the eight slots.
+    sh[sub][0][0][lane] = A0;
+    sh[sub][0][1][lane] = A1;
+    sh[sub][0][2][lane] = A2;
+    sh[sub][0][3][lane] = A3;
+    sh[sub][1][0][lane] = B0;
+    sh[sub][1][1][lane] = B1;
+    sh[sub][1][2][lane] = B2;
+    sh[sub][1][3][lane] = B3;
+    barrier();
+    for (int st = 32; st > 0; st >>= 1) {
+        if (int(lane) < st) {
+            for (int r = 0; r < 2; ++r) {
+                for (int t = 0; t < 4; ++t) {
+                    sh[sub][r][t][lane] += sh[sub][r][t][lane + st];
+                }
+            }
+        }
+        barrier();
+    }
+    if (lane == 0u) {
+        if (ka) {
+            out_[ra]         = sh[sub][0][0][0];
+            out_[R + ra]     = sh[sub][0][1][0];
+            out_[2 * R + ra] = sh[sub][0][2][0];
+            out_[3 * R + ra] = sh[sub][0][3][0];
+        }
+        if (kb) {
+            out_[rb]         = sh[sub][1][0][0];
+            out_[R + rb]     = sh[sub][1][1][0];
+            out_[2 * R + rb] = sh[sub][1][2][0];
+            out_[3 * R + rb] = sh[sub][1][3][0];
+        }
+    }
+}
