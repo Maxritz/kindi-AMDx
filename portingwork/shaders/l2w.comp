@@ -1,0 +1,49 @@
+// l2w.comp <- k_l2w (row L2 normalize, no weight)
+// CUDA: same warp-per-row layout as k_rmsw; sc = 1/max(sqrt(acc),1e-6);
+//   out[r,e] = xr[e]*sc, fp64 acc.
+// Vulkan: local_size_x=256 (8 warps of 32), workgroups = ceil(rows/8).
+//   r = WorkGroupID.x*8 + (LocalID>>5), lane = LocalID&31 (CUDA-lane emulation).
+// Push constants: struct PC { int n; int rows; };
+// Bindings (set=0):
+//   0: readonly float x[] (rows*n), 1: write float out[] (rows*n)
+#version 450
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer Bx { float x[]; };
+layout(set = 0, binding = 1) buffer Bo { float out_[]; };
+
+layout(push_constant) uniform PC { int n; int rows; } pc;
+
+float64_t wsum_d(float64_t v) {
+  v += subgroupShuffleXor(v, 16);
+  v += subgroupShuffleXor(v, 8);
+  v += subgroupShuffleXor(v, 4);
+  v += subgroupShuffleXor(v, 2);
+  v += subgroupShuffleXor(v, 1);
+  return v;
+}
+
+void main() {
+  uint lid = gl_LocalInvocationID.x;
+  uint lane = lid & 31u;
+  uint wp = lid >> 5;
+  int n = pc.n;
+  int r = int(gl_WorkGroupID.x * 8u + wp);
+  // Tail lanes (r >= rows) must still execute the subgroup shuffle
+  // (Vulkan shuffles need a converged subgroup), so they contribute 0
+  // and skip only the final store. Maps to one CUDA warp each: the
+  // xor offsets 16..1 never set bit 5, so the two 32-halves of a
+  // 64-wide subgroup reduce independently, bit-identical to CUDA.
+  bool live = (r < pc.rows);
+  float64_t acc = float64_t(0.0);
+  for (int e = int(lane); e < n; e += 32) {
+    float64_t v = live ? float64_t(x[r * n + e]) : float64_t(0.0);
+    acc += v * v;
+  }
+  acc = wsum_d(acc);
+  if (!live) return;
+  float sc = 1.0f / max(sqrt(float(acc)), 1e-6f);
+  for (int e = int(lane); e < n; e += 32) out_[r * n + e] = x[r * n + e] * sc;
+}

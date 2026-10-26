@@ -1,0 +1,74 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// g4lutM.comp - ternary GEMV over T tokens against ONE weight stream.
+//
+// Why this exists: the engine processed exactly one token per pass, so a speculative
+// verify over [last, draft] cost two full passes and MTP was a net loss. It is also the
+// only way to attack the inter-dispatch drain, which measured at 18.6 of 27.5 ms/token.
+//
+// This workload is memory-bound: per token the 27B streams ~6 GB of weights and does
+// almost no arithmetic. So the win is not more FLOPs, it is reading each weight byte
+// once and using it for T tokens.
+//
+// One 64-wide wave owns one output row and loops the tokens INSIDE the byte loop, so
+// every weight byte is decoded once and multiplied into T accumulators. SubgroupAdd
+// reduces each accumulator; no shared memory, no barriers in the hot path.
+//
+// Push constants: { int R; int C; int T; }
+// Bindings: 0 W 1 S 2 Y (T*R floats) 3 X (T*C floats), both token-major.
+layout(local_size_x = 256) in;
+
+shared uint lut[256];
+
+layout(set = 0, binding = 0) readonly buffer WB { uint W[]; };
+layout(set = 0, binding = 1) readonly buffer SB { uint S[]; };
+layout(set = 0, binding = 2) buffer YB { float Y[]; };
+layout(set = 0, binding = 3) readonly buffer XB { float X[]; };
+
+layout(push_constant) uniform PC { int R; int C; int T; int xstride; } pc;
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    int C = pc.C, T = pc.T;
+
+    lut[tid] = uint(tid % 3) | (uint((tid / 3) % 3) << 8)
+             | (uint((tid / 9) % 3) << 16) | (uint((tid / 27) % 3) << 24);
+    barrier();
+
+    uint sgsz = gl_SubgroupSize;
+    uint nsub = uint(gl_WorkGroupSize.x) / sgsz;
+    int row   = int(gl_WorkGroupID.x) * int(nsub) + int(gl_SubgroupID);
+    if (row >= pc.R) return;
+
+    uint lane  = gl_SubgroupInvocationID;
+    int nq     = C >> 7;
+    int nbytes = C >> 2;
+    uint base  = uint(row) * uint(nbytes);
+
+    // T is bounded by the MTP verify width (k+1). Four is plenty and keeps these in
+    // registers; anything wider falls back to repeated single-token launches.
+    float acc[4] = float[4](0.0, 0.0, 0.0, 0.0);
+
+    for (int kb = int(lane); kb < nbytes; kb += int(sgsz)) {
+        uint bi   = base + uint(kb);
+        uint byte = (W[bi >> 2] >> (8u * (bi & 3u))) & 0xFFu;
+        uint p    = lut[byte];
+        float sc  = unpackHalf2x16(S[uint(row * nq + (kb >> 5))]).x;
+        int k     = kb << 2;
+        float t0 = float(p & 0xFFu)         - 1.0;
+        float t1 = float((p >> 8)  & 0xFFu) - 1.0;
+        float t2 = float((p >> 16) & 0xFFu) - 1.0;
+        float t3 = float((p >> 24) & 0xFFu) - 1.0;
+        // one weight byte, T tokens: this is the amortisation
+        for (int t = 0; t < T && t < 4; ++t) {
+            int o = t * pc.xstride + k;
+            acc[t] += sc * (t0 * X[o] + t1 * X[o + 1] + t2 * X[o + 2] + t3 * X[o + 3]);
+        }
+    }
+
+    for (int t = 0; t < T && t < 4; ++t) {
+        float s = subgroupAdd(acc[t]);
+        if (lane == 0u) Y[t * pc.R + row] = s;
+    }
+}

@@ -1,0 +1,46 @@
+// gdn_delta.comp <- k_gdn_delta (kindi.cu lines 429-452)
+// CUDA grid/block: grid NV (=16 v-heads), block 128 (j = value column).
+//   Per head: load ks/qs (128, shared, barrier), e=exp(g[h]); sk = sum_i
+//   (M[i][j]*e)*ks[i]; dd=(v-sk)*beta; M[i][j]=M[i][j]*e+ks[i]*dd;
+//   o=sum_i M[i][j]*qs[i]; out=o*scale. kh=h%n_k_heads shares q/k heads.
+// Vulkan mapping: local_size_x=128, dispatch (NV,1,1); h=gl_WorkGroupID.x,
+//   j=gl_LocalInvocationID.x; barrier() == __syncthreads. No warp shuffles
+//   in source -> no subgroup ops.
+// Push constants (8B): { float scale; int n_k_heads; }.
+// Bindings: 0 M rw (NV*128*128), 1 q ro, 2 k ro, 3 v ro (NV*128),
+//   4 g ro, 5 beta ro (NV), 6 out wo (NV*128).
+// Fidelity risks vs CUDA: serial fp32 accumulation order identical
+//   (i=0..127) -> bit-identical M/o; only exp() (~1-2 ulp on GCN) differs.
+#version 450
+#extension GL_KHR_shader_subgroup_shuffle : require
+layout(local_size_x = 128) in;
+layout(set = 0, binding = 0) buffer B0 { float M[]; };
+layout(set = 0, binding = 1) readonly buffer B1 { float q[]; };
+layout(set = 0, binding = 2) readonly buffer B2 { float k[]; };
+layout(set = 0, binding = 3) readonly buffer B3 { float v[]; };
+layout(set = 0, binding = 4) readonly buffer B4 { float g[]; };
+layout(set = 0, binding = 5) readonly buffer B5 { float beta[]; };
+layout(set = 0, binding = 6) buffer B6 { float out_[]; };
+layout(push_constant) uniform PC { float scale; int n_k_heads; } pc;
+shared float ks[128];
+shared float qs[128];
+void main() {
+  uint h = gl_WorkGroupID.x;
+  uint j = gl_LocalInvocationID.x;
+  uint kh = h % uint(pc.n_k_heads);
+  ks[j] = k[kh * 128u + j];
+  qs[j] = q[kh * 128u + j];
+  barrier();
+  float e = exp(g[h]);
+  uint Mh = h * 16384u;
+  float sk = 0.0f;
+  for (int i = 0; i < 128; ++i) sk += (M[Mh + uint(i) * 128u + j] * e) * ks[uint(i)];
+  float dd = (v[h * 128u + j] - sk) * beta[h];
+  float o = 0.0f;
+  for (int i = 0; i < 128; ++i) {
+    float m = M[Mh + uint(i) * 128u + j] * e + ks[uint(i)] * dd;
+    M[Mh + uint(i) * 128u + j] = m;
+    o += m * qs[uint(i)];
+  }
+  out_[h * 128u + j] = o * pc.scale;
+}

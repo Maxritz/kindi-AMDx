@@ -1,0 +1,61 @@
+// g4q8.comp — Q8_0 GEMV: out[r] = sum_c W[r][c] * x[c]
+// Q8_0 block = 32 int8 weights + 1 fp16 scale.  Host layout (split arrays):
+//   binding 0: codes as uint words, 4 signed bytes per word (little-endian),
+//              byte index = row*C + c
+//   binding 1: scales as uint words, one fp16 bit-pattern per element
+//              (low 16 bits used), index = row*(C/32) + (c/32)
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer BW { uint w[]; };
+layout(set = 0, binding = 1) readonly buffer BS { uint sc[]; };
+layout(set = 0, binding = 2) readonly buffer BX { float x[]; };
+layout(set = 0, binding = 3) buffer BO { float out_[]; };
+
+layout(push_constant) uniform PC { int R; int C; } pc;
+
+shared float sh[256];
+
+float fp16_to_f32(uint bits) {
+    uint sign = (bits >> 15) & 1u;
+    uint exp  = (bits >> 10) & 0x1Fu;
+    uint mant = bits & 0x3FFu;
+    if (exp == 0u) {
+        float val = float(mant) / 1024.0 * (1.0 / 16384.0);
+        return sign == 1u ? -val : val;
+    } else if (exp == 31u) {
+        return sign == 1u ? -3.0e38 : 3.0e38;
+    }
+    float val = (1.0 + float(mant) / 1024.0) * exp2(float(int(exp) - 15));
+    return sign == 1u ? -val : val;
+}
+
+void main() {
+    int r = int(gl_WorkGroupID.x);
+    if (r >= pc.R) return;
+    int tid = int(gl_LocalInvocationID.x);
+    int C = pc.C;
+    int bpr = C >> 5;                    // 32-weight blocks per row
+    int rowbyte = r * C;                 // byte offset of this row's codes
+    int rowsc  = r * bpr;                // word offset of this row's scales
+
+    float acc = 0.0;
+    for (int b = tid; b < bpr; b += 256) {
+        float scale = fp16_to_f32(sc[rowsc + b] & 0xFFFFu);
+        int c0 = b << 5;
+        for (int i = 0; i < 32; ++i) {
+            int bi = rowbyte + c0 + i;
+            uint word = w[bi >> 2];
+            int raw = int((word >> (8u * uint(bi & 3))) & 0xFFu);
+            int sv = (raw >= 128) ? (raw - 256) : raw;   // signed byte
+            acc += float(sv) * scale * x[c0 + i];
+        }
+    }
+    sh[tid] = acc;
+    barrier();
+    for (int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sh[tid] += sh[tid + s];
+        barrier();
+    }
+    if (tid == 0) out_[r] = sh[0];
+}

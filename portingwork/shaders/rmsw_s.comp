@@ -1,0 +1,54 @@
+// rmsw_s.comp <- k_rmsw_s (kindi.cu lines 1156-1167)
+// CUDA grid/block: block 256 = 8 warps, one 32-lane warp per row:
+//   r=blockIdx.x*8+(threadIdx.x>>5), lane=threadIdx.x&31. fp64 sum of
+//   squares over xr[e] (stride xs), wsum_d warp shuffle, per-lane
+//   sc=1/sqrt(acc/n+eps), out[r*n+e]=(xr[e]*sc)*w[e].
+// Vulkan mapping: local_size_x=256, dispatch (ceil(rows/8),1,1);
+//   r=gl_WorkGroupID.x*8+(gl_LocalInvocationID.x>>5). No shared, no
+//   barrier (butterfly result is live in every lane, as in CUDA).
+//   wsum_d -> subgroupShuffleXor chain; valid for subgroupSize 32 or 64
+//   (consecutive grouping): each aligned 32-lane group folds to its own
+//   lane 0, which is exactly the row's warp. No subgroup ops in divergent
+//   control flow: all lanes of each row-group execute the chain together.
+// Push constants (12B): { int n; int rows; int xs; }.
+// Bindings: 0 x ro (rows*xs), 1 w ro (n), 2 out wo (rows*n).
+// Fidelity risks vs CUDA: accumulation order identical (bit-identical fp64
+//   sum); only float(acc/n) division + sqrt() last-ulp differences on GCN.
+#version 450
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer B0 { float x[]; };
+layout(set = 0, binding = 1) readonly buffer B1 { float w[]; };
+layout(set = 0, binding = 2) buffer B2 { float out_[]; };
+layout(push_constant) uniform PC { int n; int rows; int xs; } pc;
+float64_t wsum_d(float64_t v) {
+  v += subgroupShuffleXor(v, 16u);
+  v += subgroupShuffleXor(v, 8u);
+  v += subgroupShuffleXor(v, 4u);
+  v += subgroupShuffleXor(v, 2u);
+  v += subgroupShuffleXor(v, 1u);
+  return v;
+}
+void main() {
+  uint li = gl_LocalInvocationID.x;
+  uint r = gl_WorkGroupID.x * 8u + (li >> 5u);
+  uint lane = li & 31u;
+  if (r >= uint(pc.rows)) return;
+  uint n = uint(pc.n);
+  uint xr = r * uint(pc.xs);
+  // All lanes run the shuffle chain (converged); OOB rows feed 0.0 and skip stores.
+  bool valid = r < uint(pc.rows);
+  float64_t acc = float64_t(0.0);
+  if (valid) {
+    for (uint e = lane; e < n; e += 32u) {
+      float64_t v = float64_t(x[xr + e]);
+      acc += v * v;
+    }
+  }
+  acc = wsum_d(acc);
+  if (!valid) return;
+  float sc = 1.0f / sqrt(float(acc / float64_t(pc.n)) + 1e-6f);
+  uint orow = r * n;
+  for (uint e = lane; e < n; e += 32u) out_[orow + e] = (x[xr + e] * sc) * w[e];
+}

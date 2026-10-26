@@ -1,0 +1,39 @@
+#version 450
+#extension GL_KHR_shader_subgroup_shuffle : require
+layout(local_size_x = 64) in;
+shared float sh[64];
+layout(set = 0, binding = 0) readonly buffer CB { uint codes[]; };
+layout(set = 0, binding = 1) readonly buffer SB { uint scales[]; };
+layout(set = 0, binding = 2) readonly buffer XB { float x[]; };
+layout(set = 0, binding = 3) buffer YB { float y[]; };
+layout(push_constant) uniform PC { int R; int C; } pc;
+void main() {
+  int row = int(gl_WorkGroupID.x);
+  int lane = int(gl_LocalInvocationID.x);
+  int R = pc.R, C = pc.C;
+  if (row >= R) return;
+  float acc = 0.0;
+  if (lane < 32) {
+    int nq = C >> 7;
+    for (int k = lane; k < C; k += 32) {
+      // codes is a byte array stored in uint words: byte-address then extract
+      uint bi = uint(row) * uint(C >> 2) + uint(k >> 2);
+      uint byte = (codes[bi >> 2] >> (8u * (bi & 3u))) & 0xFFu;
+      uint sel = uint(k & 3);
+      uint div_ = sel == 0u ? 1u : (sel == 1u ? 3u : (sel == 2u ? 9u : 27u));
+      int trit = int((byte / div_) % 3u) - 1;
+      if (trit != 0) {
+        uint scbits = scales[row * nq + (k >> 7)];
+        float sc = unpackHalf2x16(scbits).x;
+        acc += float(trit) * sc * x[k];
+      }
+    }
+  }
+  sh[lane] = acc;
+  barrier();
+  for (int s = 16; s > 0; s >>= 1) {
+    if (lane < s) sh[lane] += sh[lane + s];
+    barrier();
+  }
+  if (lane == 0) y[row] = sh[0];
+}

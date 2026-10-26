@@ -1,0 +1,28 @@
+#version 450
+#extension GL_KHR_shader_subgroup_shuffle : require
+// gdn_conv_T.comp - gdn_conv for T tokens in order, shift register held in registers.
+// Mirrors k_gdn_conv_T: the 3-deep conv state advances per token inside one launch,
+// so T tokens cost one dispatch instead of T.
+// Push: { int C; int ldq; int ldc; int T; }
+//   qkv[t*ldq + c] -> cs[t*ldc + c]; conv is [3][C], carried across tokens.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer B0 { float qkv[]; };
+layout(set = 0, binding = 1) buffer B1 { float conv[]; };
+layout(set = 0, binding = 2) readonly buffer B2 { float cw[]; };
+layout(set = 0, binding = 3) buffer B3 { float cs[]; };
+layout(push_constant) uniform PC { int C; int ldq; int ldc; int T; } pc;
+
+void main() {
+  uint c = gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x;
+  if (c >= uint(pc.C)) return;
+  uint C = uint(pc.C);
+  float c0 = conv[c], c1 = conv[C + c], c2 = conv[2u * C + c];
+  float w0 = cw[4u * c], w1 = cw[4u * c + 1u], w2 = cw[4u * c + 2u], w3 = cw[4u * c + 3u];
+  for (int tok = 0; tok < pc.T; ++tok) {
+    float nw = qkv[uint(tok) * uint(pc.ldq) + c];
+    float o = c0 * w0 + c1 * w1 + c2 * w2 + nw * w3;
+    c0 = c1; c1 = c2; c2 = nw;
+    cs[uint(tok) * uint(pc.ldc) + c] = o / (1.0f + exp(-o));
+  }
+  conv[c] = c0; conv[C + c] = c1; conv[2u * C + c] = c2;
+}

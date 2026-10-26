@@ -1,0 +1,40 @@
+// attn_sq.comp - GQA scores: s[qh*n + t] = dot(q[qh], K[t][kv])
+// One workgroup per KV head, local_size_x = hd lanes (hd = 64).
+//   bindings: 0 Kc(uint fp16 pairs)  1 q(float, nh*hd)  2 s(float, nh*n)
+//   push: { int n; int nh; int nhkv; int hd; }
+// Scale is applied by the softmax pass, as in ggml_soft_max_ext.
+#version 450
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer BK { uint K[]; };
+layout(set = 0, binding = 1) readonly buffer BQ { float q[]; };
+layout(set = 0, binding = 2) buffer BS { float s[]; };
+
+layout(push_constant) uniform PC { int n; int nh; int nhkv; int hd; } pc;
+
+shared float sh[64];
+
+float kh(uint e) {
+  uint w = K[e >> 1];
+  return ((e & 1u) == 0u) ? unpackHalf2x16(w).x : unpackHalf2x16(w).y;
+}
+
+void main() {
+  int kv = int(gl_WorkGroupID.x);
+  int f  = int(gl_LocalInvocationID.x);
+  int hd = pc.hd, nhkv = pc.nhkv, n = pc.n, G = pc.nh / pc.nhkv;
+  bool live = (f < hd);
+  for (int qh = kv * G; qh < kv * G + G; ++qh) {
+    for (int t = 0; t < n; ++t) {
+      float prod = live ? q[qh * hd + f] * kh(uint((t * nhkv + kv) * hd + f)) : 0.0;
+      sh[f] = prod;
+      barrier();
+      for (int st = 32; st > 0; st >>= 1) {
+        if (f < st) sh[f] += sh[f + st];
+        barrier();
+      }
+      if (f == 0) s[qh * n + t] = sh[0];
+      barrier();
+    }
+  }
+}

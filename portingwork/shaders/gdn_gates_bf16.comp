@@ -1,0 +1,57 @@
+// gdn_gates_bf16.comp — k_gdn_gates with bf16-packed weight rows (no host dequant).
+// The 27B stores ssm_beta / ssm_alpha as BF16; bf16 -> f32 is a 16-bit shift, done here.
+// Push constants: { int n }   Bindings: 0 xn f32 ro, 1 bw u16 ro, 2 aw u16 ro,
+//   3 dtb f32 ro, 4 ssma f32 ro, 5 beta f32 wo, 6 g f32 wo
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer B0 { float xn[]; };
+layout(set = 0, binding = 1) readonly buffer B1 { uint bw[]; };   // two bf16 per word
+layout(set = 0, binding = 2) readonly buffer B2 { uint aw[]; };   // two bf16 per word
+layout(set = 0, binding = 3) readonly buffer B3 { float dtb[]; };
+layout(set = 0, binding = 4) readonly buffer B4 { float ssma[]; };
+layout(set = 0, binding = 5) buffer B5 { float beta[]; };
+layout(set = 0, binding = 6) buffer B6 { float g[]; };
+
+layout(push_constant) uniform PC { int n; } pc;
+
+shared float sb[256];
+shared float sa[256];
+
+float bf(uint w, uint i) {          // i-th bf16 in the word stream
+    uint bits = (i & 1u) == 0u ? (w >> 16) : (w & 0xFFFFu);
+    uint f = bits << 16;
+    return uintBitsToFloat(f);
+}
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    float ab = 0.0, aa = 0.0;
+    uint base = h * uint(pc.n);
+    for (int i = int(t); i < pc.n; i += 256) {
+        float x = xn[i];
+        uint idx = base + uint(i);
+        // little-endian pair: even element in low half
+        uint wb = bw[idx >> 1];
+        uint wa = aw[idx >> 1];
+        float bv = (idx & 1u) == 0u ? uintBitsToFloat((wb & 0xFFFFu) << 16)
+                                    : uintBitsToFloat((wb >> 16) << 16);
+        float av = (idx & 1u) == 0u ? uintBitsToFloat((wa & 0xFFFFu) << 16)
+                                    : uintBitsToFloat((wa >> 16) << 16);
+        ab += bv * x;
+        aa += av * x;
+    }
+    sb[t] = ab; sa[t] = aa;
+    barrier();
+    for (int st = 128; st > 0; st >>= 1) {
+        if (t < uint(st)) { sb[t] += sb[t + uint(st)]; sa[t] += sa[t + uint(st)]; }
+        barrier();
+    }
+    if (t == 0u) {
+        beta[h] = 1.0f / (1.0f + exp(-sb[0]));
+        float a = sa[0] + dtb[h];
+        float sp = (a > 20.0f) ? a : log(1.0f + exp(min(a, 20.0f)));
+        g[h] = sp * ssma[h];
+    }
+}

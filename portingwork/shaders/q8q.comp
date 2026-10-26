@@ -1,0 +1,42 @@
+// q8q.comp - quantize one F32 row to Q8_0 (activation quantization for mul_mat)
+// Mirrors ggml quantize_row_q8_0_ref: amax over 32, d = amax/127,
+// id = 1/d from the UNROUNDED d, q = roundf(x*id), and d stored as fp16.
+// One workgroup per 32-element block.
+//   bindings: 0 x(float, C)  1 codes(uint, C/4 words)  2 scales(uint, C/32 words, fp16 in low half)
+//   push: { int C }
+#version 450
+layout(local_size_x = 32) in;
+
+layout(set = 0, binding = 0) readonly buffer BX { float x[]; };
+layout(set = 0, binding = 1) buffer BC { uint codes[]; };
+layout(set = 0, binding = 2) buffer BS { uint scales[]; };
+
+layout(push_constant) uniform PC { int C; } pc;
+
+shared float sv[32];
+shared int   qv[32];
+
+void main() {
+  int b = int(gl_WorkGroupID.x);
+  int bpr = pc.C >> 5;
+  if (b >= bpr) return;
+  int l = int(gl_LocalInvocationID.x);
+  float v = x[b * 32 + l];
+  sv[l] = abs(v);
+  barrier();
+  for (int s = 16; s > 0; s >>= 1) {
+    if (l < s) sv[l] = max(sv[l], sv[l + s]);
+    barrier();
+  }
+  float amax = sv[0];
+  float d = amax / 127.0;
+  float id = (d != 0.0) ? 1.0 / d : 0.0;
+  qv[l] = int(round(v * id));
+  barrier();
+  if (l < 8) {
+    uint w = (uint(qv[4 * l    ] & 0xFF))       | (uint(qv[4 * l + 1] & 0xFF) << 8)
+           | (uint(qv[4 * l + 2] & 0xFF) << 16) | (uint(qv[4 * l + 3] & 0xFF) << 24);
+    codes[b * 8 + l] = w;
+  }
+  if (l == 0) scales[b] = packHalf2x16(vec2(d, 0.0));
+}

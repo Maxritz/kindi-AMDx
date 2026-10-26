@@ -1,0 +1,84 @@
+// g5ptq.comp — PTQ1_0 native 5-trit GEMV (no host expansion).
+// Block = 128 weights in 28 bytes: qs[0..23] | qh[24..25] | fp16 scale[26..27].
+//   trits (base-3, value 0/1/2, weight = (trit-1)*scale) are laid out:
+//     bytes  0..15 -> out[n*16 + j]      n=0..4, j=0..15
+//     bytes 16..23 -> out[80 + n*8 + j]  n=0..4, j=0..7
+//     bytes 24..25 -> out[120 + n*2 + j] n=0..3, j=0..1
+//   digit: q = (raw * 3^n) & 0xFF ; trit = (q * 3) >> 8
+// Layout: binding 0 = raw blocks as uint words (4 bytes/word), row-major,
+//         byte index = (row*bpr + c/128)*28 + <byte in block>
+//         binding 1 = x (float), binding 2 = out (float)
+#version 450
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer BW { uint w[]; };
+layout(set = 0, binding = 1) readonly buffer BX { float x[]; };
+layout(set = 0, binding = 2) buffer BO { float out_[]; };
+
+layout(push_constant) uniform PC { int R; int C; } pc;
+
+shared float sh[64];
+
+float fp16_to_f32(uint bits) {
+    uint sign = (bits >> 15) & 1u;
+    uint exp  = (bits >> 10) & 0x1Fu;
+    uint mant = bits & 0x3FFu;
+    if (exp == 0u) { float v = float(mant)/1024.0*(1.0/16384.0); return sign==1u ? -v : v; }
+    if (exp == 31u) return sign==1u ? -3.0e38 : 3.0e38;
+    float v = (1.0 + float(mant)/1024.0) * exp2(float(int(exp) - 15));
+    return sign==1u ? -v : v;
+}
+
+uint block_byte(int row, int bpr, int blk, int byteInBlk) {
+    int bi = (row * bpr + blk) * 28 + byteInBlk;   // absolute byte offset
+    return (w[bi >> 2] >> (8u * uint(bi & 3))) & 0xFFu;
+}
+
+// trit index i (0..127) inside the block
+int block_trit(int row, int bpr, int blk, int i) {
+    uint q;
+    if (i < 80) {                       // bytes 0..15, groups of 16
+        int n = i >> 4, j = i & 15;
+        uint raw = block_byte(row, bpr, blk, j);
+        uint p = 1u; for (int t = 0; t < n; ++t) p *= 3u;
+        q = (raw * p) & 0xFFu;
+    } else if (i < 120) {               // bytes 16..23, groups of 8
+        int k = i - 80, n = k >> 3, j = k & 7;
+        uint raw = block_byte(row, bpr, blk, 16 + j);
+        uint p = 1u; for (int t = 0; t < n; ++t) p *= 3u;
+        q = (raw * p) & 0xFFu;
+    } else {                            // bytes 24..25, groups of 2
+        int k = i - 120, n = k >> 1, j = k & 1;
+        uint raw = block_byte(row, bpr, blk, 24 + j);
+        uint p = 1u; for (int t = 0; t < n; ++t) p *= 3u;
+        q = (raw * p) & 0xFFu;
+    }
+    return int((q * 3u) >> 8);
+}
+
+void main() {
+    int row = int(gl_WorkGroupID.x);
+    if (row >= pc.R) return;
+    int lane = int(gl_LocalInvocationID.x);
+    int C = pc.C;
+    int bpr = C >> 7;
+
+    float acc = 0.0;
+    for (int c = lane; c < C; c += 64) {
+        int blk = c >> 7, i = c & 127;
+        int trit = block_trit(row, bpr, blk, i);
+        if (trit != 1) {                                  // trit 1 -> weight 0, skip
+            uint dlo = block_byte(row, bpr, blk, 26);
+            uint dhi = block_byte(row, bpr, blk, 27);
+            float sc = fp16_to_f32(dlo | (dhi << 8));
+            acc += float(trit - 1) * sc * x[c];
+        }
+    }
+    sh[lane] = acc;
+    barrier();
+    for (int s = 32; s > 0; s >>= 1) {
+        if (lane < s) sh[lane] += sh[lane + s];
+        barrier();
+    }
+    if (lane == 0) out_[row] = sh[0];
+}

@@ -1,0 +1,80 @@
+#version 450
+// attn_vg.comp <- k_attn_vg (generic GQA: G <= 8 q heads per K/V head; G from push constant)
+//   Faithful port for future 4B/9B models. For 2B dispatch with G=4 it matches
+//   k_attn_vg with G=4 (same values as k_attn_v4p up to shared-layout order).
+// CUDA grid/block mapping:
+//   CUDA: grid (NHKV, 1, nchunks), block 128; threadIdx.x = f2 (features 2f,2f+1),
+//         blockIdx.x = kv, blockIdx.z = chunk c. i0 = c*ATV_CH, m = min(...).
+//         Shared sp[ATV_CH*8] floats (8 KB); per-position loop i=0..m-1 with the
+//         G probs in one row; head-major writes pp[0],pp[1] at part+((c*nheads+
+//         kv*G+j)*256+2f).
+// Vulkan: num workgroups (NHKV, 1, nchunks), local_size_x = 128.
+//         gl_WorkGroupID.x = kv, gl_WorkGroupID.z = c,
+//         gl_LocalInvocationID.x = f2.
+//         NOTE: Vulkan z index runs over all chunks; dispatch the full context
+//         chunk count and let chunks with i0 >= n exit at once (as k_attn_vgn).
+// Push constants (16 B <= 128 B): int n, int nheads, int n_kv, int G (<=8).
+// Buffers: Vh2 = fp16 BITS as uint[] (never dequantized on host); word
+//   ((i0+i)*n_kv+kv)*128+f2 decoded with unpackHalf2x16. s rows (kv*G+j)*n.
+//   part layout part[(c*nheads+kv*G+j)*256+2f].
+// Arithmetic: exact order of k_attn_vg - shared row-major probs load, shared
+//   barrier, per-position accumulation a[j]+=p*v0 / b[j]+=p*v1 with the head
+//   loop innermost (j=0..7), then guarded head-major writes (j < G only).
+// SUBGROUP NOTE: no subgroup ops; shared memory 256*8 floats = 8 KB, under
+//   the 32 KB budget. subgroupSize=64 vs warp=32 changes nothing.
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) readonly buffer SBuf { float s[]; };
+layout(set = 0, binding = 1) readonly buffer VBuf { uint Vh2[]; };
+layout(set = 0, binding = 2) buffer PartBuf { float part[]; };
+
+layout(push_constant) uniform PushConstants {
+  int n;
+  int nheads;
+  int n_kv;
+  int G;
+} pc;
+
+shared float sp[256 * 8];
+
+void main() {
+  int kv = int(gl_WorkGroupID.x);
+  int f2 = int(gl_LocalInvocationID.x);
+  int c = int(gl_WorkGroupID.z);
+  int n = pc.n;
+  int nheads = pc.nheads;
+  int n_kv = pc.n_kv;
+  int G = pc.G;
+  int i0 = c * 256;
+  if (i0 >= n) return;
+  int m = min(256, n - i0);
+
+  for (int i = int(gl_LocalInvocationID.x); i < 256; i += 128) {
+    for (int j = 0; j < 8; ++j) {
+      sp[i * 8 + j] = (i < m && j < G) ? s[(kv * G + j) * n + i0 + i] : 0.0;
+    }
+  }
+  barrier();
+
+  float a[8], b[8];
+  for (int j = 0; j < 8; ++j) { a[j] = 0.0; b[j] = 0.0; }
+  int r0 = (i0 * n_kv + kv) * 128 + f2;
+  for (int i = 0; i < m; ++i) {
+    uint vv = Vh2[r0 + i * n_kv * 128];
+    vec2 h = unpackHalf2x16(vv);
+    float v0 = h.x, v1 = h.y;
+    for (int j = 0; j < 8; ++j) {
+      float p = sp[i * 8 + j];
+      a[j] += p * v0;
+      b[j] += p * v1;
+    }
+  }
+  for (int j = 0; j < 8; ++j) {
+    if (j < G) {
+      int prow = ((c * nheads + kv * G + j)) * 256 + 2 * f2;
+      part[prow] = a[j];
+      part[prow + 1] = b[j];
+    }
+  }
+}

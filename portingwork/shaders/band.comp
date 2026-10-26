@@ -1,0 +1,32 @@
+// band.comp <- k_band (collect logits within band of max)
+// CUDA: thr = y[amax[0]]-band; for i=global; i<n; i+=gridSize:
+//   if y[i]>=thr: k=atomicAdd(cnt,1); if k<cap {out_i[k]=i; out_v[k]=v}.
+// Vulkan: local_size_x=256, any workgroup count; stride via gl_NumWorkGroups.
+// Push constants: struct PC { int n; float band; int cap; };
+// Bindings (set=0):
+//   0: readonly float y[] (n), 1: readonly int amax[1],
+//   2: buffer uint cnt[1] (atomic counter, host-zeroed),
+//   3: write int out_i[] (cap), 4: write float out_v[] (cap)
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer By { float y[]; };
+layout(set = 0, binding = 1) readonly buffer Bam { int amax[]; };
+layout(set = 0, binding = 2) buffer Bcnt { uint cnt[]; };
+layout(set = 0, binding = 3) buffer Boi { int out_i[]; };
+layout(set = 0, binding = 4) buffer Bov { float out_v[]; };
+
+layout(push_constant) uniform PC { int n; float band; int cap; } pc;
+
+void main() {
+  float thr = y[amax[0]] - pc.band;
+  uint total = gl_NumWorkGroups.x * 256u;
+  uint gid = gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x;
+  for (uint i = gid; i < uint(pc.n); i += total) {
+    float v = y[i];
+    if (v >= thr) {
+      uint k = atomicAdd(cnt[0], 1u);
+      if (int(k) < pc.cap) { out_i[k] = int(i); out_v[k] = v; }
+    }
+  }
+}

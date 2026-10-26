@@ -1,0 +1,19 @@
+// silu_mul.comp - SwiGLU: out = silu(g) * u  (ggml_swiglu_split)
+// ggml_silu_f32(x) = x / (1 + expf(-x))
+//   bindings: 0 g(float)  1 u(float)  2 out(float)
+//   push: { int n }
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer BG { float g[]; };
+layout(set = 0, binding = 1) readonly buffer BU { float u[]; };
+layout(set = 0, binding = 2) buffer BO { float out_[]; };
+
+layout(push_constant) uniform PC { int n; } pc;
+
+void main() {
+  int i = int(gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x);
+  if (i >= pc.n) return;
+  float x = g[i];
+  out_[i] = (x / (1.0 + exp(-x))) * u[i];
+}

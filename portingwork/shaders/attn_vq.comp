@@ -1,0 +1,29 @@
+// attn_vq.comp - GQA value mix: out[qh*hd + f] = sum_t s[qh*n + t] * V[t][kv][f]
+// One workgroup per KV head, local_size_x = hd lanes (hd = 64).
+//   bindings: 0 s(float, nh*n)  1 Vc(uint fp16 pairs)  2 out(float, nh*hd)
+//   push: { int n; int nh; int nhkv; int hd; }
+#version 450
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer BS { float s[]; };
+layout(set = 0, binding = 1) readonly buffer BV { uint V[]; };
+layout(set = 0, binding = 2) buffer BO { float out_[]; };
+
+layout(push_constant) uniform PC { int n; int nh; int nhkv; int hd; } pc;
+
+float vh(uint e) {
+  uint w = V[e >> 1];
+  return ((e & 1u) == 0u) ? unpackHalf2x16(w).x : unpackHalf2x16(w).y;
+}
+
+void main() {
+  int kv = int(gl_WorkGroupID.x);
+  int f  = int(gl_LocalInvocationID.x);
+  int hd = pc.hd, nhkv = pc.nhkv, n = pc.n, G = pc.nh / pc.nhkv;
+  if (f >= hd) return;
+  for (int qh = kv * G; qh < kv * G + G; ++qh) {
+    float acc = 0.0;
+    for (int t = 0; t < n; ++t) acc += s[qh * n + t] * vh(uint((t * nhkv + kv) * hd + f));
+    out_[qh * hd + f] = acc;
+  }
+}

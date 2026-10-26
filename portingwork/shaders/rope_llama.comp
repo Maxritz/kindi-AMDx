@@ -1,0 +1,32 @@
+// rope_llama.comp - RoPE over one head row
+// neox == 0: GGML_ROPE_TYPE_NORMAL (Llama) - pairs are adjacent (2j, 2j+1)
+// neox != 0: GGML_ROPE_TYPE_NEOX            - pairs are (j, j+HD/2)
+// Arithmetic matches ggml rotate_pairs: dst0 = x0*c - x1*s, dst1 = x0*s + x1*c.
+//   bindings: 0 x(float, rows*HD)  1 cc(float, HD/2)  2 ss(float, HD/2)  3 out(float, rows*HD)
+//   push: { int HD; int neox; }   grid = rows, local = HD/2 rounded to 64
+#version 450
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer Bx  { float x[]; };
+layout(set = 0, binding = 1) readonly buffer Bcc { float cc[]; };
+layout(set = 0, binding = 2) readonly buffer Bss { float ss[]; };
+layout(set = 0, binding = 3) buffer Bo { float out_[]; };
+
+layout(push_constant) uniform PC { int HD; int neox; } pc;
+
+void main() {
+  uint r = gl_WorkGroupID.x;
+  int j = int(gl_LocalInvocationID.x);
+  int HD = pc.HD;
+  int hd2 = HD >> 1;
+  if (j >= hd2) return;
+  uint base = r * uint(HD);
+  int i0 = (pc.neox != 0) ? j : 2 * j;
+  int i1 = (pc.neox != 0) ? j + hd2 : 2 * j + 1;
+  float a = x[base + uint(i0)];
+  float b = x[base + uint(i1)];
+  float c = cc[j];
+  float s = ss[j];
+  out_[base + uint(i0)] = a * c - b * s;
+  out_[base + uint(i1)] = a * s + b * c;
+}

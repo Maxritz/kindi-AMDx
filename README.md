@@ -26,6 +26,201 @@ video</a> (123 s, no pauses shortened) and its <a href="https://github.com/ahtx/
 
 By [Amir Husain](https://www.amirhusain.com). Watch the [launch video](https://youtu.be/ddAnghj8HpE) on YouTube.
 
+## AMD Polaris / GCN port (RX 580 / gfx803) - Vulkan, first working port
+
+This is the first working AMD port of Kindi. It is a Vulkan compute engine for the Radeon
+RX 580 (Polaris 10, gfx803, 8 GB) running on Windows. There is no ROCm and no container
+anywhere in the stack. The card has no WMMA and no usable ROCm support, so every matrix
+product here is a hand-written GLSL compute shader built for GCN's wave64 model.
+
+It reads the original GGUF files directly. There is no conversion step and no weight pack.
+PQ2_0, native PTQ1_0 (5-trit) and the 4-trit pack are all decoded on the card itself.
+
+**Requirements:** Windows x64, an AMD driver with Vulkan support, and the GGUF model files.
+The prebuilt engine needs no Vulkan SDK and no compiler.
+
+**Get the models** from Prism ML on Hugging Face. For example the 2B:
+
+```powershell
+mkdir C:\x
+curl.exe -L -o C:\x\Ternary-Bonsai-2-2B-PTQ1_0.gguf `
+  https://huggingface.co/prism-ml/Ternary-Bonsai-2-2B-gguf/resolve/main/Ternary-Bonsai-2-2B-PTQ1_0.gguf
+```
+
+The 27B files used below are `Ternary-Bonsai-2-27B-PQ2_0.gguf` and
+`Ternary-Bonsai-2-27B-PTQ1_0-mtp-procreations.gguf` from the same publisher. Adjust the
+paths in the commands if you keep them somewhere else.
+
+**Run it.** Unzip `portingwork/kindi-vk-polaris-win64.zip` anywhere, then run from inside
+the extracted folder. The engine loads its shaders from `shaders/` relative to the working
+directory, so do not move the exe out on its own.
+
+```powershell
+Expand-Archive portingwork\kindi-vk-polaris-win64.zip -DestinationPath kindi-vk
+cd kindi-vk
+.\kindi_vk_decode.exe --model C:\x\Ternary-Bonsai-2-2B-PTQ1_0.gguf `
+    --prompt "The sky is blue because" --temp 0 -n 20
+```
+
+To build from source instead of using the zip, run `portingwork/build.ps1`.
+
+**Results on the RX 580 (8 GB):**
+
+2B PTQ1_0 (Ternary-Bonsai-2-2B-PTQ1_0.gguf) - token-exact, 36.8 tok/s
+
+```powershell
+.\kindi_vk_decode.exe --model C:\x\Ternary-Bonsai-2-2B-PTQ1_0.gguf `
+    --prompt "The sky is blue because" --temp 0 -n 20
+```
+
+27B PQ2_0 (Ternary-Bonsai-2-27B-PQ2_0.gguf) - token-exact, 1.6 tok/s
+
+```powershell
+.\kindi_vk_decode.exe --model C:\x\Ternary-Bonsai-2-27B-PQ2_0.gguf `
+    --ctx 4096 --prompt "The sky is blue because" --temp 0 -n 8
+```
+
+27B PTQ1_0 with MTP head (Ternary-Bonsai-2-27B-PTQ1_0-mtp-procreations.gguf) - token-exact,
+and the only model here that drafts: add `--spec 20` for 1.47x
+
+```powershell
+.\kindi_vk_decode.exe --model C:\x\Ternary-Bonsai-2-27B-PTQ1_0-mtp-procreations.gguf `
+    --ctx 4096 --native5 --prompt "The sky is blue because" --temp 0 -n 8
+```
+
+Output checked against Prism's `llama-completion`:
+
+```
+2B   "The sky is blue because"  ->  " of the scattering of light"
+27B  "The sky is blue because"  ->  " of Rayleigh scattering. This is a phenomenon where light is"
+```
+
+**Prefill and token generation, RX 580 8 GB.** Model load is excluded (about 2.5 s for
+the 2B and 8.6 s for the 27B). Prefill is measured on a 144-token prompt, so 143 tokens
+are actually prefilled.
+
+| Model | Prefill | Prefill (`KINDI_CHUNK=4`) | Token gen | Token gen (`--spec`) |
+|---|---|---|---|---|
+| 2B PTQ1_0 | 39.3 tok/s | 69.0 tok/s | 32-34 tok/s | n/a (no MTP head) |
+| 27B PQ2_0 | 1.71 tok/s | 3.03 tok/s | 1.5 tok/s | n/a (no MTP head) |
+| 27B PTQ1_0 + MTP | 1.7 tok/s | 3.0 tok/s | 0.85 tok/s | **1.25 tok/s** |
+
+Chunked prefill buys 1.76x on the 2B and 1.77x on the 27B. Token generation is not
+affected, because decode is always a single token per pass. It is off by default; set the
+environment variable before running:
+
+```powershell
+$env:KINDI_CHUNK = 4
+.\kindi_vk_decode.exe --model C:\x\Ternary-Bonsai-2-27B-PQ2_0.gguf --ctx 4096 `
+    --prompt "The sky is blue because" --temp 0 -n 8
+```
+
+Sanity check that the build is working:
+
+```powershell
+.\kindi_vk_decode.exe --model C:\x\Ternary-Bonsai-2-2B-PTQ1_0.gguf --selftest
+```
+
+### OpenAI-compatible API
+
+`--serve` turns the engine into a local server that speaks the OpenAI chat and completion
+APIs, so any OpenAI client works without knowing about Vulkan or GGUF:
+
+```powershell
+.\kindi_vk_decode.exe --model C:\x\Ternary-Bonsai-2-2B-PTQ1_0.gguf --serve --port 8080
+```
+
+```python
+from openai import OpenAI
+c = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="none")
+r = c.chat.completions.create(
+    model="Ternary-Bonsai-2-2B-PTQ1_0",
+    messages=[{"role": "user", "content": "What is 2+2?"}],
+    max_tokens=16, temperature=0,
+    extra_body={"enable_thinking": False},
+)
+print(r.choices[0].message.content)
+```
+
+`POST /v1/chat/completions` and `POST /v1/completions` both stream. Reasoning is reported
+separately in `reasoning_content`, split at `</think>`.
+
+Add `--spec 1` to enable speculative decode in the server too. On the 27B PTQ1_0 + MTP
+head that is 0.88 -> 1.20 tok/s (1.37x) with byte-identical output; it applies to greedy
+requests only and leaves prefill untouched. The 2B has no MTP head, so the server reports
+`--spec ignored` and serves normally.
+
+**Prompt reuse** is on by default. The KV cache needs no copying here (it is
+position-indexed and append-only), so a checkpoint of the recurrent state is the whole
+cost, ~20 MiB on the 2B and ~150 MiB on the 27B. On the 27B the same request went from
+31.4 s of prefill to 0 s, with byte-identical output.
+
+`--ctx` is clamped to what the card can actually hold. `--ctx 16384` on the 27B now warns
+and runs at 13824 instead of dying with a bare `Vulkan error -2`.
+
+Full endpoint list, request fields and limits:
+[portingwork/API.md](portingwork/API.md).
+
+**What this port needed that the CUDA engine did not:**
+
+- GCN has no WMMA and no `cp.async`, so the tensor core paths are replaced by subgroup-64
+  GEMVs. The 4-trit weight layout exists upstream only to feed a 256-entry LUT kernel, and
+  here it is decoded with a shared memory LUT at 4 trits per byte.
+- Every launch used to carry its own fence. Batching the dispatches into one command buffer
+  removed 21.6 ms out of 27.5 ms per token on the 2B.
+- `VK_KHR_global_priority` was requested and the driver does accept REALTIME, but it made
+  no measurable difference. The GPU sits idle for about 35% of the wall time, so there is
+  nothing to contend with.
+- AMD's `VkQueueFamilyGlobalPriorityPropertiesKHR` has to be queried through the queue
+  family chain. In the device properties chain it quietly returns zero and you stay on
+  MEDIUM without any error.
+
+**Instrumentation** is compiled in always and switched on with a flag, never an env var.
+`--trace` prints a per-component and per-shader table with device, idle and host time,
+bytes moved, waves and waves per CU, along with traps for synchronisation, allocation,
+transfer, accuracy and a measured instrumentation floor.
+
+**Full details:** [portingwork/README.md](portingwork/README.md) covers the engine, the
+build and every flag. [portingwork/PERFORMANCE.md](portingwork/PERFORMANCE.md) has the
+measurements and the bottleneck analysis. [portingwork/CHUNK-STATUS.md](portingwork/CHUNK-STATUS.md)
+records the chunked prefill work and the bugs it exposed.
+[portingwork/MTP-FINDINGS.md](portingwork/MTP-FINDINGS.md) describes the MTP head layout and
+the speculative decode loop, and [portingwork/API.md](portingwork/API.md) the server.
+
+**MTP speculative decode works.** `--spec N` drafts one token with the MTP head, verifies
+it in a single T=2 trunk pass and accepts the matching prefix. Output is token-identical to
+plain decode. Measured on the 27B PTQ1_0 + MTP head, 20 tokens, greedy:
+
+| prompt | plain | `--spec` | acceptance | speedup |
+|---|---|---|---|---|
+| `The sky is blue because` | 0.850 tok/s | **1.25 tok/s** | 100% | **1.47x** |
+| `def fibonacci(n):` | 0.829 tok/s | **1.20 tok/s** | 100% | **1.45x** |
+| `Once upon a time there was` | 0.871 tok/s | **1.00 tok/s** | 53.8% | **1.15x** |
+
+Break-even is about 1.27 tokens per pass, so the draft needs roughly 27% acceptance to pay
+for itself. The verify pass runs at 1.74x the serial trunk, close to the 2x ceiling that
+one weight read per two tokens allows. See
+[portingwork/MTP-FINDINGS.md](portingwork/MTP-FINDINGS.md) for the four bugs it took
+(including a `block_q8_0` layout error that had made the Q8 selftest pass on garbage).
+
+```powershell
+.\kindi_vk_decode.exe --model C:\x\Ternary-Bonsai-2-27B-PTQ1_0-mtp-procreations.gguf `
+    --ctx 2048 --native5 --prompt "The sky is blue because" --temp 0 --spec 20
+```
+
+**Not done yet:** k=2 drafts (a second draft would amortise the per-pass overhead over 3
+tokens), a T-row attention kernel, a Q4 KV cache (would take the 27B from ~14k to ~50k
+context on 8 GB), and Llama-3.2-1B.
+
+**Quick Note:** 
+I actually installed my rx580x just to port this to vulkan. Now will switch back to my 6700xt
+Thanks to the amazing brother Amir for his original engine. It was fun to port (I find the frustration that it caused really worth it)
+Now lets see if I can get this to speed up on Rx 6700xt and Rx 9070xt.
+Anyone who wants to port to anything else, check the portingwork folder and have fun. (Deepseek is you friend)
+
+---
+
+
 ## Quick start: one command
 
 On Linux x86-64 with an NVIDIA card (Kepler to Ampere, one or two cards) or with no GPU:

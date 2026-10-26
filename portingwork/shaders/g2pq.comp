@@ -1,0 +1,52 @@
+// g2pq.comp — PQ2_0 native GEMV (2 bits/weight, group 128).
+// Block (34 bytes): fp16 d (bytes 0..1) | uint8 qs[32] (bytes 2..33), 2 bits per weight.
+//   weight[j] = (((qs[j/4] >> ((j%4)*2)) & 3) - 1) * d      -> {-1,0,+1,+2} * d
+// Codes are kept packed (no host expansion): binding 0 is the raw block stream as uint words.
+//   byte offset of a row's block = (row*bpr + c/128) * 34
+#version 450
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer BW { uint w[]; };
+layout(set = 0, binding = 1) readonly buffer BX { float x[]; };
+layout(set = 0, binding = 2) buffer BO { float out_[]; };
+
+layout(push_constant) uniform PC { int R; int C; } pc;
+
+shared float sh[64];
+
+float fp16_to_f32(uint bits) {
+    uint sign = (bits >> 15) & 1u;
+    uint exp  = (bits >> 10) & 0x1Fu;
+    uint mant = bits & 0x3FFu;
+    if (exp == 0u) { float v = float(mant)/1024.0*(1.0/16384.0); return sign==1u ? -v : v; }
+    if (exp == 31u) return sign==1u ? -3.0e38 : 3.0e38;
+    float v = (1.0 + float(mant)/1024.0) * exp2(float(int(exp) - 15));
+    return sign==1u ? -v : v;
+}
+
+uint bbyte(int bi) { return (w[bi >> 2] >> (8u * uint(bi & 3))) & 0xFFu; }
+
+void main() {
+    int row = int(gl_WorkGroupID.x);
+    if (row >= pc.R) return;
+    int lane = int(gl_LocalInvocationID.x);
+    int C = pc.C;
+    int bpr = C >> 7;
+
+    float acc = 0.0;
+    for (int c = lane; c < C; c += 64) {
+        int blk = c >> 7, j = c & 127;
+        int base = (row * bpr + blk) * 34;
+        float d = fp16_to_f32(bbyte(base) | (bbyte(base + 1) << 8));
+        uint q = (bbyte(base + 2 + (j >> 2)) >> (2u * uint(j & 3))) & 3u;
+        int wv = int(q) - 1;
+        if (wv != 0) acc += float(wv) * d * x[c];
+    }
+    sh[lane] = acc;
+    barrier();
+    for (int s = 32; s > 0; s >>= 1) {
+        if (lane < s) sh[lane] += sh[lane + s];
+        barrier();
+    }
+    if (lane == 0) out_[row] = sh[0];
+}

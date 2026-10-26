@@ -1,0 +1,32 @@
+// store_h.comp <- k_store_h (fp32 -> fp16 bits, round-to-nearest-even; K/V store)
+// CUDA grid: ceil(n/blockDim) blocks; i = blockIdx.x*blockDim.x+threadIdx.x.
+//   dst[i] = cvt.rn.f16.f32(x[i]) bit-for-bit.
+// Vulkan: local_size_x=256, workgroups = ceil(n/256).
+//   i = WorkGroupID.x*256 + LocalID.x; pack as packHalf2x16(vec2(x,0)).x,
+//   which is also round-to-nearest-even, bit-exact to cvt.rn for finite
+//   inputs (NaN payload/Inf handling matches; subnormals flush per pack).
+//   dst arrives as uint words, 2 halves per word, little-endian:
+//   word w covers elements 2w,2w+1; lanes read-modify-write disjoint halves.
+//   NOTE: concurrent half writes to the same word need care: each thread
+//   touches exactly one half-word, but Vulkan has no atomic 16-bit OR.
+//   Host must size dst as uint[n] (one word per element, low 16 bits used)
+//   OR dispatch with non-overlapping guarantee. We write one uint per
+//   element (low half = bits, high half = 0); host compacts. Simplest
+//   correct + race-free: dst[] is uint per element.
+// Push constants: struct PC { int n; };
+// Bindings (set=0):
+//   0: readonly float x[] (n), 1: write uint dst[] (n words, bits in low half)
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer Bx { float x[]; };
+layout(set = 0, binding = 1) buffer Bd { uint dst[]; };
+
+layout(push_constant) uniform PC { int n; } pc;
+
+void main() {
+  int i = int(gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x);
+  if (2 * i >= pc.n) return;
+  // pack two consecutive floats into one uint (low half = x[2i], high half = x[2i+1])
+  dst[i] = packHalf2x16(vec2(x[2 * i], x[2 * i + 1]));
+}

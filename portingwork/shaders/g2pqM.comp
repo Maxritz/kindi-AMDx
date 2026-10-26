@@ -1,0 +1,69 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// g2pqM.comp - PQ2_0 batched GEMV: T tokens against one weight stream.
+//
+// Layout (same as g2pq): 34-byte blocks, fp16 d | uint8 qs[32], 2 bits per weight,
+// 128 weights per block. weight[j] = (((qs[j/4] >> ((j%4)*2)) & 3) - 1) * d
+// Byte offset of (row, block) = (row*bpr + block) * 34.
+//
+// ACCESS PATTERN MATTERS HERE. An earlier version gave each lane a whole 128-weight
+// block and looped j inside it. Consecutive lanes then read 64 different blocks, i.e.
+// addresses 34 bytes apart - uncoalesced - and measured 8x slower than g2pq (10.4 ms
+// vs 1.3 ms per op on the 27B). This version keeps g2pq's mapping (lane strides over
+// the C dimension, so consecutive lanes touch consecutive weights) and only adds the
+// token loop, which is where the reuse actually is.
+//
+// Push: { int R; int C; int T; int xstride; }
+// Bindings: 0 W (raw blocks as uint words) 1 X (token-major) 2 Y (token-major)
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer BW { uint W[]; };
+layout(set = 0, binding = 1) readonly buffer BX { float X[]; };
+layout(set = 0, binding = 2) buffer BO { float O[]; };
+
+layout(push_constant) uniform PC { int R; int C; int T; int xstride; } pc;
+
+float fp16_to_f32(uint bits) {
+    uint sign = (bits >> 15) & 1u;
+    uint exp  = (bits >> 10) & 0x1Fu;
+    uint mant = bits & 0x3FFu;
+    if (exp == 0u) { float v = float(mant) / 1024.0 * (1.0 / 16384.0); return sign == 1u ? -v : v; }
+    if (exp == 31u) return sign == 1u ? -3.0e38 : 3.0e38;
+    float v = (1.0 + float(mant) / 1024.0) * exp2(float(int(exp) - 15));
+    return sign == 1u ? -v : v;
+}
+uint bbyte(int bi) { return (W[bi >> 2] >> (8u * uint(bi & 3))) & 0xFFu; }
+
+void main() {
+    uint sgsz = gl_SubgroupSize;
+    uint nsub = uint(gl_WorkGroupSize.x) / sgsz;
+    int row = int(gl_WorkGroupID.x) * int(nsub) + int(gl_SubgroupID);
+    if (row >= pc.R) return;
+
+    uint lane = gl_SubgroupInvocationID;
+    int C = pc.C, T = pc.T;
+    int bpr = C >> 7;
+    int rowblk = row * bpr;
+
+    float acc[4] = float[4](0.0, 0.0, 0.0, 0.0);
+
+    // lane strides over C: consecutive lanes read consecutive weights (coalesced),
+    // exactly as g2pq does. The block scale d is re-read per element but is cached.
+    for (int c = int(lane); c < C; c += int(sgsz)) {
+        int blk = c >> 7, j = c & 127;
+        int base = (rowblk + blk) * 34;
+        float d = fp16_to_f32(bbyte(base) | (bbyte(base + 1) << 8));
+        uint q = (bbyte(base + 2 + (j >> 2)) >> (2u * uint(j & 3))) & 3u;
+        int wv = int(q) - 1;
+        if (wv != 0) {
+            float wd = float(wv) * d;
+            for (int t = 0; t < T && t < 4; ++t) acc[t] += wd * X[t * pc.xstride + c];
+        }
+    }
+
+    for (int t = 0; t < T && t < 4; ++t) {
+        float s = subgroupAdd(acc[t]);
+        if (lane == 0u) O[t * pc.R + row] = s;
+    }
+}

@@ -1,0 +1,55 @@
+// deq_emb2.comp — embedding row dequant from native PQ2_0 blocks + Hadamard fold.
+// PQ2_0 block = 34 bytes: fp16 d | uint8 qs[32] (2 bits/weight, 128 weights).
+// One workgroup per token row; C = D. Folds over HB (512, 1024, ...).
+#version 450
+layout(local_size_x = 1024) in;
+
+layout(set = 0, binding = 0) readonly buffer BW { uint w[]; };
+layout(set = 0, binding = 1) readonly buffer Bsg { float sg[]; };
+layout(set = 0, binding = 2) buffer Bh { float h[]; };
+
+layout(push_constant) uniform PC { int row; int C; int HB; int raw; } pc;
+
+shared float x[8192];
+
+float fp16_to_f32(uint bits) {
+    uint sign = (bits >> 15) & 1u;
+    uint exp  = (bits >> 10) & 0x1Fu;
+    uint mant = bits & 0x3FFu;
+    if (exp == 0u) { float v = float(mant)/1024.0*(1.0/16384.0); return sign==1u ? -v : v; }
+    if (exp == 31u) return sign==1u ? -3.0e38 : 3.0e38;
+    float v = (1.0 + float(mant)/1024.0) * exp2(float(int(exp) - 15));
+    return sign==1u ? -v : v;
+}
+uint bbyte(int bi) { return (w[bi >> 2] >> (8u * uint(bi & 3))) & 0xFFu; }
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    int C = pc.C, HB = pc.HB;
+    int bpr = C >> 7;
+    int rowbase = pc.row * bpr * 34;
+
+    for (int e = int(t); e < C; e += 1024) {
+        int blk = e >> 7, j = e & 127;
+        int base = rowbase + blk * 34;
+        float d = fp16_to_f32(bbyte(base) | (bbyte(base + 1) << 8));
+        uint q = (bbyte(base + 2 + (j >> 2)) >> (2u * uint(j & 3))) & 3u;
+        x[e] = float(int(q) - 1) * d;
+    }
+    barrier();
+
+    for (int c0 = 0; c0 < C; c0 += HB) {
+        for (int hh = 1; hh < HB; hh <<= 1) {
+            for (int q = int(t); q < (HB >> 1); q += 1024) {
+                int i = c0 + (q / hh) * 2 * hh + (q % hh);
+                float a = x[i], b = x[i + hh];
+                x[i] = a + b; x[i + hh] = a - b;
+            }
+            barrier();
+        }
+    }
+    if (pc.raw != 0) { for (int e = int(t); e < C; e += 1024) h[e] = x[e]; return; }
+    barrier();
+    float s = inversesqrt(float(HB));
+    for (int e = int(t); e < C; e += 1024) h[e] = sg[e] * (x[e] * s);
+}

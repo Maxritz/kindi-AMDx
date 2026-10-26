@@ -1,0 +1,121 @@
+// rmsfold.comp <- k_rmsfold (single-card 2B path)
+// CUDA grid: (C/512) blocks, block 512 threads.
+//   blockIdx.x = c (chunk), threadIdx.x = j (0..511)
+//   c0 = c * (HB<0 ? 512 : HB); chunk len = HB<0 ? 512 : HB
+// Vulkan: local_size_x=512, num workgroups = C/512.
+//   gl_WorkGroupID.x = c, gl_LocalInvocationID.x = j
+// Push constants (<=128B):
+//   struct PC { int C; int add; int HB; };
+//   C   = vector length (e.g. 2048); grid = C/512
+//   add = residual parts in r (0 = none; >1 = column-split parts, C apart)
+//   HB  = 512 (scaled by 0.044194173824159220878) or -512 (unscaled); generic HB also handled
+// Bindings (set=0):
+//   0: readonly float x[]      (len C)
+//   1: readonly float r[]      (len add*C, ignored if add==0)
+//   2: write   float xw[]     (len C, written only if add!=0)
+//   3: readonly float w[]      (len C, rms weight)
+//   4: readonly float sg[]     (len C, hadamard signs)
+//   5: write   float xn[]     (len C, normalized)
+//   6: write   float xo[]     (len C, folded output)
+#version 450
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+layout(local_size_x = 512) in;
+
+layout(set = 0, binding = 0) readonly buffer Bx { float x[]; };
+layout(set = 0, binding = 1) readonly buffer Br { float r[]; };
+layout(set = 0, binding = 2) buffer Bxw { float xw[]; };
+layout(set = 0, binding = 3) readonly buffer Bw { float w[]; };
+layout(set = 0, binding = 4) readonly buffer Bsg { float sg[]; };
+layout(set = 0, binding = 5) buffer Bxn { float xn[]; };
+layout(set = 0, binding = 6) buffer Bxo { float xo[]; };
+
+layout(push_constant) uniform PC { int C; int add; int HB; } pc;
+
+shared float xs[4096];
+shared float64_t red[16];
+shared float bscale;
+
+float64_t wsum_d(float64_t v) {
+  v += subgroupShuffleXor(v, 16);
+  v += subgroupShuffleXor(v, 8);
+  v += subgroupShuffleXor(v, 4);
+  v += subgroupShuffleXor(v, 2);
+  v += subgroupShuffleXor(v, 1);
+  return v;
+}
+
+void main() {
+  uint j = gl_LocalInvocationID.x;
+  uint lane = j & 31u;
+  uint wp = j >> 5;
+  int C = pc.C;
+  int add = pc.add;
+  int HB = pc.HB;
+  int chunk = (HB < 0 ? 512 : HB);
+  uint c0 = gl_WorkGroupID.x * uint(chunk);
+
+  float64_t acc = float64_t(0.0);
+  for (int e = int(j); e < C; e += 512) {
+    float xf = x[e];
+    if (add != 0) {
+      float s = r[e];
+      for (int i = 1; i < add; ++i) s += r[i * C + e];
+      xf = x[e] + s;
+    }
+    float64_t v = float64_t(xf);
+    acc += v * v;
+  }
+  acc = wsum_d(acc);
+  if (lane == 0u) red[wp] = acc;
+  barrier();
+  if (wp == 0u) {
+    float64_t t = (lane < 16u) ? red[lane] : float64_t(0.0);
+    t = wsum_d(t);
+    if (lane == 0u) bscale = 1.0f / sqrt(float(t / float64_t(float(C))) + 1e-6f);
+  }
+  barrier();
+  float s = bscale;
+  for (int m = int(j); m < chunk; m += 512) {
+    uint e = c0 + uint(m);
+    float xf = x[int(e)];
+    if (add != 0) {
+      float rs = r[int(e)];
+      for (int i = 1; i < add; ++i) rs += r[i * C + int(e)];
+      xf = x[int(e)] + rs;
+      xw[int(e)] = xf;
+    }
+    float v = (xf * s) * w[int(e)];
+    xn[int(e)] = v;
+    xs[m] = sg[int(e)] * v;
+  }
+  barrier();
+  if (HB == 512 || HB == -512) {
+    // fwht_chunks(xs, NC=1, j): only j<256 active, same as CUDA
+    for (int h = 1; h < 512; h <<= 1) {
+      if (j < 256u) {
+        int i = (int(j) / h) * 2 * h + (int(j) % h);
+        float a = xs[i];
+        float b = xs[i + h];
+        xs[i] = a + b;
+        xs[i + h] = a - b;
+      }
+      barrier();
+    }
+    xo[c0 + j] = (HB == 512) ? xs[j] * 0.044194173824159220878f : xs[j];
+  } else {
+    // generic HB-point FWHT (HB power of two, <=4096), then 1/sqrt(HB)
+    for (int h = 1; h < HB; h <<= 1) {
+      for (int t = int(j); t < (HB >> 1); t += 512) {
+        int i = (t / h) * 2 * h + (t % h);
+        float a = xs[i];
+        float b = xs[i + h];
+        xs[i] = a + b;
+        xs[i + h] = a - b;
+      }
+      barrier();
+    }
+    float sc = inversesqrt(float(HB));
+    for (int m = int(j); m < HB; m += 512) xo[c0 + uint(m)] = xs[m] * sc;
+  }
+}

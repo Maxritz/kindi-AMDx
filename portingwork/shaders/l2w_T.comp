@@ -1,0 +1,45 @@
+#version 450
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+// l2w_T.comp - L2 normalise q/k rows for T tokens.
+// Push: { int n; int rows; int stride; }  stride = per-token row stride in floats
+//   x[tok*stride + r*n + e], out same layout. rows = rows-per-token.
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer Bx { float x[]; };
+layout(set = 0, binding = 1) buffer Bo { float out_[]; };
+
+layout(push_constant) uniform PC { int n; int rows; int stride; int T; int ostride; } pc;
+
+float64_t wsum_d(float64_t v) {
+  v += subgroupShuffleXor(v, 16);
+  v += subgroupShuffleXor(v, 8);
+  v += subgroupShuffleXor(v, 4);
+  v += subgroupShuffleXor(v, 2);
+  v += subgroupShuffleXor(v, 1);
+  return v;
+}
+
+void main() {
+  uint lid = gl_LocalInvocationID.x;
+  uint lane = lid & 31u;
+  uint wp = lid >> 5;
+  int n = pc.n;
+  int total = pc.rows * pc.T;
+  int r = int(gl_WorkGroupID.x * 8u + wp);
+  bool live = (r < total);
+  // map global row r -> (token, row-in-token), then to a flat offset
+  int tok = (pc.rows != 0) ? (r / pc.rows) : 0;
+  int rr  = (pc.rows != 0) ? (r % pc.rows) : 0;
+  int off  = tok * pc.stride  + rr * n;
+  int ooff = tok * pc.ostride + rr * n;
+  float64_t acc = float64_t(0.0);
+  for (int e = int(lane); e < n; e += 32) {
+    float64_t v = live ? float64_t(x[off + e]) : float64_t(0.0);
+    acc += v * v;
+  }
+  acc = wsum_d(acc);
+  if (!live) return;
+  float sc = 1.0f / max(sqrt(float(acc)), 1e-6f);
+  for (int e = int(lane); e < n; e += 32) out_[ooff + e] = x[off + e] * sc;
+}

@@ -1,0 +1,80 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// g4lut3.comp - ternary GEMV, up to THREE tensors sharing one input, one launch.
+//
+// The reference engine (engine.py gemv) says: "Up to three ternary tensors with the
+// same input in one launch." The port called gemv separately per tensor, so every
+// tensor paid a full inter-dispatch barrier - measured at ~48 us each, 446 barriers
+// per token, 21.6 ms/token of pure drain on a 10.4 ms/token workload.
+//
+// q/k/v share xp, attn_qkv/attn_gate share xp, ffn_gate/ffn_up share xp. Fusing them
+// removes the barrier between them and gives each launch 2-3x the work, so the drain
+// is amortised.
+//
+// Row space is the concatenation [0,R0) + [R0,R0+R1) + [R0+R1,R0+R1+R2). Each 64-wide
+// wave owns one row; 4 waves per workgroup.
+//
+// Push constants: { int R0; int R1; int R2; int C; }
+// Bindings: 0 W0 1 S0 2 Y0 3 W1 4 S1 5 Y1 6 W2 7 S2 8 Y2 9 X
+layout(local_size_x = 256) in;
+
+shared uint lut[256];
+
+layout(set = 0, binding = 0) readonly buffer W0B { uint W0[]; };
+layout(set = 0, binding = 1) readonly buffer S0B { uint S0[]; };
+layout(set = 0, binding = 2) buffer Y0B { float Y0[]; };
+layout(set = 0, binding = 3) readonly buffer W1B { uint W1[]; };
+layout(set = 0, binding = 4) readonly buffer S1B { uint S1[]; };
+layout(set = 0, binding = 5) buffer Y1B { float Y1[]; };
+layout(set = 0, binding = 6) readonly buffer W2B { uint W2[]; };
+layout(set = 0, binding = 7) readonly buffer S2B { uint S2[]; };
+layout(set = 0, binding = 8) buffer Y2B { float Y2[]; };
+layout(set = 0, binding = 9) readonly buffer XB { float x[]; };
+
+layout(push_constant) uniform PC { int R0; int R1; int R2; int C; } pc;
+
+uint rdW(int t, uint i) { return t == 0 ? W0[i] : (t == 1 ? W1[i] : W2[i]); }
+uint rdS(int t, uint i) { return t == 0 ? S0[i] : (t == 1 ? S1[i] : S2[i]); }
+void wrY(int t, uint i, float v) { if (t == 0) Y0[i] = v; else if (t == 1) Y1[i] = v; else Y2[i] = v; }
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    int C = pc.C;
+
+    lut[tid] = uint(tid % 3) | (uint((tid / 3) % 3) << 8)
+             | (uint((tid / 9) % 3) << 16) | (uint((tid / 27) % 3) << 24);
+    barrier();
+
+    uint sgsz = gl_SubgroupSize;
+    uint nsub = uint(gl_WorkGroupSize.x) / sgsz;
+    int gr = int(gl_WorkGroupID.x) * int(nsub) + int(gl_SubgroupID);
+    int total = pc.R0 + pc.R1 + pc.R2;
+    if (gr >= total) return;
+
+    int t, row;
+    if (gr < pc.R0)            { t = 0; row = gr; }
+    else if (gr < pc.R0 + pc.R1) { t = 1; row = gr - pc.R0; }
+    else                        { t = 2; row = gr - pc.R0 - pc.R1; }
+
+    uint lane  = gl_SubgroupInvocationID;
+    int nq     = C >> 7;
+    int nbytes = C >> 2;
+    uint base  = uint(row) * uint(nbytes);
+
+    float acc = 0.0;
+    for (int kb = int(lane); kb < nbytes; kb += int(sgsz)) {
+        uint bi   = base + uint(kb);
+        uint byte = (rdW(t, bi >> 2) >> (8u * (bi & 3u))) & 0xFFu;
+        uint p    = lut[byte];
+        float sc  = unpackHalf2x16(rdS(t, uint(row * nq + (kb >> 5)))).x;
+        int k = kb << 2;
+        float t0 = float(p & 0xFFu)         - 1.0;
+        float t1 = float((p >> 8)  & 0xFFu) - 1.0;
+        float t2 = float((p >> 16) & 0xFFu) - 1.0;
+        float t3 = float((p >> 24) & 0xFFu) - 1.0;
+        acc += sc * (t0 * x[k] + t1 * x[k + 1] + t2 * x[k + 2] + t3 * x[k + 3]);
+    }
+    acc = subgroupAdd(acc);
+    if (lane == 0u) wrY(t, uint(row), acc);
+}

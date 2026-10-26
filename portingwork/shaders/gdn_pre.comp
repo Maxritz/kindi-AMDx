@@ -1,0 +1,114 @@
+// gdn_pre.comp <- k_gdn_pre (kindi.cu lines 1059-1118), 27B merged path
+// CUDA grid/block: grid NV+2*NK+rest, block 256.
+//   blocks [0,NV): gates of v-head b (k_gdn_gates, bf16 weights).
+//   blocks [NV,NV+2*NK): conv+silu of HK channels of q/k head (b-NV),
+//     then k_l2w L2-norm into qk[(b-NV)*HK+t].
+//   rest: conv+silu of 256 v-channels each, c=2*NK*HK+(b-NV-2*NK)*256+t.
+// Vulkan mapping: local_size_x=256, dispatch (NV+2*NK+ceil(...),1,1);
+//   b=gl_WorkGroupID.x, t=gl_LocalInvocationID.x; barrier()==__syncthreads.
+//   The qkh t>=HK early-out's two dummy __syncthreads() are replaced by
+//   predicated execution: every lane runs both barriers (identical sync,
+//   no divergent-barrier UB), idle lanes just skip the loads/stores.
+// bf16 VERIFICATION (checked, do NOT "simplify"):
+//   CUDA: f = __uint_as_float((uint)w16 << 16), w16 = stored 16-bit word.
+//   Bit layout of f: sign=w16[15], exp8=w16[14:7], frac23=w16[6:0]::0x0000.
+//   That is EXACTLY bfloat16 (bias 127, 8-bit exp, 7-bit mantissa): the file
+//   stores the upper half of an fp32 (cf. gguf_loader.py ty==30: v=u32<<16).
+//   unpackHalf2x16 instead decodes IEEE binary16 (bias 15, 5-bit exp).
+//   Counter-example: w16=0x3F80 -> bits-as-bf16 = 1.0f,
+//   unpackHalf2x16(w16).x = fp16(0x3F80) = 1.5f. NOT equivalent.
+//   Correct GLSL: uintBitsToFloat(w16 << 16u) -- exact, bit-identical.
+//   Host uploads the u16 array zero-extended to uint (one word per element).
+// Push constants (20B): { int n, C, NV, NK, HK }.
+// Bindings: 0 xn ro, 1 bw ro uint, 2 aw ro uint, 3 dtb ro, 4 ssma ro,
+//   5 beta wo, 6 g wo, 7 qkv ro, 8 conv rw, 9 cw ro, 10 cs wo, 11 qk wo.
+// Fidelity risks vs CUDA: dot/norm accumulation order identical
+//   (bit-identical); only exp()/log1p()/sqrt() last-ulp differences on GCN.
+#version 450
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer B0 { float xn[]; };
+layout(set = 0, binding = 1) readonly buffer B1 { uint bw[]; };
+layout(set = 0, binding = 2) readonly buffer B2 { uint aw[]; };
+layout(set = 0, binding = 3) readonly buffer B3 { float dtb[]; };
+layout(set = 0, binding = 4) readonly buffer B4 { float ssma[]; };
+layout(set = 0, binding = 5) buffer B5 { float beta[]; };
+layout(set = 0, binding = 6) buffer B6 { float g[]; };
+layout(set = 0, binding = 7) readonly buffer B7 { float qkv[]; };
+layout(set = 0, binding = 8) buffer B8 { float conv[]; };
+layout(set = 0, binding = 9) readonly buffer B9 { float cw[]; };
+layout(set = 0, binding = 10) buffer B10 { float cs[]; };
+layout(set = 0, binding = 11) buffer B11 { float qk[]; };
+layout(push_constant) uniform PC { int n; int C; int NV; int NK; int HK; } pc;
+shared float sb[256];
+shared float sa[256];
+shared float row[128];
+shared float scl;
+float64_t wsum_d(float64_t v) {
+  v += subgroupShuffleXor(v, 16u);
+  v += subgroupShuffleXor(v, 8u);
+  v += subgroupShuffleXor(v, 4u);
+  v += subgroupShuffleXor(v, 2u);
+  v += subgroupShuffleXor(v, 1u);
+  return v;
+}
+void main() {
+  uint b = gl_WorkGroupID.x;
+  uint t = gl_LocalInvocationID.x;
+  int n = pc.n, C = pc.C, NV = pc.NV, NK = pc.NK, HK = pc.HK;
+  if (int(b) < NV) {
+    float ab = 0.0f, aa = 0.0f;
+    uint base = b * uint(n);
+    for (int i = int(t); i < n; i += 256) {
+      float x = xn[uint(i)];
+      ab += uintBitsToFloat(bw[base + uint(i)] << 16u) * x;
+      aa += uintBitsToFloat(aw[base + uint(i)] << 16u) * x;
+    }
+    sb[t] = ab; sa[t] = aa;
+    barrier();
+    for (int st = 128; st > 0; st >>= 1) {
+      if (t < uint(st)) { sb[t] += sb[t + uint(st)]; sa[t] += sa[t + uint(st)]; }
+      barrier();
+    }
+    if (t == 0u) {
+      beta[b] = 1.0f / (1.0f + exp(-sb[0]));
+      float a = sa[0] + dtb[b];
+      float sp = (a > 20.0f) ? a : log(1.0f + exp(min(a, 20.0f)));
+      g[b] = sp * ssma[b];
+    }
+    return;
+  }
+  if (int(b) < NV + 2 * NK) {
+    if (t < uint(HK)) {
+      uint c = (b - uint(NV)) * uint(HK) + t;
+      uint Cu = uint(C);
+      float c0 = conv[c], c1 = conv[Cu + c], c2 = conv[2u * Cu + c], nw = qkv[c];
+      float o = c0 * cw[4u * c] + c1 * cw[4u * c + 1u] + c2 * cw[4u * c + 2u] + nw * cw[4u * c + 3u];
+      conv[c] = c1; conv[Cu + c] = c2; conv[2u * Cu + c] = nw;
+      float y = o / (1.0f + exp(-o));
+      cs[c] = y;
+      row[t] = y;
+    }
+    barrier();
+    float64_t acc = float64_t(0.0);
+    if (t < 32u) {
+      for (int e = int(t); e < HK; e += 32) {
+        float64_t vv = float64_t(row[uint(e)]);
+        acc += vv * vv;
+      }
+    }
+    acc = wsum_d(acc);
+    if (t == 0u) scl = 1.0f / max(sqrt(float(acc)), 1e-6f);
+    barrier();
+    if (t < uint(HK)) qk[(b - uint(NV)) * uint(HK) + t] = row[t] * scl;
+    return;
+  }
+  uint c = uint(2 * NK * HK) + (b - uint(NV) - uint(2 * NK)) * 256u + t;
+  if (int(c) >= C) return;
+  uint Cu = uint(C);
+  float c0 = conv[c], c1 = conv[Cu + c], c2 = conv[2u * Cu + c], nw = qkv[c];
+  float o = c0 * cw[4u * c] + c1 * cw[4u * c + 1u] + c2 * cw[4u * c + 2u] + nw * cw[4u * c + 3u];
+  conv[c] = c1; conv[Cu + c] = c2; conv[2u * Cu + c] = nw;
+  cs[c] = o / (1.0f + exp(-o));
+}

@@ -1,0 +1,44 @@
+#version 450
+// gdn_delta_T.comp - gdn_delta for T tokens in order (k_gdn_delta_T).
+// The state column for head h is held in registers for the whole chunk, so the T
+// sequential delta steps cost one dispatch. State is written back once at the end,
+// which is exactly equivalent to calling gdn_delta T times in order.
+// Push: { float scale; int n_k_heads; int ldqk; int ldv; int ldg; int T; }  (24 B)
+// Bindings: 0 M(rw) 1 q 2 k 3 v 4 g 5 beta 6 out
+layout(local_size_x = 128) in;
+layout(set = 0, binding = 0) buffer B0 { float M[]; };
+layout(set = 0, binding = 1) readonly buffer B1 { float q[]; };
+layout(set = 0, binding = 2) readonly buffer B2 { float k[]; };
+layout(set = 0, binding = 3) readonly buffer B3 { float v[]; };
+layout(set = 0, binding = 4) readonly buffer B4 { float g[]; };
+layout(set = 0, binding = 5) readonly buffer B5 { float beta[]; };
+layout(set = 0, binding = 6) buffer B6 { float out_[]; };
+layout(push_constant) uniform PC { float scale; int nkh; int ldqk; int ldv; int ldg; int T; int ldo; } pc;
+
+shared float ks[128];
+shared float qs[128];
+
+void main() {
+  uint h = gl_WorkGroupID.x;
+  uint j = gl_LocalInvocationID.x;
+  uint kh = h % uint(pc.nkh);
+  uint Mh = h * 16384u;
+  for (int tok = 0; tok < pc.T; ++tok) {
+    uint to = uint(tok);
+    barrier();
+    ks[j] = k[to * uint(pc.ldqk) + kh * 128u + j];
+    qs[j] = q[to * uint(pc.ldqk) + kh * 128u + j];
+    barrier();
+    float e = exp(g[to * uint(pc.ldg) + h]);
+    float sk = 0.0f;
+    for (int i = 0; i < 128; ++i) sk += (M[Mh + uint(i) * 128u + j] * e) * ks[uint(i)];
+    float dd = (v[to * uint(pc.ldv) + h * 128u + j] - sk) * beta[to * uint(pc.ldg) + h];
+    float o = 0.0f;
+    for (int i = 0; i < 128; ++i) {
+      float m = M[Mh + uint(i) * 128u + j] * e + ks[uint(i)] * dd;
+      M[Mh + uint(i) * 128u + j] = m;
+      o += m * qs[uint(i)];
+    }
+    out_[to * uint(pc.ldo) + h * 128u + j] = o * pc.scale;
+  }
+}

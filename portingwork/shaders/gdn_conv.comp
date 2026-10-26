@@ -1,0 +1,27 @@
+// gdn_conv.comp <- k_gdn_conv (kindi.cu)
+// CUDA grid/block: 1D grid ceil(C/blockDim), thread c guards c>=C. Per
+//   channel: width-4 causal FIR o=c0*cw[0]+c1*cw[1]+c2*cw[2]+nw*cw[3], in-place
+//   state shift conv[c]=c1, conv[C+c]=c2, conv[2C+c]=nw, cs[c]=silu(o).
+// Vulkan mapping: local_size_x=256, dispatch (ceil(C/256),1,1);
+//   c=gl_WorkGroupID.x*256+gl_LocalInvocationID.x. No shared, no shuffles.
+// Push constants (4B): { int C }.
+// Bindings: 0 qkv ro, 1 conv rw (3*C floats), 2 cw ro (4*C), 3 cs wo.
+// Fidelity risks: per-channel lanes are independent (no cross-lane state),
+//   so the in-place shift is race-free; only exp() ulp risk in silu.
+#version 450
+#extension GL_KHR_shader_subgroup_shuffle : require
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer B0 { float qkv[]; };
+layout(set = 0, binding = 1) buffer B1 { float conv[]; };
+layout(set = 0, binding = 2) readonly buffer B2 { float cw[]; };
+layout(set = 0, binding = 3) buffer B3 { float cs[]; };
+layout(push_constant) uniform PC { int C; } pc;
+void main() {
+  uint c = gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x;
+  if (c >= uint(pc.C)) return;
+  uint C = uint(pc.C);
+  float c0 = conv[c], c1 = conv[C + c], c2 = conv[2u * C + c], nw = qkv[c];
+  float o = c0 * cw[4u * c] + c1 * cw[4u * c + 1u] + c2 * cw[4u * c + 2u] + nw * cw[4u * c + 3u];
+  conv[c] = c1; conv[C + c] = c2; conv[2u * C + c] = nw;
+  cs[c] = o / (1.0f + exp(-o));
+}

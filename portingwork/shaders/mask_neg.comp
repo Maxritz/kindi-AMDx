@@ -1,0 +1,26 @@
+// mask_neg.comp <- k_mask_neg (negate shortlist logits for excluded tokens)
+// CUDA: for i=block*blockDim+tid; i<n; i+=grid*blockDim:
+//   if tok[i]<0: y[i] = -1e30.
+// Vulkan: local_size_x=256, fixed total 4096 threads emulation:
+//   grid*blockDim equivalent = 4096 (16 workgroups). tid = global linear id.
+//   Host dispatches exactly 16 workgroups (or any W; stride = W*256).
+//   To stay launch-shape agnostic we stride by WorkGroupID range via
+//   numWorkgroups (Vulkan 1.1+): i = gid; i<n; i += totalThreads.
+// Push constants: struct PC { int n; };
+// Bindings (set=0):
+//   0: buffer float y[] (n, r/w), 1: readonly int tok[] (n)
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer By { float y[]; };
+layout(set = 0, binding = 1) readonly buffer Bt { int tok[]; };
+
+layout(push_constant) uniform PC { int n; } pc;
+
+void main() {
+  uint total = gl_NumWorkGroups.x * 256u;
+  uint gid = gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x;
+  for (uint i = gid; i < uint(pc.n); i += total) {
+    if (tok[i] < 0) y[i] = -1e30f;
+  }
+}

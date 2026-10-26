@@ -1,0 +1,150 @@
+#version 450
+#extension GL_KHR_shader_subgroup_shuffle : require
+// g4.comp <- k_g4 (ternary GEMV decode, up to 3 fused tensors sharing one input)
+// CUDA mapping: grid (nsm, gridY), block 1024. One warp (32 lanes) owns one 16-row
+// group; NPH = C/512 phases per row. Tables live in a GLOBAL scratch buffer because
+// 2*81*64 floats = 41KB exceeds gfx803's 32KB shared memory. Table content is
+// identical for every workgroup (same input x), one scratch buffer is shared.
+// Phase loop stays inside one dispatch; barrier()+memoryBarrierBuffer() == __syncthreads().
+// Uniform-trip group loop (clamped reads, predicated writes) so subgroup shuffles stay
+// converged; numerically identical to CUDA for all real outputs.
+// Push constants (36B): R0 R1 R2 C NG0 NG1 NPH gridX gridY
+// Bindings: 0:W0u 1:S0u 2:y0f 3:W1u 4:S1u 5:y1f 6:W2u 7:S2u 8:y2f 9:xf 10:tablesf(coherent)
+// W layout: per (group,phase): 4 uint4 per lane -> uint idx (((g*NPH+ph)*4+i)*32+lane)*4+m
+// S layout: uint idx (g*NPH+ph)*32+lane ; scales via unpackHalf2x16
+// Table float idx: byte b of weight w -> T[(uint)b*64+lane] (+32 / +5184 / +5216 halves)
+
+layout(local_size_x = 1024) in;
+
+layout(set = 0, binding = 0) readonly buffer W0B { uint W0[]; };
+layout(set = 0, binding = 1) readonly buffer S0B { uint S0[]; };
+layout(set = 0, binding = 2) buffer Y0B { float y0[]; };
+layout(set = 0, binding = 3) readonly buffer W1B { uint W1[]; };
+layout(set = 0, binding = 4) readonly buffer S1B { uint S1[]; };
+layout(set = 0, binding = 5) buffer Y1B { float y1[]; };
+layout(set = 0, binding = 6) readonly buffer W2B { uint W2[]; };
+layout(set = 0, binding = 7) readonly buffer S2B { uint S2[]; };
+layout(set = 0, binding = 8) buffer Y2B { float y2[]; };
+layout(set = 0, binding = 9) readonly buffer XB { float x[]; };
+layout(set = 0, binding = 10) coherent buffer TB { float T[]; };
+
+layout(push_constant) uniform PC {
+  int R0; int R1; int R2; int C; int NG0; int NG1; int NPH; int gridX; int gridY;
+} pc;
+
+uint rdW(uint t, uint idx) {
+  if (t == 0u) return W0[idx];
+  if (t == 1u) return W1[idx];
+  return W2[idx];
+}
+uint rdS(uint t, uint idx) {
+  if (t == 0u) return S0[idx];
+  if (t == 1u) return S1[idx];
+  return S2[idx];
+}
+float rdY(uint t, uint idx) {
+  if (t == 0u) return y0[idx];
+  if (t == 1u) return y1[idx];
+  return y2[idx];
+}
+void wrY(uint t, uint idx, float v) {
+  if (t == 0u) y0[idx] = v;
+  else if (t == 1u) y1[idx] = v;
+  else y2[idx] = v;
+}
+
+void main() {
+  int tid = int(gl_LocalInvocationID.x);
+  int lane = tid & 31;
+  int warp = tid >> 5;
+  int NPH = pc.NPH;
+  int by = int(gl_WorkGroupID.y);
+  int ph_lo = (by * NPH) / pc.gridY;
+  int ph_hi = ((by + 1) * NPH) / pc.gridY;
+  int NG0 = pc.NG0, NG1 = pc.NG1;
+  int NG = NG0 + NG1 + (pc.R2 >> 4);
+
+  int bl = tid & 31, bk = (tid >> 5) & 3;
+  float nx0 = 0.0, nx1 = 0.0, nx2 = 0.0, nx3 = 0.0;
+  if (tid < 384) {
+    uint xb = (uint(ph_lo) << 9u) + (uint(bl) << 4u) + (uint(bk) << 2u);
+    nx0 = x[xb]; nx1 = x[xb + 1u]; nx2 = x[xb + 2u]; nx3 = x[xb + 3u];
+  }
+
+  bool b0 = (lane & 1) != 0, b1 = (lane & 2) != 0;
+  bool b2 = (lane & 4) != 0, b3 = (lane & 8) != 0;
+  int rfin = (b0 ? 8 : 0) + (b1 ? 4 : 0) + (b2 ? 2 : 0) + (b3 ? 1 : 0);
+  bool wr = (lane & 16) == 0;
+  uint stride = uint(pc.gridX) * 32u;
+  uint base = uint(gl_WorkGroupID.x) * 32u;
+
+  for (int ph = ph_lo; ph < ph_hi; ++ph) {
+    barrier();
+    if (tid < 384) {
+      int l = bl, k = bk, t3 = tid >> 7;
+      float x0 = nx0, x1 = nx1, x2 = nx2, x3 = nx3;
+      if (ph + 1 < ph_hi) {
+        uint xq = (uint(ph + 1) << 9u) + (uint(l) << 4u) + (uint(k) << 2u);
+        nx0 = x[xq]; nx1 = x[xq + 1u]; nx2 = x[xq + 2u]; nx3 = x[xq + 3u];
+      }
+      uint Tk = (uint(k >> 1)) * 5184u + (uint(k & 1)) * 32u + uint(l) + uint(t3) * 27u * 64u;
+      float bb3 = float(t3 - 1) * x3;
+      for (int t2 = 0; t2 < 3; ++t2) {
+        float bb2 = bb3 + float(t2 - 1) * x2;
+        for (int t1 = 0; t1 < 3; ++t1) {
+          float bb1 = bb2 + float(t1 - 1) * x1;
+          uint q = Tk + (uint(t2 * 9 + t1 * 3)) * 64u;
+          T[q] = bb1 - x0; T[q + 64u] = bb1; T[q + 128u] = bb1 + x0;
+        }
+      }
+    }
+    memoryBarrierBuffer();
+    barrier();
+    // uniform-trip group loop: exit condition uniform, reads clamped, writes predicated
+    for (uint s = base; s < uint(NG); s += stride) {
+      uint g = s + uint(warp);
+      bool on = g < uint(NG);
+      uint gg = on ? g : 0u;
+      uint t = gg >= uint(NG0 + NG1) ? 2u : (gg >= uint(NG0) ? 1u : 0u);
+      uint gl = t == 2u ? gg - uint(NG0 + NG1) : (t == 1u ? gg - uint(NG0) : gg);
+      int Rt = t == 2u ? pc.R2 : (t == 1u ? pc.R1 : pc.R0);
+      uint yoff = uint(by) * uint(Rt);
+      uint rw = (gg << 4u) + uint(rfin);
+      float yo = (ph > ph_lo && wr && on) ? rdY(t, yoff + rw) : 0.0;
+      uint wbase = ((gg * uint(NPH) + uint(ph)) * 4u);
+      uint wv0 = rdW(t, (wbase + 0u) * 32u + uint(lane));
+      uint wv1 = rdW(t, (wbase + 1u) * 32u + uint(lane));
+      uint wv2 = rdW(t, (wbase + 2u) * 32u + uint(lane));
+      uint wv3 = rdW(t, (wbase + 3u) * 32u + uint(lane));
+      // NOTE: CUDA loads uint4 (4 consecutive uints per lane); the flat W buffer
+      // here stores them transposed as [4][32] per (g,ph): component m of lane l at
+      // index m*32+l. Reorder to match CUDA's wv[i].{x,y,z,w} below.
+      uint wv[4];
+      wv[0] = wv0; wv[1] = wv1; wv[2] = wv2; wv[3] = wv3;
+      uint sv = rdS(t, (gg * uint(NPH) + uint(ph)) * 32u + uint(lane));
+      float v[16];
+      for (int i = 0; i < 4; ++i) {
+        uint w = wv[i];
+        uint e0 = w & 255u, e1 = (w >> 8u) & 255u, e2 = (w >> 16u) & 255u, e3 = (w >> 24u) & 255u;
+        uint L = uint(lane);
+        // e1's table base is +128 BYTES = +32 floats; e2 base 20736B = +5184 floats
+        v[i * 4 + 0] = (T[e0 * 64u + L] + T[e1 * 64u + L + 32u])
+                     + (T[e2 * 64u + L + 5184u] + T[e3 * 64u + L + 5216u]);
+      }
+      float a8[8];
+      for (int i = 0; i < 8; ++i)
+        a8[i] = (b0 ? v[8 + i] : v[i]) + subgroupShuffleXor(b0 ? v[i] : v[8 + i], 1u);
+      float a4[4];
+      for (int i = 0; i < 4; ++i)
+        a4[i] = (b1 ? a8[4 + i] : a8[i]) + subgroupShuffleXor(b1 ? a8[i] : a8[4 + i], 2u);
+      float a2[2];
+      for (int i = 0; i < 2; ++i)
+        a2[i] = (b2 ? a4[2 + i] : a4[i]) + subgroupShuffleXor(b2 ? a4[i] : a4[2 + i], 4u);
+      vec2 sc = unpackHalf2x16(sv);
+      a2[0] *= sc.x; a2[1] *= sc.y;
+      float d = (b3 ? a2[1] : a2[0]) + subgroupShuffleXor(b3 ? a2[0] : a2[1], 8u);
+      d += subgroupShuffleXor(d, 16u);
+      if (wr && on) wrY(t, yoff + rw, yo + d);
+    }
+  }
+}

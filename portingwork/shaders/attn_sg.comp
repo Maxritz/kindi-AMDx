@@ -1,0 +1,95 @@
+#version 450
+#extension GL_KHR_shader_subgroup_shuffle : require
+// attn_sg.comp <- k_attn_sg (generic GQA: G <= 8 q heads per K/V head; G from push constant)
+//   Faithful port for future 4B/9B models. For 2B dispatch with G=4 it matches
+//   k_attn_sg with G=4 (and k_attn_s4w's scores; s4w uses the 16-value butterfly
+//   while sg uses per-head wsum_f - same sums, different reduction structure).
+// CUDA grid/block mapping:
+//   CUDA: grid (NHKV, <=32), block 256 (8 warps of 32): one warp per position,
+//         persistent t = blockIdx.y*8+warp; t += gridDim.y*8. lane = dims 8l..8l+7
+//         (block l/4 of the 8 q8 blocks is historical; here 256 fp32 dims);
+//         the G heads' q in registers (zero-padded for j >= G).
+// Vulkan: num workgroups (NHKV, nposgroups <= 32, 1), local_size_x = 256.
+//         gl_WorkGroupID.x = kv, gl_WorkGroupID.y = position-group,
+//         gl_LocalInvocationID.x gives lane (bits 0..4) and warp (bits 3..7>>5).
+// Push constants (16 B <= 128 B): int n, int n_kv, int G (<=8), float scale
+//   (0.0625 for 2B; kept as a constant so future models can differ).
+// Buffers: Kh = fp16 BITS as uint[] (never dequantized on host); word index
+//   ((t*n_kv+kv)*32+lane)*4+m, decoded with unpackHalf2x16. q = float[NHKV*G*256]
+//   row-major (head kv*G+j)*256; s = float[(NHKV*G)*n], row (kv*G+j)*n+t.
+// Arithmetic: exact order of k_attn_sg - 8-dim dot, then wsum_f xor chain
+//   16,8,4,2,1 (five subgroupShuffleXor adds in that order), lane 0 writes
+//   a * scale.
+// SUBGROUP NOTE (64 vs warp 32): masks are 16,8,4,2,1, all <32, so both
+//   32-lane halves of a 64-lane subgroup reduce independently with no
+//   crosstalk - identical to two CUDA warps. The (j < G) guard is branchless
+//   per lane (all 32 lanes of a warp take the same path), matching __shfl_xor
+//   semantics; with subgroupSize=64 the shuffle still pairs lanes idx^mask
+//   within each 32-lane half, so inactive-head lanes contribute 0.0 exactly as
+//   in CUDA. Requires consecutively numbered subgroups (gfx803 true).
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer KhBuf { uint Kh[]; };
+layout(set = 0, binding = 1) readonly buffer QBuf { float q[]; };
+layout(set = 0, binding = 2) buffer SBuf { float s[]; };
+
+layout(push_constant) uniform PushConstants {
+  int n;
+  int n_kv;
+  int G;
+  float scale;
+} pc;
+
+void main() {
+  int kv = int(gl_WorkGroupID.x);
+  int tid = int(gl_LocalInvocationID.x);
+  int lane = tid & 31;
+  int warp = tid >> 5;
+  int n = pc.n;
+  int n_kv = pc.n_kv;
+  int G = pc.G;
+  float scale = pc.scale;
+
+  float qr[64];
+  for (int j = 0; j < 8; ++j) {
+    int base = (kv * G + j) * 256 + lane * 8;
+    for (int i = 0; i < 8; ++i) qr[j * 8 + i] = (j < G) ? q[base + i] : 0.0;
+  }
+
+  for (int t = int(gl_WorkGroupID.y) * 8 + warp; t < n; t += int(gl_NumWorkGroups.y) * 8) {
+    int wbase = ((t * n_kv + kv) * 32 + lane) * 4;
+    uint ww0 = Kh[wbase + 0];
+    uint ww1 = Kh[wbase + 1];
+    uint ww2 = Kh[wbase + 2];
+    uint ww3 = Kh[wbase + 3];
+    vec2 h0v = unpackHalf2x16(ww0);
+    vec2 h1v = unpackHalf2x16(ww1);
+    vec2 h2v = unpackHalf2x16(ww2);
+    vec2 h3v = unpackHalf2x16(ww3);
+    float kk0 = h0v.x, kk1 = h0v.y;
+    float kk2 = h1v.x, kk3 = h1v.y;
+    float kk4 = h2v.x, kk5 = h2v.y;
+    float kk6 = h3v.x, kk7 = h3v.y;
+    for (int j = 0; j < 8; ++j) {
+      if (j < G) {
+        float a = 0.0;
+        a += kk0 * qr[j * 8 + 0];
+        a += kk1 * qr[j * 8 + 1];
+        a += kk2 * qr[j * 8 + 2];
+        a += kk3 * qr[j * 8 + 3];
+        a += kk4 * qr[j * 8 + 4];
+        a += kk5 * qr[j * 8 + 5];
+        a += kk6 * qr[j * 8 + 6];
+        a += kk7 * qr[j * 8 + 7];
+        // wsum_f: exact xor order 16,8,4,2,1
+        a += subgroupShuffleXor(a, 16u);
+        a += subgroupShuffleXor(a, 8u);
+        a += subgroupShuffleXor(a, 4u);
+        a += subgroupShuffleXor(a, 2u);
+        a += subgroupShuffleXor(a, 1u);
+        if (lane == 0) s[(kv * G + j) * n + t] = a * scale;
+      }
+    }
+  }
+}

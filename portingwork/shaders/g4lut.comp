@@ -1,0 +1,73 @@
+#version 450
+// g4simple.comp - ternary GEMV over the 4-trit packed layout (one byte = 4 weights).
+//
+// Original version decoded ONE weight per loop iteration with
+//     trit = (byte / div_) % 3 - 1     // variable integer divide AND modulo
+// GCN has no hardware integer divide, so that expanded to a long instruction sequence
+// per weight - measured at ~2% of the memory roofline.
+//
+// This version:
+//   * decodes a whole byte (4 weights) at a time: consecutive lanes read consecutive
+//     bytes, so the weight stream is fully coalesced (the old stride-32 walk was not);
+//   * replaces divide/modulo with a 256-entry shared lookup table built once per
+//     workgroup (256 uints = 1 KB), so the hot loop has no integer division at all;
+//   * the four weights of a byte share one 128-block scale, so one scale load serves
+//     four MACs.
+//
+// Push constants: { int R; int C; }   Bindings: 0 codes 1 scales 2 x 3 y
+layout(local_size_x = 64) in;
+
+shared float sh[64];
+shared uint lut[256];          // byte -> 4 signed trit values packed as 4 bytes
+
+layout(set = 0, binding = 0) readonly buffer CB { uint codes[]; };
+layout(set = 0, binding = 1) readonly buffer SB { uint scales[]; };
+layout(set = 0, binding = 2) readonly buffer XB { float x[]; };
+layout(set = 0, binding = 3) buffer YB { float y[]; };
+
+layout(push_constant) uniform PC { int R; int C; } pc;
+
+void main() {
+    int row  = int(gl_WorkGroupID.x);
+    int lane = int(gl_LocalInvocationID.x);
+    int R = pc.R, C = pc.C;
+    if (row >= R) return;
+
+    // Build the byte -> 4-trit table once per workgroup. Values above 80 never occur
+    // in a valid pack (max = 2 + 3*2 + 9*2 + 27*2), but computing all 256 is free here
+    // and keeps the hot loop branch-free.
+    for (int b = lane; b < 256; b += 64) {
+        uint t0 = uint(b % 3);
+        uint t1 = uint((b / 3) % 3);
+        uint t2 = uint((b / 9) % 3);
+        uint t3 = uint((b / 27) % 3);
+        lut[b] = t0 | (t1 << 8) | (t2 << 16) | (t3 << 24);
+    }
+    barrier();
+
+    float acc = 0.0;
+    if (lane < 32) {
+        int nq     = C >> 7;          // 128-weight blocks per row (one fp16 scale each)
+        int nbytes = C >> 2;          // bytes per row (4 weights per byte)
+        uint base  = uint(row) * uint(nbytes);
+        for (int kb = lane; kb < nbytes; kb += 32) {
+            uint bi   = base + uint(kb);
+            uint byte = (codes[bi >> 2] >> (8u * (bi & 3u))) & 0xFFu;
+            uint p    = lut[byte];
+            float sc  = unpackHalf2x16(scales[row * nq + (kb >> 5)]).x;
+            int k = kb << 2;
+            float t0 = float(p & 0xFFu)         - 1.0;
+            float t1 = float((p >> 8)  & 0xFFu) - 1.0;
+            float t2 = float((p >> 16) & 0xFFu) - 1.0;
+            float t3 = float((p >> 24) & 0xFFu) - 1.0;
+            acc += sc * (t0 * x[k] + t1 * x[k + 1] + t2 * x[k + 2] + t3 * x[k + 3]);
+        }
+    }
+    sh[lane] = acc;
+    barrier();
+    for (int s = 16; s > 0; s >>= 1) {
+        if (lane < s) sh[lane] += sh[lane + s];
+        barrier();
+    }
+    if (lane == 0) y[row] = sh[0];
+}

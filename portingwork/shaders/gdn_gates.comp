@@ -1,0 +1,47 @@
+// gdn_gates.comp <- k_gdn_gates (kindi.cu)
+// CUDA grid/block: grid NV (=16 v-heads), block 256. Thread t dots xn[0..n)
+//   against bw[h][i]/aw[h][i], shared-tree reduce (st=128..1), lane 0 writes
+//   beta=sigmoid(sb), g=softplus(sa+dtb)*ssma.
+// Vulkan mapping: local_size_x=256, dispatch (NV,1,1); h=gl_WorkGroupID.x,
+//   t=gl_LocalInvocationID.x. Shared sb/sa[256] + barrier() == __syncthreads.
+// Push constants (8B): { int n }  (dot length; NV = num workgroups x).
+// Bindings: 0 xn ro, 1 bw ro, 2 aw ro, 3 dtb ro, 4 ssma ro, 5 beta wo, 6 g wo.
+// Fidelity risks vs CUDA: (1) reduction order identical -> bit-identical fp32
+//   sums; (2) expf/log1pf vs GLSL exp()/log(1+x): AMD GCN exp is 2^-based,
+//   expect <=2 ulp diffs in beta/g. No subgroup ops used (none in source).
+#version 450
+#extension GL_KHR_shader_subgroup_shuffle : require
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer B0 { float xn[]; };
+layout(set = 0, binding = 1) readonly buffer B1 { float bw[]; };
+layout(set = 0, binding = 2) readonly buffer B2 { float aw[]; };
+layout(set = 0, binding = 3) readonly buffer B3 { float dtb[]; };
+layout(set = 0, binding = 4) readonly buffer B4 { float ssma[]; };
+layout(set = 0, binding = 5) buffer B5 { float beta[]; };
+layout(set = 0, binding = 6) buffer B6 { float g[]; };
+layout(push_constant) uniform PC { int n; } pc;
+shared float sb[256];
+shared float sa[256];
+void main() {
+  uint h = gl_WorkGroupID.x;
+  uint t = gl_LocalInvocationID.x;
+  float ab = 0.0f, aa = 0.0f;
+  uint base = h * uint(pc.n);
+  for (int i = int(t); i < pc.n; i += 256) {
+    float x = xn[uint(i)];
+    ab += bw[base + uint(i)] * x;
+    aa += aw[base + uint(i)] * x;
+  }
+  sb[t] = ab; sa[t] = aa;
+  barrier();
+  for (int st = 128; st > 0; st >>= 1) {
+    if (t < uint(st)) { sb[t] += sb[t + uint(st)]; sa[t] += sa[t + uint(st)]; }
+    barrier();
+  }
+  if (t == 0u) {
+    beta[h] = 1.0f / (1.0f + exp(-sb[0]));
+    float a = sa[0] + dtb[h];
+    float sp = (a > 20.0f) ? a : log(1.0f + exp(min(a, 20.0f)));
+    g[h] = sp * ssma[h];
+  }
+}

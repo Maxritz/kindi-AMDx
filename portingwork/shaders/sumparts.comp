@@ -1,0 +1,23 @@
+// sumparts.comp <- k_sumparts (column-split partial sums -> one row)
+// CUDA grid: (R blocks, any blockDim); r = blockIdx.x*blockDim.x+threadIdx.x.
+//   y[r] = p[r] + p[R+r] + ... + p[(n-1)*R+r], fixed order.
+// Vulkan: local_size_x=256, workgroups = ceil(R/256).
+//   r = WorkGroupID.x*256 + LocalID.x; early-out if r >= R.
+// Push constants: struct PC { int R; int n; };
+// Bindings (set=0):
+//   0: readonly float p[] (n*R), 1: write float y[] (R)
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer Bp { float p[]; };
+layout(set = 0, binding = 1) buffer By { float y[]; };
+
+layout(push_constant) uniform PC { int R; int n; } pc;
+
+void main() {
+  int r = int(gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x);
+  if (r >= pc.R) return;
+  float v = p[r];
+  for (int i = 1; i < pc.n; ++i) v += p[i * pc.R + r];
+  y[r] = v;
+}

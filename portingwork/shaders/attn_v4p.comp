@@ -1,0 +1,76 @@
+#version 450
+// attn_v4p.comp <- k_attn_v4p (single-card 2B only: NH=8, NHKV=2, G=4, HD=256)
+// CUDA grid/block mapping:
+//   CUDA: grid (NHKV, 1, nchunks), block 128; threadIdx.x = f2 (features 2f,2f+1),
+//         blockIdx.x = kv, blockIdx.z = chunk c. ATV_CH=256 positions per chunk,
+//         i0 = c*ATV_CH, m = min(ATV_CH, n-i0). The 4 heads' probs of one position
+//         are one float4 in shared memory (one broadcast load).
+// Vulkan: num workgroups (NHKV, 1, nchunks), local_size_x = 128.
+//         gl_WorkGroupID.x = kv, gl_WorkGroupID.z = c,
+//         gl_LocalInvocationID.x = f2.
+//         NOTE: Vulkan workgroup z index runs over all chunks; dispatch must use
+//         the full context chunk count (like k_attn_vgn's guard); chunks with
+//         i0 >= n exit at once and leave their part rows untouched.
+// Push constants (12 B <= 128 B): int n, int nheads (NH=8), int n_kv (NHKV=2).
+// Buffers: Vh2 = fp16 BITS as uint[] (never dequantized on host). V row
+//   (i0+i, kv) starts at ((i0+i)*n_kv+kv)*128 uints; thread f2 reads word +f2.
+//   Decode the two halves with unpackHalf2x16. s holds NH rows of n softmax
+//   probs; part layout part[(c*nheads+kv*4+j)*256+2f] with head strides 256.
+// Arithmetic: exact order of k_attn_v4p - shared float4 probs, per-position
+//   loop i=0..m-1 accumulating a0..a3 (even feat) and b0..b3 (odd feat), same
+//   head-major write pattern (pp[0],pp[1],pp[256],pp[257],pp[512],pp[513],pp[768],pp[769]).
+// SUBGROUP NOTE: no subgroup ops; shared-memory size 256 float4 = 4 KB,
+//   well under the 32 KB budget. subgroupSize=64 vs warp=32 changes nothing.
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) readonly buffer SBuf { float s[]; };
+layout(set = 0, binding = 1) readonly buffer VBuf { uint Vh2[]; };
+layout(set = 0, binding = 2) buffer PartBuf { float part[]; };
+
+layout(push_constant) uniform PushConstants {
+  int n;
+  int nheads;
+  int n_kv;
+} pc;
+
+shared vec4 sp4[256];
+
+void main() {
+  int kv = int(gl_WorkGroupID.x);
+  int f2 = int(gl_LocalInvocationID.x);
+  int c = int(gl_WorkGroupID.z);
+  int n = pc.n;
+  int nheads = pc.nheads;
+  int n_kv = pc.n_kv;
+  int i0 = c * 256;
+  if (i0 >= n) return;
+  int m = min(256, n - i0);
+
+  for (int i = int(gl_LocalInvocationID.x); i < 256; i += 128) {
+    vec4 p4 = vec4(0.0, 0.0, 0.0, 0.0);
+    if (i < m) {
+      int base = (kv * 4) * n + i0 + i;
+      p4 = vec4(s[base], s[base + n], s[base + 2 * n], s[base + 3 * n]);
+    }
+    sp4[i] = p4;
+  }
+  barrier();
+
+  float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+  float b0 = 0.0, b1 = 0.0, b2 = 0.0, b3 = 0.0;
+  int r0 = (i0 * n_kv + kv) * 128 + f2;
+  for (int i = 0; i < m; ++i) {
+    uint vv = Vh2[r0 + i * n_kv * 128];
+    vec2 h = unpackHalf2x16(vv);
+    float v0 = h.x, v1 = h.y;
+    vec4 p = sp4[i];
+    a0 += p.x * v0; a1 += p.y * v0; a2 += p.z * v0; a3 += p.w * v0;
+    b0 += p.x * v1; b1 += p.y * v1; b2 += p.z * v1; b3 += p.w * v1;
+  }
+  int prow = (c * nheads + kv * 4) * 256 + 2 * f2;
+  part[prow] = a0;       part[prow + 1] = b0;
+  part[prow + 256] = a1; part[prow + 257] = b1;
+  part[prow + 512] = a2; part[prow + 513] = b2;
+  part[prow + 768] = a3; part[prow + 769] = b3;
+}

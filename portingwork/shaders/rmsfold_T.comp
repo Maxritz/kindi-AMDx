@@ -1,0 +1,101 @@
+#version 450
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+// rmsfold_T.comp - rmsfold for T tokens, one workgroup per (token, chunk).
+// Push: { int C; int add; int HB; int nchunk; }   nchunk = C/chunk
+// Buffers are token-major: x[t*C + e].
+layout(local_size_x = 512) in;
+
+layout(set = 0, binding = 0) readonly buffer Bx { float x[]; };
+layout(set = 0, binding = 1) readonly buffer Br { float r[]; };
+layout(set = 0, binding = 2) buffer Bxw { float xw[]; };
+layout(set = 0, binding = 3) readonly buffer Bw { float w[]; };
+layout(set = 0, binding = 4) readonly buffer Bsg { float sg[]; };
+layout(set = 0, binding = 5) buffer Bxn { float xn[]; };
+layout(set = 0, binding = 6) buffer Bxo { float xo[]; };
+
+layout(push_constant) uniform PC { int C; int add; int HB; int nchunk; int stride; int ostride; } pc;
+
+shared float xs[4096];
+shared float64_t red[16];
+shared float bscale;
+
+float64_t wsum_d(float64_t v) {
+  v += subgroupShuffleXor(v, 16);
+  v += subgroupShuffleXor(v, 8);
+  v += subgroupShuffleXor(v, 4);
+  v += subgroupShuffleXor(v, 2);
+  v += subgroupShuffleXor(v, 1);
+  return v;
+}
+
+void main() {
+  uint j = gl_LocalInvocationID.x;
+  uint lane = j & 31u;
+  uint wp = j >> 5;
+  int C = pc.C, add = pc.add, HB = pc.HB, nchunk = pc.nchunk;
+  int chunk = (HB < 0 ? 512 : HB);
+  uint gid = gl_WorkGroupID.x;
+  uint tok = gid / uint(nchunk);
+  uint c0 = (gid % uint(nchunk)) * uint(chunk);
+  uint off  = tok * uint(pc.stride);   // x / r / xw / xn
+  uint ooff = tok * uint(pc.ostride);  // xo (the folded output)
+
+  float64_t acc = float64_t(0.0);
+  for (int e = int(j); e < C; e += 512) {
+    float xf = x[off + uint(e)];
+    if (add != 0) {
+      float s = r[off + uint(e)];
+      for (int i = 1; i < add; ++i) s += r[uint(i) * uint(C) + off + uint(e)];
+      xf = x[off + uint(e)] + s;
+    }
+    float64_t v = float64_t(xf);
+    acc += v * v;
+  }
+  acc = wsum_d(acc);
+  if (lane == 0u) red[wp] = acc;
+  barrier();
+  if (wp == 0u) {
+    float64_t t = (lane < 16u) ? red[lane] : float64_t(0.0);
+    t = wsum_d(t);
+    if (lane == 0u) bscale = 1.0f / sqrt(float(t / float64_t(float(C))) + 1e-6f);
+  }
+  barrier();
+  float s = bscale;
+  for (int m = int(j); m < chunk; m += 512) {
+    uint e = c0 + uint(m);
+    float xf = x[off + e];
+    if (add != 0) {
+      float rs = r[off + e];
+      for (int i = 1; i < add; ++i) rs += r[uint(i) * uint(C) + off + e];
+      xf = x[off + e] + rs;
+      xw[off + e] = xf;
+    }
+    float v = (xf * s) * w[e];
+    xn[off + e] = v;
+    xs[m] = sg[e] * v;
+  }
+  barrier();
+  if (HB == 512 || HB == -512) {
+    for (int h = 1; h < 512; h <<= 1) {
+      if (j < 256u) {
+        int i = (int(j) / h) * 2 * h + (int(j) % h);
+        float a = xs[i], b = xs[i + h];
+        xs[i] = a + b; xs[i + h] = a - b;
+      }
+      barrier();
+    }
+    xo[ooff + c0 + j] = (HB == 512) ? xs[j] * 0.044194173824159220878f : xs[j];
+  } else {
+    for (int h = 1; h < HB; h <<= 1) {
+      for (int t = int(j); t < (HB >> 1); t += 512) {
+        int i = (t / h) * 2 * h + (t % h);
+        float a = xs[i], b = xs[i + h];
+        xs[i] = a + b; xs[i + h] = a - b;
+      }
+      barrier();
+    }
+    float sc = inversesqrt(float(HB));
+    for (int m = int(j); m < HB; m += 512) xo[ooff + c0 + uint(m)] = xs[m] * sc;
+  }
+}

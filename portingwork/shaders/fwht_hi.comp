@@ -1,0 +1,38 @@
+// fwht_hi.comp — stages h >= 512 of an HB-point FWHT, then the 1/sqrt(HB) scale.
+// Mirrors k_fwht_hi. The 512-point chunks were already done unscaled (HB = -512),
+// so this pass combines the HB/512 chunks and normalises.
+//   t = one position j (0..511) inside one HB block b; the HB/512 chunk values in registers
+// Push constants: { int HB; int n; }   (n = vector length, e.g. D / NFF / NV*HK / NH*HD)
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer Bx { float x[]; };
+
+layout(push_constant) uniform PC { int HB; int n; } pc;
+
+void main() {
+    int t = int(gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x);
+    int nc = pc.HB >> 9;                       // chunks per HB block (HB/512)
+    if (nc < 1) nc = 1;
+    int limit = (pc.n >> 9) / nc * 512;
+    if (t >= limit) return;
+    int b = t >> 9, j = t & 511;
+    int base = b * pc.HB + j;
+
+    float v[8];
+    for (int c = 0; c < 8; ++c) v[c] = (c < nc) ? x[base + (c << 9)] : 0.0;
+
+    for (int h = 1; h < 8; h <<= 1) {
+        if (h < nc) {
+            for (int c = 0; c < 8; ++c) {
+                if (c < nc && (c & h) == 0) {
+                    float a = v[c], d = v[c + h];
+                    v[c] = a + d; v[c + h] = a - d;
+                }
+            }
+        }
+    }
+
+    float sc = inversesqrt(float(pc.HB));
+    for (int c = 0; c < 8; ++c) if (c < nc) x[base + (c << 9)] = v[c] * sc;
+}

@@ -1,0 +1,55 @@
+#version 450
+// softmax_rows.comp <- k_softmax_rows (single-card 2B only: NH=8)
+// CUDA grid/block mapping:
+//   CUDA: grid NH, block 256; blockIdx.x = head hh, threadIdx.x = t.
+//         Row sr = s + hh*n, length n, softmax in place (max-subtract).
+// Vulkan: num workgroups (NH, 1, 1), local_size_x = 256.
+//         gl_WorkGroupID.x = hh, gl_LocalInvocationID.x = t.
+// Push constants (4 B <= 128 B): int n.
+// Arithmetic: identical order - grid-stride max, shared-memory tree reduction
+//   halving 128..1 (max then, separately, sum), single broadcast of max/total,
+//   grid-stride exp accumulation, in-place normalize.
+// SUBGROUP NOTE: no subgroup ops used here; the reduction is a shared-memory
+//   tree over all 256 threads, so subgroupSize=64 vs warp=32 changes nothing.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer SBuf { float s[]; };
+
+layout(push_constant) uniform PushConstants {
+  int n;
+} pc;
+
+shared float red[256];
+shared float pmax;
+
+void main() {
+  int hh = int(gl_WorkGroupID.x);
+  int t = int(gl_LocalInvocationID.x);
+  int n = pc.n;
+  int base = hh * n;
+
+  float mx = -1e30;
+  for (int i = t; i < n; i += 256) mx = max(mx, s[base + i]);
+  red[t] = mx;
+  barrier();
+  for (int st = 128; st > 0; st >>= 1) {
+    if (t < st) red[t] = max(red[t], red[t + st]);
+    barrier();
+  }
+  if (t == 0) pmax = red[0];
+  barrier();
+  float m = pmax;
+  float acc0 = 0.0;
+  for (int i = t; i < n; i += 256) acc0 += exp(s[base + i] - m);
+  barrier();
+  red[t] = acc0;
+  barrier();
+  for (int st = 128; st > 0; st >>= 1) {
+    if (t < st) red[t] += red[t + st];
+    barrier();
+  }
+  float tot = red[0];
+  barrier();
+  for (int i = t; i < n; i += 256) s[base + i] = exp(s[base + i] - m) / tot;
+}

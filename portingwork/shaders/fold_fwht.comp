@@ -1,0 +1,56 @@
+// fold_fwht.comp <- k_fold_fwht, HB=512 case (2B uses HB=512)
+//   (+ generic-HB fallback identical to CUDA: sg*x then fwht_n, scale 1/sqrt(HB))
+// CUDA grid: (C/HB) blocks, block 512 threads.
+//   blockIdx.x = c, threadIdx.x = j (0..511)
+// Vulkan: local_size_x=512, workgroups = C/HB.
+//   gl_WorkGroupID.x = c, gl_LocalInvocationID.x = j
+// Push constants: struct PC { int HB; };
+// Bindings (set=0):
+//   0: readonly float x[], 1: readonly float sg[],
+//   2: write float xo[]
+#version 450
+layout(local_size_x = 512) in;
+
+layout(set = 0, binding = 0) readonly buffer Bx { float x[]; };
+layout(set = 0, binding = 1) readonly buffer Bsg { float sg[]; };
+layout(set = 0, binding = 2) buffer Bxo { float xo[]; };
+
+layout(push_constant) uniform PC { int HB; } pc;
+
+shared float xs[4096];
+
+void main() {
+  uint c = gl_WorkGroupID.x;
+  uint j = gl_LocalInvocationID.x;
+  int HB = pc.HB;
+  if (HB == 512 || HB == -512) {
+    xs[j] = sg[(c << 9) + j] * x[(c << 9) + j];
+    barrier();
+    for (int h = 1; h < 512; h <<= 1) {
+      if (j < 256u) {
+        int i = (int(j) / h) * 2 * h + (int(j) % h);
+        float a = xs[i];
+        float b = xs[i + h];
+        xs[i] = a + b;
+        xs[i + h] = a - b;
+      }
+      barrier();
+    }
+    xo[(c << 9) + j] = (HB == 512) ? xs[j] * 0.044194173824159220878f : xs[j];
+    return;
+  }
+  for (int q = int(j); q < HB; q += 512) xs[q] = sg[c * uint(HB) + uint(q)] * x[c * uint(HB) + uint(q)];
+  barrier();
+  for (int h = 1; h < HB; h <<= 1) {
+    for (int t = int(j); t < (HB >> 1); t += 512) {
+      int i = (t / h) * 2 * h + (t % h);
+      float a = xs[i];
+      float b = xs[i + h];
+      xs[i] = a + b;
+      xs[i + h] = a - b;
+    }
+    barrier();
+  }
+  float sc = inversesqrt(float(HB));
+  for (int q = int(j); q < HB; q += 512) xo[c * uint(HB) + uint(q)] = xs[q] * sc;
+}

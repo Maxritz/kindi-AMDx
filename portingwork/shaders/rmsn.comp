@@ -1,0 +1,40 @@
+// rmsn.comp - one-row RMS norm with per-element weight, ggml_compute_forward_rms_norm_f32 arithmetic
+//   sum in fp64, mean = (float)(sum/n), scale = 1/sqrtf(mean + eps), out = x*scale*w
+//   bindings: 0 x(float, n)  1 w(float, n)  2 out(float, n)
+//   push: { int n; float eps; }   grid = rows, local 256
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer Bx { float x[]; };
+layout(set = 0, binding = 1) readonly buffer Bw { float w[]; };
+layout(set = 0, binding = 2) buffer Bo { float out_[]; };
+
+layout(push_constant) uniform PC { int n; float eps; } pc;
+
+shared double red[256];
+shared float psc;
+
+void main() {
+  uint t = gl_LocalInvocationID.x;
+  uint row = gl_WorkGroupID.x;
+  int n = pc.n;
+  uint base = row * uint(n);
+
+  double acc = 0.0;
+  for (int e = int(t); e < n; e += 256) {
+    double v = double(x[base + uint(e)]);
+    acc += v * v;
+  }
+  red[t] = acc;
+  barrier();
+  for (int st = 128; st > 0; st >>= 1) {
+    if (int(t) < st) red[t] += red[t + st];
+    barrier();
+  }
+  if (t == 0u) psc = 1.0 / sqrt(float(red[0] / double(n)) + pc.eps);
+  barrier();
+  float sc = psc;
+  for (int e = int(t); e < n; e += 256)
+    out_[base + uint(e)] = (x[base + uint(e)] * sc) * w[e];
+}

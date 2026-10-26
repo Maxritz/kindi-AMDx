@@ -1,0 +1,63 @@
+#version 450
+// smfold_T.comp - fused silu-gate + Hadamard fold for T tokens.
+// Push: { int HB; int perm_hd; int perm_nk; int perm_rep; int nchunk; int C; }
+// Buffers token-major: a[t*C + e], etc.
+layout(local_size_x = 512) in;
+
+layout(set = 0, binding = 0) readonly buffer Ba { float a[]; };
+layout(set = 0, binding = 1) readonly buffer Bb { float b[]; };
+layout(set = 0, binding = 2) readonly buffer Bsg { float sg[]; };
+layout(set = 0, binding = 3) buffer Bxo { float xo[]; };
+
+layout(push_constant) uniform PC { int HB; int perm_hd; int perm_nk; int perm_rep; int nchunk; int C; int stride; int ostride; } pc;
+
+shared float xs[4096];
+
+void main() {
+  uint j = gl_LocalInvocationID.x;
+  int HB = pc.HB;
+  int hb = (HB < 0 ? 512 : HB);
+  uint gid = gl_WorkGroupID.x;
+  uint tok = gid / uint(pc.nchunk);
+  uint c   = gid % uint(pc.nchunk);
+  uint off  = tok * uint(pc.stride);   // a / b
+  uint ooff = tok * uint(pc.ostride);  // xo
+
+  for (int q = int(j); q < hb; q += 512) {
+    int e = int(c) * hb + q;
+    int src = e;
+    if (pc.perm_rep > 1) {
+      int hd = e % pc.perm_hd;
+      int grouped = e / pc.perm_hd;
+      int rep = grouped % pc.perm_rep;
+      int nk = grouped / pc.perm_rep;
+      src = hd + pc.perm_hd * (nk + pc.perm_nk * rep);
+    }
+    float xa = a[off + uint(src)];
+    float m = (xa / (1.0f + exp(-xa))) * b[off + uint(src)];
+    xs[q] = sg[e] * m;
+  }
+  barrier();
+  if (HB == 512 || HB == -512) {
+    for (int h = 1; h < 512; h <<= 1) {
+      if (j < 256u) {
+        int i = (int(j) / h) * 2 * h + (int(j) % h);
+        float av = xs[i], bv = xs[i + h];
+        xs[i] = av + bv; xs[i + h] = av - bv;
+      }
+      barrier();
+    }
+    xo[ooff + (c << 9) + j] = (HB == 512) ? xs[j] * 0.044194173824159220878f : xs[j];
+  } else {
+    for (int h = 1; h < HB; h <<= 1) {
+      for (int t = int(j); t < (HB >> 1); t += 512) {
+        int i = (t / h) * 2 * h + (t % h);
+        float av = xs[i], bv = xs[i + h];
+        xs[i] = av + bv; xs[i + h] = av - bv;
+      }
+      barrier();
+    }
+    float sc = inversesqrt(float(HB));
+    for (int q = int(j); q < HB; q += 512) xo[ooff + c * uint(HB) + uint(q)] = xs[q] * sc;
+  }
+}

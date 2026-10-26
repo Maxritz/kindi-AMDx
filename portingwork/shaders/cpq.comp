@@ -1,0 +1,24 @@
+// cpq.comp <- k_cpq (the q half of each [q | gate] row)
+// CUDA grid: (rows blocks, blockDim threads); r = blockIdx.x.
+//   for e=j;e<hd;e+=blockDim: q[r*hd+e] = qn[r*2*hd+e].
+// Vulkan: local_size_x=256, workgroups = rows.
+//   r = gl_WorkGroupID.x; j = gl_LocalInvocationID.x; same stride loop.
+// Push constants: struct PC { int rows; int hd; };
+// Bindings (set=0):
+//   0: readonly float qn[] (rows*2*hd), 1: write float q[] (rows*hd)
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer Bqn { float qn[]; };
+layout(set = 0, binding = 1) buffer Bq { float q[]; };
+
+layout(push_constant) uniform PC { int rows; int hd; } pc;
+
+void main() {
+  uint r = gl_WorkGroupID.x;
+  if (int(r) >= pc.rows) return;
+  uint j = gl_LocalInvocationID.x;
+  for (int e = int(j); e < pc.hd; e += 256) {
+    q[int(r) * pc.hd + e] = qn[int(r) * 2 * pc.hd + e];
+  }
+}

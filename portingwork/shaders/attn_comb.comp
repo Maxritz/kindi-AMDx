@@ -1,0 +1,35 @@
+#version 450
+// attn_comb.comp <- k_attn_comb (single-card 2B only: NH=8, HD=256)
+// CUDA grid/block mapping:
+//   CUDA: grid NH, block 256; blockIdx.x = head hh, threadIdx.x = feature f.
+//         acc = part[hh*256+f] + part[(c*nheads+hh)*256+f] for c=1..nch-1
+//         (in-order chunk sum), times sigmoid(gatev[hh*512+256+f]).
+// Vulkan: num workgroups (NH, 1, 1), local_size_x = 256.
+//         gl_WorkGroupID.x = hh, gl_LocalInvocationID.x = f.
+// Push constants (8 B <= 128 B): int nch (chunk count), int nheads (NH=8).
+// Arithmetic: exact order of k_attn_comb - chunk partials summed c=0..nch-1
+//   in that order starting from chunk 0, then one sigmoid gate multiply.
+// SUBGROUP NOTE: no subgroup or shared-memory ops; subgroupSize=64 vs warp=32
+//   changes nothing.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer PartBuf { float part[]; };
+layout(set = 0, binding = 1) readonly buffer GateBuf { float gatev[]; };
+layout(set = 0, binding = 2) buffer AttBuf { float att[]; };
+
+layout(push_constant) uniform PushConstants {
+  int nch;
+  int nheads;
+} pc;
+
+void main() {
+  int hh = int(gl_WorkGroupID.x);
+  int f = int(gl_LocalInvocationID.x);
+  int nch = pc.nch;
+  int nheads = pc.nheads;
+  float acc = part[hh * 256 + f];
+  for (int c = 1; c < nch; ++c) acc += part[(c * nheads + hh) * 256 + f];
+  float g = gatev[hh * 512 + 256 + f];
+  att[hh * 256 + f] = acc * (1.0 / (1.0 + exp(-g)));
+}

@@ -1,0 +1,43 @@
+#version 450
+#extension GL_KHR_shader_subgroup_shuffle : require
+// gdn_gates_T.comp - gdn_gates for T tokens. Push: { int n; int T; }
+// xn is [T][n]; beta/g are [T][NV]; workgroup = (token, head).
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer B0 { float xn[]; };
+layout(set = 0, binding = 1) readonly buffer B1 { float bw[]; };
+layout(set = 0, binding = 2) readonly buffer B2 { float aw[]; };
+layout(set = 0, binding = 3) readonly buffer B3 { float dtb[]; };
+layout(set = 0, binding = 4) readonly buffer B4 { float ssma[]; };
+layout(set = 0, binding = 5) buffer B5 { float beta[]; };
+layout(set = 0, binding = 6) buffer B6 { float g[]; };
+layout(push_constant) uniform PC { int n; int T; int nv; } pc;
+shared float sb[256];
+shared float sa[256];
+void main() {
+  uint gid = gl_WorkGroupID.x;
+  int nv = pc.nv;                                // heads per token (explicit)
+  uint tok = gid / uint(nv);
+  uint h   = gid % uint(nv);
+  uint t = gl_LocalInvocationID.x;
+  float ab = 0.0f, aa = 0.0f;
+  uint base = h * uint(pc.n);
+  uint xoff = tok * uint(pc.n);                 // xn row for this token
+  for (int i = int(t); i < pc.n; i += 256) {
+    float x = xn[xoff + uint(i)];
+    ab += bw[base + uint(i)] * x;
+    aa += aw[base + uint(i)] * x;
+  }
+  sb[t] = ab; sa[t] = aa;
+  barrier();
+  for (int st = 128; st > 0; st >>= 1) {
+    if (t < uint(st)) { sb[t] += sb[t + uint(st)]; sa[t] += sa[t + uint(st)]; }
+    barrier();
+  }
+  if (t == 0u) {
+    uint o = tok * uint(nv) + h;
+    beta[o] = 1.0f / (1.0f + exp(-sb[0]));
+    float a = sa[0] + dtb[h];
+    float sp = (a > 20.0f) ? a : log(1.0f + exp(min(a, 20.0f)));
+    g[o] = sp * ssma[h];
+  }
+}

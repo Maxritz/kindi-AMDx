@@ -1,0 +1,17 @@
+// addv.comp - elementwise residual add: out = a + b
+//   bindings: 0 a(float)  1 b(float)  2 out(float)
+//   push: { int n }
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer BA { float a[]; };
+layout(set = 0, binding = 1) readonly buffer BB { float b[]; };
+layout(set = 0, binding = 2) buffer BO { float out_[]; };
+
+layout(push_constant) uniform PC { int n; } pc;
+
+void main() {
+  int i = int(gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x);
+  if (i >= pc.n) return;
+  out_[i] = a[i] + b[i];
+}

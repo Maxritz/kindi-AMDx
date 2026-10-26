@@ -1,0 +1,46 @@
+// argmax.comp <- k_argmax (vocab argmax, ties -> smallest index)
+// CUDA grid: 1 block, 1024 threads.
+//   tid: bv=-1e30, bi=0; for e=tid;e<n;e+=1024: if y[e]>bv {bv=y[e];bi=e}
+//   shared bidx[1024], bval[1024]; tree reduce st=512..1, strict-greater
+//   or equal-with-smaller-index wins; out[0]=bidx[0].
+// Vulkan: local_size_x=1024, 1 workgroup.
+//   tid = gl_LocalInvocationID.x; identical loop + shared-memory tree.
+// Push constants: struct PC { int n; };
+// Bindings (set=0):
+//   0: readonly float y[] (len n), 1: write int out_[1]
+#version 450
+layout(local_size_x = 1024) in;
+
+layout(set = 0, binding = 0) readonly buffer By { float y[]; };
+layout(set = 0, binding = 1) buffer Bo { int out_[]; };
+
+layout(push_constant) uniform PC { int n; } pc;
+
+shared int bidx[1024];
+shared float bval[1024];
+
+void main() {
+  uint tid = gl_LocalInvocationID.x;
+  int n = pc.n;
+  float bv = -1e30f;
+  int bi = 0;
+  for (int e = int(tid); e < n; e += 1024) {
+    float v = y[e];
+    if (v > bv) { bv = v; bi = e; }
+  }
+  bidx[tid] = bi;
+  bval[tid] = bv;
+  barrier();
+  for (int st = 512; st > 0; st >>= 1) {
+    if (int(tid) < st) {
+      uint i2 = tid + uint(st);
+      if (bval[i2] > bval[tid] ||
+          (bval[i2] == bval[tid] && bidx[i2] < bidx[tid])) {
+        bval[tid] = bval[i2];
+        bidx[tid] = bidx[i2];
+      }
+    }
+    barrier();
+  }
+  if (tid == 0u) out_[0] = bidx[0];
+}

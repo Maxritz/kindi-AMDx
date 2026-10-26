@@ -1,0 +1,18 @@
+# build output
+bin/
+x/
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.lib
+*.exp
+# generated SPIR-V (rebuild with build.ps1)
+shaders/*.spv
+# debug dumps
+dv_*.bin
+dump*.txt
+d2.txt
+ref27.txt
+__pycache__/
+*.pyc

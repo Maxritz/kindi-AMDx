@@ -1,0 +1,29 @@
+// expand.comp <- k_expand (shortlist scatter: group ids -> glist slots)
+// CUDA grid: (m blocks); m-th block: k=sel[m], n=gcount[k], o=off[m], s=gstart[k].
+//   for i=tid;i<n;i+=blockDim: glist[o+i] = s+i.
+// Vulkan: local_size_x=256, workgroups = m.
+//   m = gl_WorkGroupID.x; identical gather + strided store.
+// Push constants: struct PC { int m; };
+// Bindings (set=0):
+//   0: readonly int sel[], 1: readonly int gstart[], 2: readonly int gcount[],
+//   3: readonly int off[], 4: write int glist[]
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer Bsel { int sel[]; };
+layout(set = 0, binding = 1) readonly buffer Bgs { int gstart[]; };
+layout(set = 0, binding = 2) readonly buffer Bgc { int gcount[]; };
+layout(set = 0, binding = 3) readonly buffer Boff { int off[]; };
+layout(set = 0, binding = 4) buffer Bgl { int glist[]; };
+
+layout(push_constant) uniform PC { int m; } pc;
+
+void main() {
+  int m = int(gl_WorkGroupID.x);
+  if (m >= pc.m) return;
+  int k = sel[m];
+  int n = gcount[k];
+  int o = off[m];
+  int s = gstart[k];
+  for (int i = int(gl_LocalInvocationID.x); i < n; i += 256) glist[o + i] = s + i;
+}

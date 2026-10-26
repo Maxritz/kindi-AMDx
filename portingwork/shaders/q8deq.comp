@@ -1,0 +1,33 @@
+// q8deq.comp - dequantize one Q8_0 row to F32 (embedding lookup)
+//   bindings: 0 codes(uint, R*C/4)  1 scales(uint, R*C/32)  2 out(float, C)
+//   push: { int row; int C; }
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer BC { uint codes[]; };
+layout(set = 0, binding = 1) readonly buffer BS { uint scales[]; };
+layout(set = 0, binding = 2) buffer BO { float out_[]; };
+
+layout(push_constant) uniform PC { int row; int C; } pc;
+
+int s8(uint w, int k) {
+  int c = int((w >> uint(8 * k)) & 0xFFu);
+  return c >= 128 ? c - 256 : c;
+}
+
+void main() {
+  int t = int(gl_LocalInvocationID.x);
+  int C = pc.C;
+  int bpr = C >> 5;
+  int row = pc.row;
+  int wrow = row * (C >> 2);
+  int srow = row * bpr;
+  for (int e = t; e < C; e += 256) {
+    int b = e >> 5;
+    int j = e & 31;
+    uint w = codes[wrow + b * 8 + (j >> 2)];
+    int c = s8(w, j & 3);
+    float d = unpackHalf2x16(scales[srow + b]).x;
+    out_[e] = float(c) * d;
+  }
+}

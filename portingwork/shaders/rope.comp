@@ -1,0 +1,36 @@
+// rope.comp <- k_rope (generic GQA rotary embedding)
+// CUDA grid: (NH or NHKV) blocks, block 256 threads.
+//   r = blockIdx.x (head row); j = threadIdx.x
+//   if j<32:  pair (j, j+32) rotated by (cc[j], ss[j])
+//   elif j>=64: passthrough (dims 64..HD, HD=128)
+// Vulkan: local_size_x=256, workgroups = rows.
+//   r = gl_WorkGroupID.x, j = gl_LocalInvocationID.x
+// Push constants: struct PC { int HD; };
+//   HD = head dim (128 on 2B); j in [32,64) idle like CUDA.
+// Bindings (set=0):
+//   0: readonly float x[] (rows*HD), 1: readonly float cc[] (HD/2),
+//   2: readonly float ss[] (HD/2), 3: write float out[] (rows*HD)
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer Bx { float x[]; };
+layout(set = 0, binding = 1) readonly buffer Bcc { float cc[]; };
+layout(set = 0, binding = 2) readonly buffer Bss { float ss[]; };
+layout(set = 0, binding = 3) buffer Bo { float out_[]; };
+
+layout(push_constant) uniform PC { int HD; } pc;
+
+void main() {
+  uint r = gl_WorkGroupID.x;
+  uint j = gl_LocalInvocationID.x;
+  int HD = pc.HD;
+  uint base = r * uint(HD);
+  if (j < 32u) {
+    float a = x[base + j];
+    float b = x[base + j + 32u];
+    out_[base + j] = a * cc[j] - b * ss[j];
+    out_[base + j + 32u] = a * ss[j] + b * cc[j];
+  } else if (j >= 64u) {
+    out_[base + j] = x[base + j];
+  }
+}

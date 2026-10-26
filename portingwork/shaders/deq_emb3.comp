@@ -1,0 +1,77 @@
+// deq_emb3.comp <- k_deq_emb3, HB=512 path only (2B single-card)
+// CUDA grid: 1 block, 1024 threads; C<=6144; shared float w[6144].
+//   t = threadIdx.x; r4=row>>2, rl=row&3, g16=row>>4, rr=row&15
+//   lane_low = bit0/1/2 of rr remapped, jj = rr&1
+//   dequant: for e=t;e<C;e+=1024: s=e>>2, p=e>>7, r=e&3
+//     b = bc[byte idx]; dig via %3 /3 /9 /27; lane=((p&3)<<3)|lane_low
+//     w[e] = (dig-1) * half(dpb[((g16*(C>>9)+(p>>2))*32+lane)*2+jj])
+//   fold HB=512: for j2=t;j2<C;j2+=1024: c=j2>>9, j=j2&511
+//     acc = sum_i +/-w[c*512+i], sign = - when bitCount(i&j) odd
+//     h[j2] = sg[j2] * acc * 0.044194173824159220878
+// Vulkan: local_size_x=1024, 1 workgroup.
+//   bc bytes arrive as uint words (4 bytes/word, little-endian):
+//     byte b_idx = (bc[b_idx>>2] >> (8*(b_idx&3))) & 0xFF
+//   dpb fp16 bits arrive as uint (one half per word, low 16 bits):
+//     float via unpackHalf2x16(parity: dpb bits in low half).x
+// Push constants: struct PC { int row; int C; };
+// Bindings (set=0):
+//   0: readonly uint bc[] (ceil(nbytes/4) words), 1: readonly uint dpb[],
+//   2: readonly float sg[] (C), 3: write float h[] (C)
+#version 450
+layout(local_size_x = 1024) in;
+
+layout(set = 0, binding = 0) readonly buffer Bbc { uint bc[]; };
+layout(set = 0, binding = 1) readonly buffer Bdpb { uint dpb[]; };
+layout(set = 0, binding = 2) readonly buffer Bsg { float sg[]; };
+layout(set = 0, binding = 3) buffer Bh { float h[]; };
+
+layout(push_constant) uniform PC { int row; int C; } pc;
+
+shared float w[6144];
+
+uint getByte(uint idx) {
+  uint word = bc[idx >> 2];
+  return (word >> (8u * (idx & 3u))) & 0xFFu;
+}
+
+float h2f(uint bits) {
+  return unpackHalf2x16(bits & 0xFFFFu).x;
+}
+
+void main() {
+  uint t = gl_LocalInvocationID.x;
+  int row = pc.row;
+  int C = pc.C;
+  int r4 = row >> 2;
+  int rl = row & 3;
+  int g16 = row >> 4;
+  int rr = row & 15;
+  int lane_low = ((rr >> 3) & 1) | (((rr >> 2) & 1) << 1) | (((rr >> 1) & 1) << 2);
+  int jj = rr & 1;
+  int Cdiv512 = C >> 9;
+  for (int e = int(t); e < C; e += 1024) {
+    // row-major pack: codes[row][ (e>>7)*32 + ((e>>2)&31) ], scales[row][e>>7]
+    uint bidx = uint(row) * uint(C >> 2) + uint(e >> 2);
+    uint b = getByte(bidx);
+    int r = e & 3;
+    int dig;
+    if (r == 0) dig = int(b % 3u);
+    else if (r == 1) dig = int((b / 3u) % 3u);
+    else if (r == 2) dig = int((b / 9u) % 3u);
+    else dig = int((b / 27u) % 3u);
+    uint dpidx = uint(row) * uint(C >> 7) + uint(e >> 7);
+    w[e] = float(dig - 1) * h2f(dpb[dpidx]);
+  }
+  barrier();
+  // HB=512 path only
+  for (int j2 = int(t); j2 < C; j2 += 1024) {
+    int c = j2 >> 9;
+    int j = j2 & 511;
+    float acc = 0.0f;
+    for (int i = 0; i < 512; ++i) {
+      float ww = w[(c << 9) + i];
+      acc += (((bitCount(uint(i & j)) & 1u) == 1u) ? -ww : ww);
+    }
+    h[j2] = sg[j2] * (acc * 0.044194173824159220878f);
+  }
+}

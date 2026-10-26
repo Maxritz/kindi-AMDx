@@ -1,0 +1,67 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// g4lut2.comp - ternary GEMV, 4-trit packed, 4 rows per workgroup, wave reduction.
+//
+// v1 (g4lut) was correct and 5.4x faster than g4simple, but still wasted most of its
+// time on the reduction, not the loads:
+//   * one workgroup of 64 per output row, and only lanes 0..31 loaded;
+//   * the sum used 5 shared-memory tree steps, each with a barrier();
+//   * for the 2B an output row is only C/4 = 512 bytes, so 32 lanes x 16 B of traffic
+//     was dwarfed by 5 barriers.
+//
+// This version:
+//   * one WAVE per output row, 4 rows per 256-thread workgroup, so the LUT build and
+//     the workgroup scheduling are amortised 4x;
+//   * all 64 lanes load (2 x uint4 per lane for C=2048) - no idle half-wave;
+//   * the reduction is subgroupAdd: a wave-wide shuffle, no shared memory, no barrier;
+//   * the byte -> 4-trit decode still uses a 256-entry LUT, so no integer divide.
+//
+// Push constants: { int R; int C; }   Bindings: 0 codes 1 scales 2 x 3 y
+layout(local_size_x = 256) in;
+
+shared uint lut[256];
+
+layout(set = 0, binding = 0) readonly buffer CB { uint codes[]; };
+layout(set = 0, binding = 1) readonly buffer SB { uint scales[]; };
+layout(set = 0, binding = 2) readonly buffer XB { float x[]; };
+layout(set = 0, binding = 3) buffer YB { float y[]; };
+
+layout(push_constant) uniform PC { int R; int C; } pc;
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    int R = pc.R, C = pc.C;
+
+    // Build the byte -> 4-trit table once per workgroup (256 threads: one entry each).
+    lut[tid] = uint(tid % 3) | (uint((tid / 3) % 3) << 8)
+             | (uint((tid / 9) % 3) << 16) | (uint((tid / 27) % 3) << 24);
+    barrier();
+
+    // One wave owns one row. All lanes of a wave share `row`, so a whole-wave exit is safe.
+    uint sgsz = gl_SubgroupSize;
+    uint nsub = uint(gl_WorkGroupSize.x) / sgsz;
+    int row = int(gl_WorkGroupID.x) * int(nsub) + int(gl_SubgroupID);
+    if (row >= R) return;
+
+    uint lane = gl_SubgroupInvocationID;
+    int nq     = C >> 7;          // 128-weight blocks per row (one fp16 scale each)
+    int nbytes = C >> 2;          // bytes per row (4 weights per byte)
+    uint base  = uint(row) * uint(nbytes);
+
+    float acc = 0.0;
+    for (int kb = int(lane); kb < nbytes; kb += int(sgsz)) {
+        uint bi   = base + uint(kb);
+        uint byte = (codes[bi >> 2] >> (8u * (bi & 3u))) & 0xFFu;
+        uint p    = lut[byte];
+        float sc  = unpackHalf2x16(scales[row * nq + (kb >> 5)]).x;
+        int k = kb << 2;
+        float t0 = float(p & 0xFFu)         - 1.0;
+        float t1 = float((p >> 8)  & 0xFFu) - 1.0;
+        float t2 = float((p >> 16) & 0xFFu) - 1.0;
+        float t3 = float((p >> 24) & 0xFFu) - 1.0;
+        acc += sc * (t0 * x[k] + t1 * x[k + 1] + t2 * x[k + 2] + t3 * x[k + 3]);
+    }
+    acc = subgroupAdd(acc);
+    if (lane == 0u) y[row] = acc;
+}

@@ -1,0 +1,54 @@
+// q8gemv.comp - Q8_0 weight row x Q8_0 activation dot product (one row per workgroup)
+// Matches ggml vec_dot_q8_0_q8_0: per 32-block int32 dot, then acc += (d_w*d_x)*idot
+// with d values read back from the fp16 halves.
+//   bindings: 0 wcodes(uint, R*C/4)  1 wscales(uint, R*C/32)  2 xcodes(uint, C/4)
+//             3 xscales(uint, C/32)  4 y(float, R)
+//   push: { int R; int C; }
+#version 450
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer BWC { uint wcodes[]; };
+layout(set = 0, binding = 1) readonly buffer BWS { uint wscales[]; };
+layout(set = 0, binding = 2) readonly buffer BXC { uint xcodes[]; };
+layout(set = 0, binding = 3) readonly buffer BXS { uint xscales[]; };
+layout(set = 0, binding = 4) buffer BY { float y[]; };
+
+layout(push_constant) uniform PC { int R; int C; } pc;
+
+shared float sh[64];
+
+int s8(uint w, int k) {
+  int c = int((w >> uint(8 * k)) & 0xFFu);
+  return c >= 128 ? c - 256 : c;
+}
+
+void main() {
+  int row  = int(gl_WorkGroupID.x);
+  int lane = int(gl_LocalInvocationID.x);
+  float acc = 0.0;
+  if (row < pc.R && lane < 32) {
+    int bpr = pc.C >> 5;
+    int wbase = row * (pc.C >> 2);   // words per row
+    for (int b = lane; b < bpr; b += 32) {
+      int idot = 0;
+      int wo = wbase + b * 8;
+      int xo = b * 8;
+      for (int i = 0; i < 8; ++i) {
+        uint ww = wcodes[wo + i];
+        uint xw = xcodes[xo + i];
+        idot += s8(ww, 0) * s8(xw, 0) + s8(ww, 1) * s8(xw, 1)
+              + s8(ww, 2) * s8(xw, 2) + s8(ww, 3) * s8(xw, 3);
+      }
+      float dw = unpackHalf2x16(wscales[row * bpr + b]).x;
+      float dx = unpackHalf2x16(xscales[b]).x;
+      acc += (dw * dx) * float(idot);
+    }
+  }
+  sh[lane] = acc;
+  barrier();
+  for (int s = 16; s > 0; s >>= 1) {
+    if (lane < s) sh[lane] += sh[lane + s];
+    barrier();
+  }
+  if (lane == 0 && row < pc.R) y[row] = sh[0];
+}

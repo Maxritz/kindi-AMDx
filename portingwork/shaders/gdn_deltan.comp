@@ -1,0 +1,75 @@
+// gdn_deltan.comp <- k_gdn_deltan (kindi.cu lines 1120-1154)
+// CUDA grid/block: grid NV, block 128. k_gdn_delta then RMS-norm of the
+//   head's 128 outputs fused: os[j]=o*scale; barrier; lanes j<32 fp64
+//   accumulate os[x] (x=j..127 step 32), wsum_d shuffle, lane 0 writes scl;
+//   barrier; out=(os*scl)*nw[j] (per-element weight, like k_rmsw).
+// Vulkan mapping: local_size_x=128, dispatch (NV,1,1). Shared ks/qs/os[128]
+//   + scl; barrier() == __syncthreads. wsum_d -> subgroupShuffleXor chain.
+//   All 128 lanes execute the shuffles (upper lanes contribute 0.0); valid
+//   because XOR offsets {16,8,4,2,1} keep lanes 0..31 closed inside a
+//   consecutive 64-lane subgroup, so lane 0 sees exactly the 32 partials.
+//   Assumes consecutive 64-lane subgroups (true on RX580; portable fallback
+//   would be a shared-memory tree).
+// Push constants (8B): { float scale; int n_k_heads; }.
+// Bindings: 0 M rw (NV*128*128), 1 q ro, 2 k ro, 3 v ro (NV*128),
+//   4 g ro, 5 beta ro (NV), 6 nw ro (128), 7 out wo (NV*128).
+// Fidelity risks vs CUDA: M/o accumulation order identical (bit-identical);
+//   fp64 norm sum order identical (same pairwise XOR pattern); exp()/sqrt()
+//   on GCN may differ ~1-2 ulp from CUDA, shifting scl's last ulp.
+#version 450
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+layout(local_size_x = 128) in;
+layout(set = 0, binding = 0) buffer B0 { float M[]; };
+layout(set = 0, binding = 1) readonly buffer B1 { float q[]; };
+layout(set = 0, binding = 2) readonly buffer B2 { float k[]; };
+layout(set = 0, binding = 3) readonly buffer B3 { float v[]; };
+layout(set = 0, binding = 4) readonly buffer B4 { float g[]; };
+layout(set = 0, binding = 5) readonly buffer B5 { float beta[]; };
+layout(set = 0, binding = 6) readonly buffer B6 { float nw[]; };
+layout(set = 0, binding = 7) buffer B7 { float out_[]; };
+layout(push_constant) uniform PC { float scale; int n_k_heads; } pc;
+shared float ks[128];
+shared float qs[128];
+shared float os[128];
+shared float scl;
+float64_t wsum_d(float64_t v) {
+  v += subgroupShuffleXor(v, 16u);
+  v += subgroupShuffleXor(v, 8u);
+  v += subgroupShuffleXor(v, 4u);
+  v += subgroupShuffleXor(v, 2u);
+  v += subgroupShuffleXor(v, 1u);
+  return v;
+}
+void main() {
+  uint h = gl_WorkGroupID.x;
+  uint j = gl_LocalInvocationID.x;
+  uint kh = h % uint(pc.n_k_heads);
+  ks[j] = k[kh * 128u + j];
+  qs[j] = q[kh * 128u + j];
+  barrier();
+  float e = exp(g[h]);
+  uint Mh = h * 16384u;
+  float sk = 0.0f;
+  for (int i = 0; i < 128; ++i) sk += (M[Mh + uint(i) * 128u + j] * e) * ks[uint(i)];
+  float dd = (v[h * 128u + j] - sk) * beta[h];
+  float o = 0.0f;
+  for (int i = 0; i < 128; ++i) {
+    float m = M[Mh + uint(i) * 128u + j] * e + ks[uint(i)] * dd;
+    M[Mh + uint(i) * 128u + j] = m;
+    o += m * qs[uint(i)];
+  }
+  os[j] = o * pc.scale;
+  barrier();
+  float64_t acc = float64_t(0.0);
+  if (j < 32u) {
+    for (int x = int(j); x < 128; x += 32) {
+      float64_t vv = float64_t(os[uint(x)]);
+      acc += vv * vv;
+    }
+  }
+  acc = wsum_d(acc);
+  if (j == 0u) scl = 1.0f / sqrt(float(acc / float64_t(128)) + 1e-6f);
+  barrier();
+  out_[h * 128u + j] = (os[j] * scl) * nw[j];
+}

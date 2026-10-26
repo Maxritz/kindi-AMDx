@@ -1,0 +1,55 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// q8f.comp - Q8_0 weight row x float activation, batched over T tokens.
+//
+// Needed by the MTP block (blk.64), whose weights are Q8_0 rather than ternary. The
+// existing q8gemv.comp expects a *quantised* activation (xcodes/xscales); here the
+// activation stays float, which is what the rest of the engine produces.
+//
+// Loader layout (kindi_vk_decode.cpp, type 8):
+//   codebufs [row*C + b*32 + i]  byte-packed int8 codes
+//   scalebufs[row*bpr + b]       fp16 scale bits, one per 32 weights
+//
+// One 64-wide wave owns one output row, 4 rows per workgroup. Lanes stride over C so
+// consecutive lanes touch consecutive weights (coalesced); tokens are looped inside so
+// each weight byte is decoded once for the whole chunk.
+//
+// Push: { int R; int C; int T; int xstride; }
+// Bindings: 0 codes 1 scales 2 X (token-major) 3 Y (token-major)
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer BC { uint codes[]; };
+layout(set = 0, binding = 1) readonly buffer BS { uint scales[]; };
+layout(set = 0, binding = 2) readonly buffer BX { float X[]; };
+layout(set = 0, binding = 3) buffer BY { float Y[]; };
+
+layout(push_constant) uniform PC { int R; int C; int T; int xstride; } pc;
+
+void main() {
+    uint sgsz = gl_SubgroupSize;
+    uint nsub = uint(gl_WorkGroupSize.x) / sgsz;
+    int row = int(gl_WorkGroupID.x) * int(nsub) + int(gl_SubgroupID);
+    if (row >= pc.R) return;
+
+    uint lane = gl_SubgroupInvocationID;
+    int C = pc.C, T = pc.T;
+    int bpr = C >> 5;
+    uint rbase = uint(row) * uint(C);
+
+    float acc[4] = float[4](0.0, 0.0, 0.0, 0.0);
+
+    for (int k = int(lane); k < C; k += int(sgsz)) {
+        uint bi = rbase + uint(k);
+        int q = int((codes[bi >> 2] >> (8u * (bi & 3u))) & 0xFFu);
+        if (q >= 128) q -= 256;
+        float d = unpackHalf2x16(scales[row * bpr + (k >> 5)]).x;
+        float wd = d * float(q);
+        for (int t = 0; t < T && t < 4; ++t) acc[t] += wd * X[t * pc.xstride + k];
+    }
+
+    for (int t = 0; t < T && t < 4; ++t) {
+        float s = subgroupAdd(acc[t]);
+        if (lane == 0u) Y[t * pc.R + row] = s;
+    }
+}

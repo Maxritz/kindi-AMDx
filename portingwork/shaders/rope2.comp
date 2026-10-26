@@ -1,0 +1,42 @@
+// rope2.comp <- k_rope2 (kindi.cu lines 1169-1183)
+// CUDA grid/block: one block per row, thread j: rows [0,nq) read q/write
+//   qo, the rest read k/write ko. j<32: pairwise rotate with (cc,ss);
+//   32<=j<64: untouched by this kernel (belongs to the same pair block);
+//   j>=64: passthrough copy. (HD=128: pairs (j,j+32), tail 64..127.)
+// Vulkan mapping: local_size_x=128, dispatch (nq+nk,1,1);
+//   r=gl_WorkGroupID.x, j=gl_LocalInvocationID.x. No shared, no shuffles.
+//   The j>=HD guard is added (CUDA relies on exact blockDim==HD launch).
+// Push constants (8B): { int nq; int HD; }.
+// Bindings: 0 q ro, 1 k ro, 2 cc ro, 3 ss ro, 4 qo wo, 5 ko wo.
+// Fidelity risks vs CUDA: pure fp32 multiply-add pair rotation, same order;
+//   bit-identical expected (no exp/log/sqrt; fused z-rotor arithmetic only).
+#version 450
+#extension GL_KHR_shader_subgroup_shuffle : require
+layout(local_size_x = 128) in;
+layout(set = 0, binding = 0) readonly buffer B0 { float q[]; };
+layout(set = 0, binding = 1) readonly buffer B1 { float k[]; };
+layout(set = 0, binding = 2) readonly buffer B2 { float cc[]; };
+layout(set = 0, binding = 3) readonly buffer B3 { float ss[]; };
+layout(set = 0, binding = 4) buffer B4 { float qo[]; };
+layout(set = 0, binding = 5) buffer B5 { float ko[]; };
+layout(push_constant) uniform PC { int nq; int HD; } pc;
+void main() {
+  uint r = gl_WorkGroupID.x;
+  uint j = gl_LocalInvocationID.x;
+  if (j >= uint(pc.HD)) return;
+  uint HD = uint(pc.HD);
+  bool isQ = int(r) < pc.nq;
+  uint ri = isQ ? r : r - uint(pc.nq);
+  uint xbase = ri * HD;
+  if (j < 32u) {
+    float a = (isQ ? q[xbase + j] : k[xbase + j]);
+    float b = (isQ ? q[xbase + j + 32u] : k[xbase + j + 32u]);
+    float ro0 = a * cc[j] - b * ss[j];
+    float ro1 = a * ss[j] + b * cc[j];
+    if (isQ) { qo[xbase + j] = ro0; qo[xbase + j + 32u] = ro1; }
+    else     { ko[xbase + j] = ro0; ko[xbase + j + 32u] = ro1; }
+  } else if (j >= 64u) {
+    float v = isQ ? q[xbase + j] : k[xbase + j];
+    if (isQ) qo[xbase + j] = v; else ko[xbase + j] = v;
+  }
+}
