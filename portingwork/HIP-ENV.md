@@ -58,7 +58,38 @@ Copying is what a shipped bundle has to do anyway, so that is the recommended ro
 Note `amd_comgr.dll` is 117 MB, so a bundle carries about 133 MB of runtime before any
 weights.
 
-### 3. rocblas needs `.kpack`
+### 3. rocblas: sgemv is unimplemented, sgemm works, and it needs Tensile's path
+
+Three separate problems, all measured:
+
+**It looks for `./rocblas/library/` next to the exe.** Without `ROCBLAS_TENSILE_LIBPATH` it
+fails with:
+
+```
+rocBLAS error: Cannot read <exedir>/rocblas/library/TensileLibrary.dat: No such file or
+directory for GPU arch : gfx1031
+```
+
+Fix: `ROCBLAS_TENSILE_LIBPATH=C:\Rocm10\bin\rocblas\library` (159 MB, 994 files, so set
+the variable rather than copying it).
+
+**`rocblas_sgemv` is not implemented for gfx1031.** It returns status 6 and throws
+`hipErrorInvalidKernelFile`, even with the path set. `rocblas_sgemm` works fine. A GEMV is a
+GEMM with `n=1`, so use that:
+
+```cpp
+rocblas_sgemm(h, rocblas_operation_transpose, rocblas_operation_none,
+              R, 1, C, &alpha, A, C, x, C, &beta, y, R);
+```
+
+with `A` stored row-major `R x C` (which is `C x R` column-major with `lda=C`, hence the
+transpose).
+
+**The first call costs about 390 ms.** That is Tensile loading its kernel library, not the
+GEMM. It is one-time per process; every later call is fast. Worth knowing before reading a
+trace that shows a single enormous sgemm.
+
+### 4. `.kpack`
 
 `rocblas.dll` reads its precompiled kernels from `$env:ROCM_PATH\.kpack`. This install has
 `blas_lib_gfx1031.kpack` there, so `ROCM_PATH=C:\Rocm10` must be set even when the DLLs are
