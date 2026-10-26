@@ -1,0 +1,114 @@
+// g5ptq.comp - PTQ1_0 native 5-trit GEMV (no host expansion).
+//
+// Block = 128 weights in 28 bytes: qs[0..23] | qh[24..25] | fp16 scale[26..27].
+//   Each byte carries FIVE base-3 digits (3^5 = 243 < 256), which is where the
+//   1.75 bpw comes from: 128 weights / 5 per byte = 25.6, plus a 2-byte scale.
+//   bytes  0..15 -> trits j, 16+j, 32+j, 48+j, 64+j        (j = 0..15, 5 each)
+//   bytes 16..23 -> trits 80+j, 88+j, 96+j, 104+j, 112+j   (j = 0..7,  5 each)
+//   bytes 24..25 -> trits 120+j, 122+j, 124+j, 126+j     (j = 0..1,  4 each)
+//   digit n of a byte: q = (raw * 3^n) & 0xFF ; trit = (q * 3) >> 8
+//
+// Why this is written per byte and not per trit:
+//
+// The previous version called block_trit() once per weight, so every one of the
+// C/64 weights a lane handles cost its own byte load, its own 3^n multiply and its
+// own shift. It measured 5.44 GB/s on a card whose 4-trit shaders (g4lut2/g4lut3)
+// reach 76-95 GB/s, and an ablation attributed 25% of the kernel to decoding the
+// fp16 scale per element and 29% to the 3^n chain.
+//
+// One byte yields five weights, so the load and the 3^n multiply are amortised 5x
+// and only the MACs stay at one per weight. Across lanes the byte index is
+// consecutive, so for a fixed digit n the x reads are consecutive too: lanes that
+// share a block read x[base + j + 16n] for consecutive j.
+//
+// bi / 26 has a compile-time divisor, so the compiler emits mul_hi + shift rather
+// than an integer divide (GCN has no integer divide at all).
+//
+// Layout: binding 0 = raw blocks as uint words, row-major,
+//         byte index = (row*bpr + c/128)*28 + <byte in block>
+//         binding 1 = x (float), 2 = out (float)
+#version 450
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer BW { uint w[]; };
+layout(set = 0, binding = 1) readonly buffer BX { float x[]; };
+layout(set = 0, binding = 2) buffer BO { float out_[]; };
+
+layout(push_constant) uniform PC { int R; int C; } pc;
+
+shared float sh[64];
+// byte -> its five trits, two bits each, packed in one uint (3^5 = 243 < 256).
+// One LDS load per byte replaces 15 ALU ops of mul/and/mul/shr.
+shared uint tl[256];
+
+const uint P3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
+
+// byte <byteInBlk> of block <blk> of row <row>, as an 8-bit value
+uint block_byte(int row, int bpr, int blk, int byteInBlk) {
+    int bi = (row * bpr + blk) * 28 + byteInBlk;
+    return (w[bi >> 2] >> (8u * uint(bi & 3))) & 0xFFu;
+}
+
+void main() {
+    int row = int(gl_WorkGroupID.x);
+    if (row >= pc.R) return;
+    int lane = int(gl_LocalInvocationID.x);
+    int C = pc.C;
+    int bpr = C >> 7;            // 128-weight blocks per row
+    int ntb = bpr * 26;          // trit-bearing bytes per row (26 of the 28)
+
+    // Build the byte -> 5-trit table. 64 threads, 4 entries each.
+    for (int e = lane; e < 256; e += 64) {
+        uint b = uint(e), pk = 0u;
+        for (int n = 0; n < 5; ++n) {
+            uint t = (((b * P3[n]) & 0xFFu) * 3u) >> 8;
+            pk |= t << (2 * n);
+        }
+        tl[e] = pk;
+    }
+    barrier();
+
+    float acc = 0.0;
+    for (int bi = lane; bi < ntb; bi += 64) {
+        int blk = bi / 26;                 // constant divisor: mul_hi + shift
+        int off = bi - blk * 26;
+        uint raw = block_byte(row, bpr, blk, off);
+        // Read the fp16 scale straight from the block we are already touching.
+        // unpackHalf2x16 is one instruction; fp16_to_f32 was two branches. This
+        // costs 8% against a widened-scale buffer and saves 0.79 GB of VRAM, which
+        // is what makes --spec fit on an 8 GB card.
+        uint dlo = block_byte(row, bpr, blk, 26);
+        uint dhi = block_byte(row, bpr, blk, 27);
+        float s  = unpackHalf2x16(dlo | (dhi << 8)).x;
+        int base = blk << 7;
+        float sub = 0.0;
+
+        uint pk = tl[raw];
+        if (off < 16) {                    // five digits, stride 16
+            for (int n = 0; n < 5; ++n) {
+                int t = int((pk >> (2 * n)) & 3u);
+                sub += float(t - 1) * x[base + off + (n << 4)];
+            }
+        } else if (off < 24) {             // five digits, stride 8, from trit 80
+            int j = off - 16;
+            for (int n = 0; n < 5; ++n) {
+                int t = int((pk >> (2 * n)) & 3u);
+                sub += float(t - 1) * x[base + 80 + j + (n << 3)];
+            }
+        } else {                           // four digits, from trit 120
+            int j = off - 24;
+            for (int n = 0; n < 4; ++n) {
+                int t = int((pk >> (2 * n)) & 3u);
+                sub += float(t - 1) * x[base + 120 + (n << 1) + j];
+            }
+        }
+        acc += s * sub;
+    }
+    sh[lane] = acc;
+    barrier();
+    for (int s = 32; s > 0; s >>= 1) {
+        if (lane < s) sh[lane] += sh[lane + s];
+        barrier();
+    }
+    if (lane == 0) out_[row] = sh[0];
+}

@@ -768,10 +768,10 @@ int main(int argc, char**argv){
     }
 
     std::map<std::string,Buf> codebufs, scalebufs, f32bufs;
-    // PTQ1_0 native blocks carry an fp16 scale at bytes 26..27 of every 28-byte block.
-    // Widening it once here removes an fp16 decode (two byte loads plus two branches)
-    // from the inner loop, where an ablation measured it at 25% of g5ptq.
-    std::map<std::string,Buf> scale5bufs;
+    // The PTQ1_0 fp16 block scale is read straight out of the 28-byte block in the
+    // shader (unpackHalf2x16). Widening it into a float buffer first was 8% faster
+    // but cost 0.79 GB of VRAM, which pushed the 27B past the 8 GB limit once the
+    // MTP state snapshot was allocated, so it is not used.
     std::map<std::string,std::pair<int,int>> tinfo;
 
     uint32_t pow3[6] = {1,3,9,27,81,243};
@@ -830,20 +830,6 @@ int main(int argc, char**argv){
             Buf cb = mkbuf(words.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
             upload(&cb, words.data(), words.size() * 4);
             codebufs[gt.name] = cb;
-            // Widen the per-block fp16 scale to float once, [row*bpr + blk].
-            std::vector<uint32_t> sc5((size_t)r * bpr, 0u);
-            for (int row = 0; row < r; ++row) {
-                for (int b = 0; b < bpr; ++b) {
-                    const unsigned char* blk = data + ((size_t)row * bpr + b) * 28;
-                    uint16_t sv; memcpy(&sv, blk + 26, 2);
-                    float f = half_to_float(sv);
-                    uint32_t bits; memcpy(&bits, &f, 4);
-                    sc5[(size_t)row * bpr + b] = bits;
-                }
-            }
-            Buf sb5 = mkbuf(sc5.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            upload(&sb5, sc5.data(), sc5.size() * 4);
-            scale5bufs[gt.name] = sb5;
             tinfo[gt.name] = std::make_pair(r, c);
             native_names.insert(gt.name);
             n_tern++;
@@ -1038,8 +1024,14 @@ int main(int argc, char**argv){
     Pipe pcpq=mkpipe((shdir+"/cpq.comp.spv").c_str(),2,8);
     Pipe psumparts=mkpipe((shdir+"/sumparts.comp.spv").c_str(),2,8);
     Pipe pq8=mkpipe((shdir+"/g4q8.comp.spv").c_str(),4,8);
-    Pipe pg5=mkpipe((shdir+"/g5ptq.comp.spv").c_str(),4,8);
-    Pipe pg5M=mkpipe((shdir+"/g5ptqM.comp.spv").c_str(),4,16);  // batched native PTQ1_0
+    Pipe pg5=mkpipe((shdir+"/g5ptq.comp.spv").c_str(),3,8);
+    // Experiment: the same decode with a different workgroup geometry.
+    //   KINDI_G5=byte  -> g5ptq_byte  (1 row per 64-thread workgroup)
+    //   KINDI_G5=byte4 -> g5ptq_byte4 (4 rows per 256-thread workgroup, subgroupAdd)
+    // Unset keeps the shipped g5ptq. Used to attribute the gap to geometry vs decode.
+    Pipe pg5b =mkpipe((shdir+"/g5ptq_byte.comp.spv").c_str(),3,8);
+    Pipe pg5b4=mkpipe((shdir+"/g5ptq_byte4.comp.spv").c_str(),3,8);
+    Pipe pg5M=mkpipe((shdir+"/g5ptqM.comp.spv").c_str(),3,16);  // batched native PTQ1_0
     Pipe pdeq5=mkpipe((shdir+"/deq_emb5.comp.spv").c_str(),3,12);
     Pipe pfwhi=mkpipe((shdir+"/fwht_hi.comp.spv").c_str(),1,8);
     Pipe pg2=mkpipe((shdir+"/g2pq.comp.spv").c_str(),3,8);
@@ -1205,10 +1197,24 @@ int main(int argc, char**argv){
             return;
         }
         if(native_names.count(wname)){
-            std::vector<Buf> bufs={codebufs[wname],xbuf,outbuf,scale5bufs[wname]};
-            bindbufs(pg5,bufs);
+            std::vector<Buf> bufs={codebufs[wname],xbuf,outbuf};
             struct{int R,C;}pc{rows,cols};
-            dispatch(pg5,G.q0,G.cp,rows,1,1,&pc,8);
+            // Default: byte-granular decode (one load per byte, five weights).
+            // KINDI_G5=byte4 selects the 4-rows-per-workgroup shape, which is a
+            // further 1.09x but sums the lanes with subgroupAdd instead of the
+            // shared tree, so it is not bit-identical to g5ptqM and would need its
+            // own spec-equivalence proof. KINDI_G5=old keeps the previous shader.
+            const char* g5 = getenv("KINDI_G5");
+            if(g5 && !strcmp(g5,"byte4")){
+                bindbufs(pg5b4,bufs);
+                dispatch(pg5b4,G.q0,G.cp,(uint32_t)((rows+3)/4),1,1,&pc,8);
+            } else if(g5 && !strcmp(g5,"old")){
+                bindbufs(pg5,bufs);
+                dispatch(pg5,G.q0,G.cp,rows,1,1,&pc,8);
+            } else {
+                bindbufs(pg5b,bufs);
+                dispatch(pg5b,G.q0,G.cp,rows,1,1,&pc,8);
+            }
             return;
         }
         if(q4names.count(wname)){
@@ -1809,7 +1815,7 @@ int main(int argc, char**argv){
         if(it == tinfo.end()) return false;
         int rows = it->second.first, cols = it->second.second;
         if(xstride<0) xstride=cols;
-        std::vector<Buf> bufs={codebufs[wname],xbuf,outbuf,scale5bufs[wname]};
+        std::vector<Buf> bufs={codebufs[wname],xbuf,outbuf};
         bindbufs(pg5M,bufs);
         struct{int R,C,T,xstride;}pc{rows,cols,T,xstride};
         dispatch(pg5M,G.q0,G.cp,(uint32_t)rows,1,1,&pc,16);
@@ -2309,10 +2315,10 @@ int main(int argc, char**argv){
             Buf xb; mkx(C, xb);
             Buf y1=mkbuf((VkDeviceSize)R*4,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
             Buf y2=mkbuf((VkDeviceSize)R*2*4,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            { std::vector<Buf> b={codebufs[n5],xb,y1,scale5bufs[n5]}; bindbufs(pg5,b);
+            { std::vector<Buf> b={codebufs[n5],xb,y1}; bindbufs(pg5,b);
               struct{int R,C;}pc{R,C}; dispatch(pg5,G.q0,G.cp,(uint32_t)R,1,1,&pc,8); }
             batch_flush();
-            { std::vector<Buf> b={codebufs[n5],xb,y2,scale5bufs[n5]}; bindbufs(pg5M,b);
+            { std::vector<Buf> b={codebufs[n5],xb,y2}; bindbufs(pg5M,b);
               struct{int R,C,T,xstride;}pc{R,C,2,C}; dispatch(pg5M,G.q0,G.cp,(uint32_t)R,1,1,&pc,16); }
             batch_flush();
             auto a=rd(y1,R), bb=rd(y2,R*2);
@@ -2321,10 +2327,37 @@ int main(int argc, char**argv){
                 double d0=std::fabs(a[i]-bb[i]);   if(d0>e0) e0=d0;
                 double d1=std::fabs(a[i]-bb[R+i]); if(d1>e1) e1=d1;
             }
-            fprintf(stderr,"selftest PTQ1_0 T=2: max|y1-y2[0]|=%.3e  max|y1-y2[1]|=%.3e\n", e0,e1);
-            bool o5 = (e0 < 1e-6) && (e1 < 1e-6);
-            fprintf(stderr,"selftest PTQ1_0: %s\n", o5 ? "PASS" : "FAIL");
-            ok = ok && o5;
+            // Informational only: the per-trit shader is kept for A/B against the
+            // old decode (KINDI_G5=old). It no longer shares arithmetic with the
+            // batched kernel, so this difference is expected, not a regression.
+            fprintf(stderr,"selftest PTQ1_0 per-trit vs batched: max|dy|=%.3e (informational)\n",
+                    e0 > e1 ? e0 : e1);
+
+            // The byte-granular pair is what the engine actually runs now. The spec
+            // verify pass compares trunk rows produced by g5ptqM against tokens the
+            // serial path produced with g5ptq_byte, so these two must agree exactly
+            // or an accepted draft could differ from the plain run.
+            {
+                Buf z1=mkbuf((VkDeviceSize)R*4,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                Buf z2=mkbuf((VkDeviceSize)R*2*4,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                { std::vector<Buf> b={codebufs[n5],xb,z1}; bindbufs(pg5b,b);
+                  struct{int R,C;}pc{R,C}; dispatch(pg5b,G.q0,G.cp,(uint32_t)R,1,1,&pc,8); }
+                batch_flush();
+                { std::vector<Buf> b={codebufs[n5],xb,z2}; bindbufs(pg5M,b);
+                  struct{int R,C,T,xstride;}pc{R,C,2,C}; dispatch(pg5M,G.q0,G.cp,(uint32_t)R,1,1,&pc,16); }
+                batch_flush();
+                auto c1=rd(z1,R), c2=rd(z2,R*2);
+                double f0=0,f1=0;
+                for(int i=0;i<R;++i){
+                    double d0=std::fabs(c1[i]-c2[i]);   if(d0>f0) f0=d0;
+                    double d1=std::fabs(c1[i]-c2[R+i]); if(d1>f1) f1=d1;
+                }
+                fprintf(stderr,"selftest PTQ1_0 byte T=2: max|y1-y2[0]|=%.3e  max|y1-y2[1]|=%.3e\n", f0,f1);
+                bool o5b = (f0 == 0.0) && (f1 == 0.0);
+                fprintf(stderr,"selftest PTQ1_0 byte: %s\n", o5b ? "PASS (bit-identical)" : "FAIL");
+                ok = ok && o5b;
+                freebuf(z1); freebuf(z2);
+            }
             freebuf(y1); freebuf(y2);
         }
 
@@ -2866,6 +2899,12 @@ int main(int argc, char**argv){
 
     if(spec_n>0){
         if(!have_mtp){ fprintf(stderr,"--spec: no usable MTP block in this model\n"); return 1; }
+        { const char* g5=getenv("KINDI_G5");
+          if(g5 && !strcmp(g5,"byte4")){
+              fprintf(stderr,"--spec: KINDI_G5=byte4 is not bit-identical to the batched "
+                             "kernel, so it cannot be used for speculative verify\n");
+              return 1;
+          } }
         if(temperature>0.0f){ fprintf(stderr,"--spec: needs --temp 0 (greedy)\n"); return 1; }
         if(CHUNK>0){ fprintf(stderr,"--spec: set KINDI_CHUNK=0\n"); return 1; }
         if(ctx < (int)ids.size()+spec_n+4){ fprintf(stderr,"--spec: context too small\n"); return 1; }

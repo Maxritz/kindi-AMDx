@@ -1,0 +1,99 @@
+// g5ptq_byte4.comp - PTQ1_0 5-trit GEMV, FOUR rows per workgroup.
+//
+// This is the g4lut2 structure applied to the 5-trit format: one wave owns one
+// output row, four waves share a 256-thread workgroup, and the reduction is a
+// wave-wide subgroupAdd rather than a shared-memory tree. g4lut2 reaches 91 GB/s
+// on this card with that shape, against 5.4 GB/s for the original g5ptq, so the
+// question this file exists to answer is how much of that gap is the workgroup
+// geometry rather than the decode.
+//
+// The byte -> five-trit decode is the same as g5ptq_byte.comp, which is already
+// verified token-identical to the original: one byte carries five base-3 digits
+// (3^5 = 243 < 256), so the byte load and the 3^n multiply are amortised 5x.
+//
+// Layout: binding 0 = raw blocks as uint words, row-major,
+//         byte index = (row*bpr + c/128)*28 + <byte in block>
+//         binding 1 = x (float), 2 = out (float)
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer BW { uint w[]; };
+layout(set = 0, binding = 1) readonly buffer BX { float x[]; };
+layout(set = 0, binding = 2) buffer BO { float out_[]; };
+
+layout(push_constant) uniform PC { int R; int C; } pc;
+
+// byte -> five trits, two bits each. Shared by all four waves in the workgroup,
+// so the 256-entry build is amortised 4x instead of once per row.
+shared uint tl[256];
+
+const uint P3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
+
+uint block_byte(int row, int bpr, int blk, int byteInBlk) {
+    int bi = (row * bpr + blk) * 28 + byteInBlk;
+    return (w[bi >> 2] >> (8u * uint(bi & 3))) & 0xFFu;
+}
+
+void main() {
+    // One wave owns one row. `row` is uniform across the wave, so the early
+    // return is a whole-wave exit and cannot diverge mid-wave.
+    uint sgsz = gl_SubgroupSize;
+    uint nsub = uint(gl_WorkGroupSize.x) / sgsz;
+    int row = int(gl_WorkGroupID.x) * int(nsub) + int(gl_SubgroupID);
+    if (row >= pc.R) return;
+
+    uint lane = gl_SubgroupInvocationID;
+    int C = pc.C;
+    int bpr = C >> 7;            // 128-weight blocks per row
+    int ntb = bpr * 26;          // trit-bearing bytes per row (26 of the 28)
+
+    // Build the table once per workgroup. 256 threads, one entry each.
+    {
+        uint b = uint(gl_LocalInvocationID.x), pk = 0u;
+        for (int n = 0; n < 5; ++n) {
+            uint t = (((b * P3[n]) & 0xFFu) * 3u) >> 8;
+            pk |= t << (2 * n);
+        }
+        tl[gl_LocalInvocationID.x] = pk;
+    }
+    barrier();
+
+    float acc = 0.0;
+    for (int bi = int(lane); bi < ntb; bi += int(sgsz)) {
+        int blk = bi / 26;                 // constant divisor: mul_hi + shift
+        int off = bi - blk * 26;
+        uint raw = block_byte(row, bpr, blk, off);
+        // fp16 scale straight from the block, one instruction, no extra buffer.
+        uint dlo = block_byte(row, bpr, blk, 26);
+        uint dhi = block_byte(row, bpr, blk, 27);
+        float s  = unpackHalf2x16(dlo | (dhi << 8)).x;
+        int base = blk << 7;
+
+        uint pk = tl[raw];
+        float sub = 0.0;
+        if (off < 16) {                    // five digits, stride 16
+            for (int n = 0; n < 5; ++n) {
+                int t = int((pk >> (2 * n)) & 3u);
+                sub += float(t - 1) * x[base + off + (n << 4)];
+            }
+        } else if (off < 24) {             // five digits, stride 8, from trit 80
+            int j = off - 16;
+            for (int n = 0; n < 5; ++n) {
+                int t = int((pk >> (2 * n)) & 3u);
+                sub += float(t - 1) * x[base + 80 + j + (n << 3)];
+            }
+        } else {                           // four digits, from trit 120
+            int j = off - 24;
+            for (int n = 0; n < 4; ++n) {
+                int t = int((pk >> (2 * n)) & 3u);
+                sub += float(t - 1) * x[base + 120 + (n << 1) + j];
+            }
+        }
+        acc += s * sub;
+    }
+    acc = subgroupAdd(acc);
+    if (lane == 0u) out_[row] = acc;
+}

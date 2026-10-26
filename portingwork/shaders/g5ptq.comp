@@ -8,7 +8,6 @@
 // Layout: binding 0 = raw blocks as uint words (4 bytes/word), row-major,
 //         byte index = (row*bpr + c/128)*28 + <byte in block>
 //         binding 1 = x (float), binding 2 = out (float)
-//         binding 3 = per-block scale widened to float, [row*bpr + blk]
 //
 // Two costs used to sit in the inner loop and an ablation put numbers on them:
 // decoding the fp16 scale once per element cost 25% of the kernel, and the
@@ -22,7 +21,6 @@ layout(local_size_x = 64) in;
 layout(set = 0, binding = 0) readonly buffer BW { uint w[]; };
 layout(set = 0, binding = 1) readonly buffer BX { float x[]; };
 layout(set = 0, binding = 2) buffer BO { float out_[]; };
-layout(set = 0, binding = 3) readonly buffer BS { float sc[]; };
 
 layout(push_constant) uniform PC { int R; int C; } pc;
 
@@ -66,7 +64,9 @@ void main() {
         int blk = c >> 7, i = c & 127;
         int trit = block_trit(row, bpr, blk, i);
         if (trit != 1) {                                  // trit 1 -> weight 0, skip
-            float s = sc[row * bpr + blk];
+            uint dlo = block_byte(row, bpr, blk, 26);
+            uint dhi = block_byte(row, bpr, blk, 27);
+            float s = unpackHalf2x16(dlo | (dhi << 8)).x;
             acc += float(trit - 1) * s * x[c];
         }
     }

@@ -1,4 +1,4 @@
-# Kindi Vulkan — performance report
+# Kindi Vulkan  -  performance report
 
 GPU: RX 580, 36 CU x 4 SIMD x 8 wavefronts = 1152 wave slots, wave size 64
 Workload: `--prompt "The sky is blue because" --temp 0`
@@ -9,7 +9,7 @@ Correctness gate: 2B token ids `314 279 69377 314 3000`, 27B ` of Rayleigh scatt
 
 | stage | 2B tokens/s | change |
 |---|---|---|
-| original (per-dispatch fence, g4simple) | ~3.3 | — |
+| original (per-dispatch fence, g4simple) | ~3.3 |  -  |
 | + dispatch batching | 5.5 | 1.7x |
 | + g4lut (256-entry LUT, 4 trits/byte) | 26.0 | 4.7x |
 | + g4lut2 (4 rows/workgroup, subgroup reduce) | 34.5 | 1.3x |
@@ -40,6 +40,69 @@ host total     : 12.44 ms
 Per token: **device 10.4 ms, inter-dispatch drain 21.6 ms, host 0.3 ms.**
 Wall marginal 27.5 ms/token.
 
+## The 27B 5-trit GEMV: 2643 -> 563 us/op, 4.7x
+
+`g5ptq` (single token) and `g5ptqM` (batched) were 98% of a 27B decode step. Five
+changes, each measured, each with the tokens checked afterwards:
+
+| step | us/op | GB/s | vs original |
+|---|---|---|---|
+| original, per-trit decode | 2643.1 | 5.44 | 1.00x |
+| widened scale buffer + `3^n` lookup | 1469.1 | 11.15 | 1.80x |
+| byte-granular decode (5 weights per byte load) | 721.2 | 22.7 | 3.66x |
+| + shared-memory byte-to-trits LUT | 526.9 | 31.1 | 5.02x |
+| + scale read from the block (drops the buffer) | 563.3 | 29.1 | 4.69x |
+| 4 rows per 256-thread workgroup (`KINDI_byte4`) | 485.0 | 33.8 | 5.45x |
+
+End to end on the 27B PTQ1_0 + MTP, 20 tokens, greedy, serial:
+**0.848 -> 3.29 tok/s** (3.88x), tokens byte-identical.
+
+### What the measurements ruled out
+
+The kernel is **instruction-bound, not bandwidth-bound**. Two experiments prove it:
+
+- *Cache-resident weights*: the same shader, same instructions, same MACs, but every
+  weight read redirected to two cache-resident blocks. 727.9 us/op against 711.5
+  shipped, i.e. **no change**. There is no memory stall to recover.
+- *Ablation*: removing the weight load entirely saved 71%, but that also lets the
+  compiler fold the whole decode chain, so that number is decode ALU, not traffic.
+  Removing 4 of the 5 digits from each byte saved 52.8%, i.e. the MACs.
+
+So cooperative loading, more rows per workgroup and wider loads cannot help much.
+An earlier attempt at wide `uint` loads per 16 bytes was **4.4x slower** (3113.9
+us/op): the scalar byte path was already coalescing.
+
+### What actually helped, and why
+
+1. **The fp16 scale was decoded per weight.** An ablation put this at 25% of the
+   kernel. It is constant for all 128 weights in a block.
+2. **`3^n` was a data-dependent multiply chain**, up to four dependent multiplies per
+   weight. A 5-entry table removed it: 29% of the kernel.
+3. **One byte carries five weights.** PTQ1_0 packs five base-3 digits per byte
+   (3^5 = 243 < 256), so a lane can load a byte once and emit five MACs instead of
+   one. That is the 2.03x step.
+4. **The byte-to-trit decode is a 1 KB shared table.** One LDS load replaces 15 ALU
+   ops per byte.
+5. **`float sub[4]` was a mistake.** An array indexed by a runtime loop variable
+   lands in scratch memory on GCN. It made the T=2 batched kernel 5.7x slower than
+   it should be (2726 us/op against ~478 expected). Specialising T=2 with scalars
+   took it to 1050 us/op and the spec pass from 1162 to 554 ms.
+
+### The scale buffer was removed on purpose
+
+Widening the fp16 block scale into a float buffer is 8% faster than reading it from
+the block with `unpackHalf2x16`. It also costs **0.79 GB** of VRAM, which pushed the
+27B past the 8 GB limit once the MTP state snapshot (149.6 MiB) was allocated, so
+`--spec` stopped working entirely. The 8% is not worth losing speculative decode:
+the block read wins on total throughput.
+
+### Still not 8 tok/s
+
+8 tok/s on the 27B needs 125 ms/token, i.e. `g5ptq` at ~288 us/op. It is at 563. The
+remaining lever is not the kernel: it is **401 launches per token**, and dispatch
+fusion is the untested idea. `g4lut3` already fuses up to three same-input tensors in
+one launch on the 4-trit path; the 5-trit path does not do this yet.
+
 ## The remaining wall: inter-dispatch barriers
 
 446 dispatches per token, each followed by a `VkMemoryBarrier`
@@ -54,7 +117,7 @@ Measured cost, controlled experiment (`KINDI_NO_BARRIER=1`, wrong results by des
 | no barriers | 2,795 ms | 315,529 us | 332 ms |
 
 So the barrier costs **~48 us each, 21.6 ms/token, 76% of runtime.** Confirmed it is
-the drain itself, not the access-mask scope — three variants all cost the same:
+the drain itself, not the access-mask scope  -  three variants all cost the same:
 
 | `KINDI_BARRIER` | wall | queue wait |
 |---|---|---|
@@ -74,8 +137,8 @@ change (e.g. folding the elementwise ops into the GEMV epilogue). Not attempted.
    reset only after the queue is idle, flush before every host readback.
    `KINDI_NO_BATCH=1` restores the old path for A/B: 7,293 vs 4,148 ms.
 
-2. **g4lut.** `g4simple` decoded one weight per iteration with `(byte/div)%3` — a
-   variable integer divide, which GCN has no hardware for — walked stride-32 (poor
+2. **g4lut.** `g4simple` decoded one weight per iteration with `(byte/div)%3`  -  a
+   variable integer divide, which GCN has no hardware for  -  walked stride-32 (poor
    coalescing) and idled half the 64-wide wavegroup. Replaced with a 256-entry shared
    LUT and 4 trits decoded per byte. 5.4x device time.
 
@@ -115,6 +178,7 @@ the matching prefix is accepted. Output is token-identical to the plain run.
 | prompt (20 tokens, greedy) | plain | spec | accept | speedup |
 |---|---|---|---|---|
 | `The sky is blue because` | 0.850 tok/s | 1.25 tok/s | 100% | 1.47x |
+| `The sky is blue because` (after the 5-trit rewrite) | 3.29 tok/s | 3.42 tok/s | 100% | 1.04x |
 | `def fibonacci(n):` | 0.829 tok/s | 1.20 tok/s | 100% | 1.45x |
 | `Once upon a time there was` | 0.871 tok/s | 1.00 tok/s | 53.8% | 1.15x |
 

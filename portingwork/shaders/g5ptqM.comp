@@ -17,18 +17,21 @@
 // so the scale read is a broadcast.
 //
 // Push: { int R; int C; int T; int xstride; }   x is token-major [T][xstride]
-// Bindings: 0 raw blocks as uint words, 1 x (float), 2 out (float, [T][R]), 3 scales
+// Bindings: 0 raw blocks as uint words, 1 x (float), 2 out (float, [T][R])
 #version 450
 layout(local_size_x = 64) in;
 
 layout(set = 0, binding = 0) readonly buffer BW { uint w[]; };
 layout(set = 0, binding = 1) readonly buffer BX { float x[]; };
 layout(set = 0, binding = 2) buffer BO { float out_[]; };
-layout(set = 0, binding = 3) readonly buffer BS { float sc[]; };
 
 layout(push_constant) uniform PC { int R; int C; int T; int xstride; } pc;
 
 shared float sh[4][64];
+// byte -> its five trits, two bits each, packed in one uint (3^5 = 243 < 256).
+// One LDS load per byte replaces 15 ALU ops of mul/and/mul/shr. Same table as
+// g5ptq_byte, so a T=1 launch stays bit-identical to the single-token shader.
+shared uint tl[256];
 
 const uint P3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
 
@@ -63,14 +66,71 @@ void main() {
     int T = pc.T;
     int bpr = C >> 7;
 
+    // Build the byte -> 5-trit table. 64 threads, 4 entries each.
+    for (int e = lane; e < 256; e += 64) {
+        uint b = uint(e), pk = 0u;
+        for (int nn = 0; nn < 5; ++nn) {
+            uint t = (((b * P3[nn]) & 0xFFu) * 3u) >> 8;
+            pk |= t << (2 * nn);
+        }
+        tl[e] = pk;
+    }
+    barrier();
+
     float acc[4] = float[4](0.0, 0.0, 0.0, 0.0);
-    for (int c = lane; c < C; c += 64) {
-        int blk = c >> 7, i = c & 127;
-        int trit = block_trit(row, bpr, blk, i);
-        if (trit != 1) {                                  // trit 1 -> weight 0, skip
-            float s = sc[row * bpr + blk];
-            float wv = float(trit - 1) * s;
-            for (int t = 0; t < T && t < 4; ++t) acc[t] += wv * x[t * pc.xstride + c];
+    int ntb = bpr * 26;            // trit-bearing bytes per row (26 of the 28)
+
+    // T == 2 is the speculative-verify shape (k=1 drafts two rows), and it is the
+    // one that matters. It gets scalars rather than arrays: an array indexed by a
+    // runtime loop variable lands in scratch memory on GCN, which cost 5.7x here
+    // (2726 us/op against 478 expected for twice the work of the T=1 shader).
+    if (T == 2) {
+        float a0 = 0.0, a1 = 0.0;
+        for (int bi = lane; bi < ntb; bi += 64) {
+            int blk = bi / 26;
+            int off = bi - blk * 26;
+            uint raw = block_byte(row, bpr, blk, off);
+            uint dlo = block_byte(row, bpr, blk, 26);
+            uint dhi = block_byte(row, bpr, blk, 27);
+            float s = unpackHalf2x16(dlo | (dhi << 8)).x;
+            int base = blk << 7;
+            uint pk = tl[raw];
+            float s0 = 0.0, s1 = 0.0;
+            int nlo = (off < 24) ? 5 : 4;
+            int xbase = (off < 16) ? (base + off)
+                      : (off < 24) ? (base + 80 + (off - 16))
+                      :              (base + 120 + (off - 24));
+            int stride = (off < 16) ? 16 : (off < 24) ? 8 : 2;
+            for (int d = 0; d < nlo; ++d) {
+                float w = float(int((pk >> (2 * d)) & 3u) - 1);
+                int xi = xbase + d * stride;
+                s0 += w * x[xi];
+                s1 += w * x[pc.xstride + xi];
+            }
+            a0 += s * s0;
+            a1 += s * s1;
+        }
+        acc[0] = a0; acc[1] = a1;
+    } else {
+        for (int bi = lane; bi < ntb; bi += 64) {
+            int blk = bi / 26;
+            int off = bi - blk * 26;
+            uint raw = block_byte(row, bpr, blk, off);
+            uint dlo = block_byte(row, bpr, blk, 26);
+            uint dhi = block_byte(row, bpr, blk, 27);
+            float s = unpackHalf2x16(dlo | (dhi << 8)).x;
+            int base = blk << 7;
+            uint pk = tl[raw];
+            int nlo = (off < 24) ? 5 : 4;
+            int xbase = (off < 16) ? (base + off)
+                      : (off < 24) ? (base + 80 + (off - 16))
+                      :              (base + 120 + (off - 24));
+            int stride = (off < 16) ? 16 : (off < 24) ? 8 : 2;
+            for (int d = 0; d < nlo; ++d) {
+                float w = float(int((pk >> (2 * d)) & 3u) - 1) * s;
+                int xi = xbase + d * stride;
+                for (int t = 0; t < T && t < 4; ++t) acc[t] += w * x[t * pc.xstride + xi];
+            }
         }
     }
     for (int t = 0; t < T && t < 4; ++t) sh[t][lane] = acc[t];
