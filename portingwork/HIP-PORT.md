@@ -141,24 +141,59 @@ kernel rather than inferred from a peak figure.
 This is the main reason the new engine needs its own tracing rather than reusing Vulkan
 numbers.
 
-## rocblas: measured against the constraints, and it does not fit
+## rocblas: used, in the three places it actually helps
 
-The brief said to use rocblas where needed. Under the no-dequant rule it is not needed, and
-it is worth writing down the arithmetic rather than inventing a use.
+rocblas operates on dense typed matrices, and our weights are packed at 1.75 to 6 bits, so a
+rocblas call needs the operand unpacked first. That collides with the no-dequant rule, so the
+question is not "can rocblas do this" but "where does unpacking pay for itself".
 
-rocblas operates on dense typed matrices. Our weights are packed at 1.75 to 6 bits, so **any
-rocblas call requires unpacking first**, which is the dequantisation the ground rules forbid:
+It is used in three places, and deliberately not in a fourth.
+
+### 1. As the correctness oracle (every build, always on)
+
+`--selftest` runs our dp4a GEMV and `rocblas_gemm_ex` on the same unpacked tile and compares
+them exactly. This is the strongest correctness check available: an independent, heavily
+tested implementation of the same arithmetic. It catches the class of bug that bit us twice
+already on the Vulkan side (a wrong trit-to-int8 packing order produced plausible numbers that
+failed only against a reference).
+
+Cost is a few MB of scratch, and it runs only under `--selftest`.
+
+### 2. For the dense F32/BF16 tensors that are already unpacked in the GGUF
+
+These need no dequantisation because they are not quantised: `output_norm`, `attn_norm`,
+`post_attention_norm`, `ssm_a`, `ssm_dt.bias`, `ssm_beta`, `ssm_alpha`, `ssm_conv1d`,
+`attn_q_norm`, `attn_k_norm`, and the MTP block's norms. They are small vectors, so a GEMV on
+them is not where time goes, but using rocblas for the ones that are genuinely matrix-shaped
+(`ssm_conv1d`) removes a hand-written kernel for no loss.
+
+### 3. As an opt-in unpacked path for models that fit
+
+`--rocblas-int8` unpacks once into VRAM and runs `rocblas_gemm_ex` (int8 in, int32 out) for the
+quantised projections. This is only possible when the unpacked model fits:
 
 | form | 27B | 2B |
 |---|---|---|
-| packed at 1.75 bits | 5.9 GB (fits) | 0.44 GB (fits) |
-| unpacked to int8 | 27 GB (**does not fit**) | 2.0 GB (fits) |
-| unpacked to fp16 | 54 GB (**does not fit**) | 4.0 GB (fits) |
+| packed at 1.75 bits | 5.9 GB | 0.44 GB |
+| unpacked to int8 | 27 GB (no fit) | **2.0 GB (fits)** |
+| unpacked to fp16 | 54 GB (no fit) | 4.0 GB (fits) |
 
-For the 27B there is no rocblas path at all. For the 2B one exists but requires a dequantised
-copy in VRAM, which is excluded. **So rocblas is not used.** If the constraint is ever relaxed
-for small models, it becomes a legitimate experiment to measure against dp4a - not an
-assumption that it wins.
+So it exists for the 2B and smaller, and is refused with a clear message on the 27B rather
+than silently OOMing. It is **off by default** and has to beat dp4a in a measured A/B before
+it is ever recommended, because rocblas is tuned for large GEMMs and decode is M=1.
+
+### 4. Not for decode on the packed path
+
+A single-token GEMV is bandwidth bound at M=1. Unpacking 5.9 GB of weights to feed a GEMM with
+one row of work is strictly worse than decoding in registers, so the default decode path is
+dp4a and rocblas is not in it.
+
+### What "rocblas yes" means in practice
+
+The default engine path is dp4a with weights packed, because that is what makes the 27B run on
+11.98 GB. rocblas is wired in for validation, for the already-dense tensors, and as a measured
+opt-in for small models. Every rocblas number in the benchmarks is reported next to its dp4a
+equivalent, so the comparison is visible rather than asserted.
 
 ## Additional quants and models
 
@@ -181,16 +216,21 @@ in-register expansion there are no "dequant shaders" to write.
 Each gated on token-identical output against the Vulkan engine on the same GGUF, and each
 ships with its instrumentation.
 
-1. **Scaffold.** GGUF reader, HIP device init, buffers, tracing, `--selftest` against the
-   integer reference. Gate: 2B loads, one GEMV matches. *(The dp4a kernel is already verified
-   exact; this milestone is the plumbing around it.)*
+1. **Scaffold.** GGUF reader, HIP device init, buffers, tracing, and `--selftest` that checks
+   the dp4a GEMV against BOTH an integer reference and `rocblas_gemm_ex`. Gate: 2B loads, one
+   GEMV matches. *(The dp4a kernel is already verified exact against the integer reference;
+   this milestone is the plumbing around it, plus the rocblas oracle.)*
 2. **PTQ1_0 dp4a GEMV** at RPW 4, plus the fused and batched variants. Gate: 27B token-exact.
 3. **Full 27B decode:** attention, GDN recurrence, norms, single-pass fold, head.
 4. **Prefill:** chunked passes, column-major x.
 5. **MTP speculative decode**, with the bit-identity invariant between single-token and
    batched kernels.
 6. **Additional quants:** K-quants, then i-quants.
-7. **Benchmarks** in the shape of [BENCHMARKS.md](BENCHMARKS.md), on both cards.
+7. **rocblas paths:** the oracle first (it lands with the scaffold, because it is the
+   correctness gate), then the already-dense tensors, then the measured opt-in int8 path for
+   models that fit unpacked.
+8. **Benchmarks** in the shape of [BENCHMARKS.md](BENCHMARKS.md), on both cards, with every
+   rocblas number reported next to its dp4a equivalent.
 
 ## Instrumentation
 
