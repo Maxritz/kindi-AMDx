@@ -83,6 +83,37 @@ I first concluded from that table that the barrier cost was dominated by the sma
 shaders. **That was wrong, and the experiment that disproved it is below.** Barrier cost
 scales with the work in flight at the barrier, not with the barrier's existence.
 
+## The scale is one word, not two bytes: 1.04x
+
+A PTQ1_0 block is 28 bytes, so it always starts at a multiple of 28, and 28 % 4 == 0.
+Byte 26 of the block is therefore always the high half of word `(base/4 + 6)`. The
+scale is one word load and a shift:
+
+```glsl
+int sw = ((row * bpr + blk) * 7) + 6;
+float s = unpackHalf2x16(w[sw] >> 16).x;
+```
+
+instead of two byte loads, two shifts, an or and a mask.
+
+| | us/op | gain |
+|---|---|---|
+| two byte loads (previous) | 535.3 | 1.00x |
+| one word load | **516.0** | **1.04x** |
+
+### A negative that matters: the FMA chain is not the bottleneck
+
+All five digit FMAs accumulate into one scalar, so in principle each waits on the
+previous result. FMA latency on GCN is ~4-6 cycles, which would be 20-30 cycles per
+byte. Unrolling the digit loop and using four independent accumulators to break the
+chain measured **0.98x**: slightly worse.
+
+So the kernel is not latency-stalled. The compiler was already interleaving the loop
+iterations, and the cost is instruction *issue throughput*. That is consistent with the
+24 instructions per weight derived from the lane-ops bound, and it means there is no
+free win hiding in the scheduling. Anything further has to remove instructions, not
+hide them.
+
 ## A float LUT instead of integer decode: 1.09x
 
 The inner loop turned a byte into five trits with, per trit, a shift, an and, an
