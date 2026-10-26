@@ -99,11 +99,16 @@ Output checked against Prism's `llama-completion`:
 the 2B and 8.6 s for the 27B). Prefill is measured on a 144-token prompt, so 143 tokens
 are actually prefilled.
 
-| Model | Prefill | Prefill (`KINDI_CHUNK=4`) | Token gen | Token gen (`--spec`) |
-|---|---|---|---|---|
-| 2B PTQ1_0 | 39.3 tok/s | 69.0 tok/s | 32-34 tok/s | n/a (no MTP head) |
-| 27B PQ2_0 | 1.71 tok/s | 3.03 tok/s | 1.5 tok/s | n/a (no MTP head) |
-| 27B PTQ1_0 + MTP | 3.75 tok/s | 3.75 tok/s | **5.19 tok/s** | **6.29 tok/s** |
+| Model | Prefill | Token gen | Token gen (`--spec`) |
+|---|---|---|---|
+| 2B PTQ1_0 | **66.5 tok/s** | **36.95 tok/s** | n/a (no MTP head) |
+| 27B PQ2_0 | 3.7 tok/s | 1.62 tok/s | n/a (no MTP head) |
+| 27B PTQ1_0 + MTP | **8.8 tok/s** | **5.19 tok/s** | **6.31 tok/s** |
+| 27B PTQ1_0 + MTP (Q4_0) | 8.8 tok/s | 5.21 tok/s | 6.2 tok/s |
+
+Measured through the server on an 85-token prompt, greedy, 32 tokens generated. Full
+method, per-model limits and the hardware ceilings are in
+[BENCHMARKS.md](portingwork/BENCHMARKS.md).
 
 The 27B PTQ1_0 generation figure is **5.19 tok/s**, and **6.29 with `--spec`**, against
 0.848 when this port started. That is 7.4x, and every step is token-identical.
@@ -131,9 +136,10 @@ this card's 3.09 T lane-ops/s; 8 tok/s would need ~14.
 treatment so it stays ahead of the serial path: one weight decode feeds both tokens, and
 one x load feeds both rows.
 
-Chunked prefill buys 1.76x on the 2B and 1.77x on the 27B. Token generation is not
-affected, because decode is always a single token per pass. It is off by default; set the
-environment variable before running:
+Chunked prefill buys 2.4x on the 27B (3.7 -> 8.8 tok/s prefill) by processing four
+tokens per pass, so one weight decode feeds four multiply-accumulates. Token generation
+is not affected, because decode is always a single token per pass. It is on by default in
+`--serve` mode and off for the CLI; set the environment variable to force it:
 
 ```powershell
 $env:KINDI_CHUNK = 4
