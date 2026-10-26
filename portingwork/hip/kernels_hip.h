@@ -254,11 +254,9 @@ __global__ void deq_emb(const uint* __restrict__ w, const int* __restrict__ tok,
                         int D, int HB, float hbscale)
 {
     extern __shared__ float xs[];   // HB floats
-    int lane = threadIdx.x % warpSize;
-    int ws = warpSize;
-    int nsub = blockDim.x / ws;
-    int sub = threadIdx.x / ws;
-    int blk = blockIdx.x * nsub + sub;      // which HB block of the row
+    // One workgroup per HB block, so every thread is in range and no thread exits
+    // before a __syncthreads().
+    int blk = blockIdx.x;
     int row = tok[0];
     int nblk = D / HB;
     if (blk >= nblk) return;
@@ -282,7 +280,10 @@ __global__ void deq_emb(const uint* __restrict__ w, const int* __restrict__ tok,
         uint q = (raw * p) & 0xFFu;
         int trit = (int)((q * 3u) >> 8);
         float sc = fp16_to_f32(w[((row * bpr + bb) * 7) + 6] >> 16);
-        xs[i] = (float)(trit - 1) * sc * signs[c];
+        // The dequantised weight goes into the transform WITHOUT the signs. The reference
+        // (deq_emb5) applies them after the FWHT: h[e] = signs[e] * (fwht(x)[e] * scale).
+        // Applying them before the transform gives a different, wrong basis.
+        xs[i] = (float)(trit - 1) * sc;
     }
     __syncthreads();
 
@@ -297,7 +298,7 @@ __global__ void deq_emb(const uint* __restrict__ w, const int* __restrict__ tok,
         __syncthreads();
     }
     for (int i = threadIdx.x; i < HB; i += blockDim.x)
-        out[c0 + i] = xs[i] * hbscale;
+        out[c0 + i] = signs[c0 + i] * (xs[i] * hbscale);
 }
 
 // ------------------------------------------------------------------------- rmsfold
@@ -360,116 +361,122 @@ __global__ void rmsfold(const float* __restrict__ x,   // h (residual target)
 }
 
 // ------------------------------------------------------------------------- gdn_gates
-// beta = sigmoid(beta_w^T xn), gate = softplus-ish from alpha/dt/a, per value head.
-// Matches the reference: g = exp(-softplus(a) * dt) with a from alpha*xn, dt from bias.
+// Reference semantics (k_sgdn_gates), one workgroup per value head:
+//   ab = sum_i beta_w[h*D + i] * xn[i]
+//   aa = sum_i alpha_w[h*D + i] * xn[i]
+//   beta[h] = sigmoid(ab)
+//   a  = aa + dt_bias[h]                       <- ADD, not multiply
+//   sp = softplus(a)                           <- softplus of a itself
+//   g[h] = sp * ssm_a[h]                       <- g is a LOG decay; delta does exp(g)
+// GGUF dims for these weights are [D, G], so element (i, h) is at h*D + i.
 __global__ void gdn_gates(const float* __restrict__ xn,
-                          const float* __restrict__ beta_w,   // [D][G]
-                          const float* __restrict__ alpha_w,  // [D][G]
+                          const float* __restrict__ beta_w,   // [G][D]
+                          const float* __restrict__ alpha_w,  // [G][D]
                           const float* __restrict__ dt_bias,  // [G]
                           const float* __restrict__ a_raw,    // [G]
                           float* __restrict__ gb, float* __restrict__ gg,
                           int D, int G)
 {
-    int g = blockIdx.x * blockDim.x + threadIdx.x;
-    if (g >= G) return;
-    float bsum = 0.f, asum = 0.f;
-    for (int e = 0; e < D; ++e) {
-        bsum += xn[e] * beta_w[e * G + g];
-        asum += xn[e] * alpha_w[e * G + g];
+    int h = blockIdx.x;
+    float ab = 0.f, aa = 0.f;
+    const float* bw = beta_w + (size_t)h * D;
+    const float* aw = alpha_w + (size_t)h * D;
+    for (int i = threadIdx.x; i < D; i += blockDim.x) {
+        float x = xn[i];
+        ab += bw[i] * x;
+        aa += aw[i] * x;
     }
-    float beta = 1.f / (1.f + expf(-bsum));
-    float a = asum + a_raw[g];
-    // softplus(a * dt) where dt is the bias term
-    float z = a * dt_bias[g];
-    float sp = (z > 20.f) ? z : log1pf(expf(z));
-    gb[g] = beta;
-    gg[g] = expf(-sp);
+    __shared__ float sb[256], sa[256];
+    sb[threadIdx.x] = ab;
+    sa[threadIdx.x] = aa;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if (threadIdx.x < st) { sb[threadIdx.x] += sb[threadIdx.x + st];
+                                sa[threadIdx.x] += sa[threadIdx.x + st]; }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        gb[h] = 1.f / (1.f + expf(-sb[0]));
+        float a = sa[0] + dt_bias[h];
+        float sp = (a > 20.f) ? a : log1pf(expf(fminf(a, 20.f)));
+        gg[h] = sp * a_raw[h];
+    }
 }
 
 // ------------------------------------------------------------------------- gdn_conv
-// Causal depthwise conv over CONV_CH channels, kernel 4, then SiLU.
-__global__ void gdn_conv(const float* __restrict__ qkv,   // [pos][CONV_CH] history
-                         float* __restrict__ state,        // [3][CONV_CH] rolling history
-                         const float* __restrict__ k,      // [4][CONV_CH]
-                         float* __restrict__ out,          // [CONV_CH]
-                         int CH, int pos)
+// Causal depthwise conv over CONV_CH channels, kernel 4, then SiLU. The weight tensor is
+// [4, CONV_CH], so tap t of channel c is at cw[4*c + t] (dims[0]=4 is the fast axis).
+// `conv` is the rolling three-token history: conv[c], conv[C+c], conv[2C+c].
+__global__ void gdn_conv(const float* __restrict__ qkv,
+                         float* __restrict__ conv,        // [3][CH] rolling history
+                         const float* __restrict__ cw,    // [CH][4]
+                         float* __restrict__ out,         // [CH]
+                         int CH)
 {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= CH) return;
-    float acc = 0.f;
-    for (int t = 0; t < 4; ++t) {
-        // history is the last three tokens plus the current one
-        float v = (t < 3) ? state[t * CH + c] : qkv[c];
-        acc += v * k[t * CH + c];
-    }
-    // roll history: [2] <- [1] <- [0] <- current
-    state[2 * CH + c] = state[1 * CH + c];
-    state[1 * CH + c] = state[0 * CH + c];
-    state[0 * CH + c] = qkv[c];
-    float x = acc;
-    out[c] = x / (1.f + expf(-x));    // SiLU
+    float c0 = conv[c], c1 = conv[CH + c], c2 = conv[2 * CH + c];
+    float nw = qkv[c];
+    float o = c0 * cw[4 * c + 0] + c1 * cw[4 * c + 1]
+            + c2 * cw[4 * c + 2] + nw * cw[4 * c + 3];
+    conv[c] = c1;
+    conv[CH + c] = c2;
+    conv[2 * CH + c] = nw;
+    out[c] = o / (1.f + expf(-o));
 }
 
 // ------------------------------------------------------------------------- l2w
-// L2-normalise each HK-row of q and k in place.
-__global__ void l2w(float* __restrict__ x, int HK, int rows, float eps)
+// L2-normalise `rows` rows of width n from x into out. The value part must stay
+// un-normalised, so this writes to a separate buffer rather than in place.
+__global__ void l2w(const float* __restrict__ x, float* __restrict__ out,
+                    int n, int rows)
 {
     int r = blockIdx.x * blockDim.x + threadIdx.x;
     if (r >= rows) return;
-    float* p = x + (size_t)r * HK;
+    const float* p = x + (size_t)r * n;
     float acc = 0.f;
-    for (int i = 0; i < HK; ++i) acc += p[i] * p[i];
-    float s = 1.f / sqrtf(acc + eps);
-    for (int i = 0; i < HK; ++i) p[i] *= s;
+    for (int i = 0; i < n; ++i) acc += p[i] * p[i];
+    float s = 1.f / fmaxf(sqrtf(acc), 1e-6f);
+    float* o = out + (size_t)r * n;
+    for (int i = 0; i < n; ++i) o[i] = p[i] * s;
 }
 
 // ------------------------------------------------------------------------- gdn_delta
-// The gated delta rule: one dispatch per value head, HK columns.
-//   M  = decay * M + beta * (v - M^T k) k^T        (state, HK x HK)
-//   out = M^T q
-// Matches the reference k_sgdn_delta. q, k, v are HK-wide rows of the l2-normalised
-// conv output; gb is beta, gg the decay.
-__global__ void gdn_delta(float* __restrict__ M,      // [HK][HK] state
-                          const float* __restrict__ qk, // q then k, each NK*HK
-                          const float* __restrict__ v,  // NV*HK
-                          const float* __restrict__ gb,
-                          const float* __restrict__ gg,
-                          float* __restrict__ out,      // NV*HK
+// The gated delta rule, exactly as k_sgdn_delta:
+//   e  = exp(g[h])                       <- g is a log decay
+//   sk = sum_i (M[i][j] * e) * ks[i]
+//   dd = (v[h*HK + j] - sk) * beta[h]
+//   m  = M[i][j] * e + ks[i] * dd ;  M[i][j] = m ;  o += m * qs[i]
+//   out[h*HK + j] = o * scale
+// One workgroup per value head, HK threads. q, k and v are separate pointers because
+// only q and k are L2-normalised; v is the raw conv output.
+__global__ void gdn_delta(float* __restrict__ M,
+                          const float* __restrict__ q,   // [NK][HK] normalised
+                          const float* __restrict__ k,   // [NK][HK] normalised
+                          const float* __restrict__ v,   // [NV][HK] raw
+                          const float* __restrict__ g,   // [NV] log decay
+                          const float* __restrict__ beta,
+                          float* __restrict__ out,
                           int HK, int NV, int NK, float scale)
 {
-    int vh = blockIdx.x;                    // value head
-    int i = threadIdx.x;                    // column within HK
-    if (i >= HK) return;
-    // grouped: value head vh uses key head vh % NK
-    int kh = vh % NK;
-    const float* k = qk + (size_t)(NK * HK) + (size_t)kh * HK;
-    const float* q = qk + (size_t)kh * HK;
-    float* m = M + (size_t)vh * HK * HK;
-    float beta = gb[vh];
-    float decay = gg[vh];
+    int h = blockIdx.x;
+    int j = threadIdx.x;
+    if (j >= HK) return;
+    int kh = h % NK;
+    float e = expf(g[h]);
+    float* Mh = M + (size_t)h * HK * HK;
 
-    // out[i] = sum_j M[j][i] * q[j]   (M stored [row=j][col=i])
-    // and the update needs M^T k, i.e. sum_j M[i][j] * k[j] per row i.
-    // One thread per column i does the column of the update; the row sums need a
-    // reduction, so do it in two passes with a shared scratch of HK floats.
-    extern __shared__ float sh[];
-    float* mk = sh;                          // M^T k, length HK
-    // M^T k: component j = sum_i M[i][j] * k[i]
-    float acc = 0.f;
-    for (int r = 0; r < HK; ++r) acc += m[r * HK + i] * k[r];
-    mk[i] = acc;
-    __syncthreads();
+    float sk = 0.f;
+    for (int i = 0; i < HK; ++i) sk += (Mh[(size_t)i * HK + j] * e) * k[(size_t)kh * HK + i];
+    float dd = (v[(size_t)h * HK + j] - sk) * beta[h];
 
-    // v - M^T k, scaled by beta
-    float vv = v[(size_t)vh * HK + i];
-    float err = (vv - mk[i]) * beta;
-    // M[j][i] = decay * M[j][i] + err * k[j]
-    for (int r = 0; r < HK; ++r) m[r * HK + i] = decay * m[r * HK + i] + err * k[r];
-
-    // out[i] = sum_j M[j][i] * q[j]
     float o = 0.f;
-    for (int r = 0; r < HK; ++r) o += m[r * HK + i] * q[r];
-    out[(size_t)vh * HK + i] = o * scale;
+    for (int i = 0; i < HK; ++i) {
+        float m = Mh[(size_t)i * HK + j] * e + k[(size_t)kh * HK + i] * dd;
+        Mh[(size_t)i * HK + j] = m;
+        o += m * q[(size_t)kh * HK + i];
+    }
+    out[(size_t)h * HK + j] = o * scale;
 }
 
 // ------------------------------------------------------------------------- rmsw
@@ -496,8 +503,7 @@ __global__ void smfold(const float* __restrict__ gate, const float* __restrict__
                        int HB, float hbscale, int C)
 {
     extern __shared__ float xs[];
-    int nsub = blockDim.x / warpSize;
-    int blk = blockIdx.x * nsub + (threadIdx.x / warpSize);
+    int blk = blockIdx.x;
     int nblk = C / HB;
     if (blk >= nblk) return;
     int c0 = blk * HB;
@@ -596,4 +602,72 @@ __global__ void addv(float* __restrict__ a, const float* __restrict__ b, int n)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) a[i] += b[i];
+}
+
+// ------------------------------------------------------------------------- cpq
+// The fused q projection is [q | gate] per head. Copy the q half out.
+__global__ void cpq(const float* __restrict__ qn, float* __restrict__ qr, int HD)
+{
+    int h = blockIdx.x;
+    int i = threadIdx.x;
+    if (i >= HD) return;
+    qr[(size_t)h * HD + i] = qn[(size_t)h * 2 * HD + i];
+}
+
+// ------------------------------------------------------------------------- attn_scores
+// score[h][j] = q[h] . K[j][kvh] * scale, for the G query heads sharing KV head kvh.
+// One block per (kv head, group of 32 positions); 32 threads cover one head's HD.
+__global__ void attn_scores(const float* __restrict__ Kc, const float* __restrict__ q,
+                            float* __restrict__ sc, int n, int NHKV, int G, int HD,
+                            float scale)
+{
+    int kvh = blockIdx.x;
+    int j = blockIdx.y * 32 + threadIdx.x;
+    if (j >= n) return;
+    const float* k = Kc + ((size_t)j * NHKV + kvh) * HD;
+    for (int g = 0; g < G; ++g) {
+        int h = kvh * G + g;
+        const float* qh = q + (size_t)h * HD;
+        // one thread per position computes the whole head's dot product; HD is 256, which
+        // is 256 FMAs per lane. Fine for decode, and it keeps the summation order simple.
+        float acc = 0.f;
+        for (int i = 0; i < HD; ++i) acc += qh[i] * k[i];
+        sc[(size_t)h * n + j] = acc * scale;
+    }
+}
+
+// ------------------------------------------------------------------------- attn_gate
+// att[hh][i] *= sigmoid(gate[hh][i]), where the gate lives in the second half of qn's
+// per-head block.
+__global__ void attn_gate(float* __restrict__ att, const float* __restrict__ qn, int HD)
+{
+    int h = blockIdx.x;
+    int i = threadIdx.x;
+    if (i >= HD) return;
+    float g = qn[(size_t)h * 2 * HD + HD + i];
+    att[(size_t)h * HD + i] *= 1.f / (1.f + expf(-g));
+}
+
+// ------------------------------------------------------------------------- fold_fwht
+// signs, then FWHT, then scale. Same as smfold's tail but from a single input.
+__global__ void fold_fwht(const float* __restrict__ x, const float* __restrict__ signs,
+                          float* __restrict__ out, int HB, float hbscale, int C)
+{
+    extern __shared__ float xs[];
+    int blk = blockIdx.x;
+    int nblk = C / HB;
+    if (blk >= nblk) return;
+    int c0 = blk * HB;
+    for (int i = threadIdx.x; i < HB; i += blockDim.x) xs[i] = signs[c0 + i] * x[c0 + i];
+    __syncthreads();
+    for (int h = 1; h < HB; h <<= 1) {
+        for (int t = threadIdx.x; t < (HB >> 1); t += blockDim.x) {
+            int i = (t / h) * 2 * h + (t % h);
+            float a = xs[i], b = xs[i + h];
+            xs[i] = a + b;
+            xs[i + h] = a - b;
+        }
+        __syncthreads();
+    }
+    for (int i = threadIdx.x; i < HB; i += blockDim.x) out[c0 + i] = xs[i] * hbscale;
 }

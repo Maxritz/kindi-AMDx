@@ -103,6 +103,8 @@ struct Gguf {
     std::map<std::string, double> kf;
     std::vector<std::string> tokens, merges;
     std::vector<int> tok_type;
+    std::vector<float> sign_values;     // prism.hadamard.sign_values
+    std::vector<int> sign_widths;       // prism.hadamard.sign_widths
     const GT* find(const std::string& n) const {
         for (auto& t : tens) if (t.name == n) return &t;
         return nullptr;
@@ -160,6 +162,19 @@ static bool load_gguf(const char* path, Gguf& g) {
             } else if (k == "tokenizer.ggml.merges" && et == 8) {
                 g.merges.reserve((size_t)n);
                 for (uint64_t j = 0; j < n && r.ok; ++j) g.merges.push_back(r.str());
+            } else if (k == "prism.hadamard.sign_values" && (et == 4 || et == 5 || et == 6)) {
+                // The values are +1/-1 and the file stores them as INTEGERS, not floats.
+                // Testing for et == 6 (FLOAT32) silently skipped the array and the fold
+                // then had no signs at all.
+                g.sign_values.reserve((size_t)n);
+                for (uint64_t j = 0; j < n && r.ok; ++j) {
+                    if (et == 6) g.sign_values.push_back(r.rd<float>());
+                    else if (et == 5) g.sign_values.push_back((float)r.rd<int32_t>());
+                    else g.sign_values.push_back((float)r.rd<uint32_t>());
+                }
+            } else if (k == "prism.hadamard.sign_widths" && (et == 4 || et == 5)) {
+                g.sign_widths.reserve((size_t)n);
+                for (uint64_t j = 0; j < n && r.ok; ++j) g.sign_widths.push_back((int)r.rd<uint32_t>());
             } else if (k == "tokenizer.ggml.token_type" && (et == 4 || et == 5)) {
                 g.tok_type.reserve((size_t)n);
                 for (uint64_t j = 0; j < n && r.ok; ++j) g.tok_type.push_back((int)r.rd<uint32_t>());
@@ -330,10 +345,12 @@ struct Model {
     std::map<std::string, Buf> w;      // packed weights
     std::map<std::string, std::pair<int,int>> rc;
     std::map<std::string, Buf> f32;    // dense tensors
-    std::vector<float> signs;
-    std::map<int, std::vector<float>> sign_by_width;
-    std::vector<int> sign_widths;
-    std::vector<float> cosv, sinv;
+    // Hadamard signs are stored as one flat list plus a list of widths. A layer's fold
+    // needs the signs for its own width: D for the norms, NFF for the FFN SwiGLU,
+    // NV*HK for the GDN SwiGLU, NH*HD for the attention output. On the 2B three of those
+    // are the same width, but the 27B has NFF=17408 and NV*HK=6144, so they cannot share.
+    std::map<int, Buf> signbuf;
+    float hbscale = 1.0f;
 };
 
 static void initdev() {
@@ -534,10 +551,168 @@ int main(int argc, char** argv) {
         return gemv_ok ? 0 : 1;
     }
 
-    fprintf(stderr, "\nthis build has the GGUF reader, the tokenizer and the RDNA2 kernels.\n"
-                    "the decode graph wiring is in progress; run --selftest --prompt TEXT to\n"
-                    "check loading and tokenisation.\n");
-    (void)ctx; (void)ngen; (void)temp;
+    // ============================================================ tensor upload
+    // PTQ1_0 stays packed (28 bytes per 128 weights) and F32 stays F32. Nothing is
+    // widened: a 27B at 1.75 bits is 5.9 GB and fits; at 8 bits it would be 27 GB and
+    // would not.
+    {
+        size_t packed = 0, dense = 0;
+        for (auto& t : g.tens) {
+            int C = t.dims.empty() ? 0 : (int)t.dims[0];
+            int R = 1;
+            for (size_t i = 1; i < t.dims.size(); ++i) R *= (int)t.dims[i];
+            const uint8_t* src = g.base + g.data_start + t.off;
+            if (t.type == T_PTQ1_0) {
+                if (C % 128) { fprintf(stderr, "PTQ1_0 %s: C=%d not a multiple of 128\n", t.name.c_str(), C); return 1; }
+                size_t nb = (size_t)R * (C >> 7) * 28;
+                Buf b = mkbuf(nb);
+                upload(&b, src, nb);
+                m.w[t.name] = b; m.rc[t.name] = {R, C};
+                packed += nb;
+            } else if (t.type == T_F32) {
+                size_t nb = (size_t)R * C * 4;
+                Buf b = mkbuf(nb);
+                upload(&b, src, nb);
+                m.f32[t.name] = b;
+                if (t.dims.size() == 1) m.rc[t.name] = {R, C};
+                dense += nb;
+            } else {
+                fprintf(stderr, "unsupported tensor format %s on %s\n",
+                        tn(t.type), t.name.c_str());
+                return 1;
+            }
+        }
+        fprintf(stderr, "weights : %.2f GB packed + %.2f GB dense = %.2f GB\n",
+                packed / 1073741824.0, dense / 1073741824.0,
+                (packed + dense) / 1073741824.0);
+    }
+
+    // ---- Hadamard signs, one buffer per width
+    m.hbscale = 1.0f / sqrtf((float)m.HB);
+    {
+        if (g.sign_widths.empty() || g.sign_values.empty()) {
+            fprintf(stderr, "no prism.hadamard signs in this GGUF; the fold cannot be applied\n");
+            return 1;
+        }
+        size_t off = 0;
+        for (int w : g.sign_widths) {
+            if (off + (size_t)w > g.sign_values.size()) { fprintf(stderr, "sign array too short\n"); return 1; }
+            Buf b = mkbuf((size_t)w * 4);
+            upload(&b, g.sign_values.data() + off, (size_t)w * 4);
+            m.signbuf[w] = b;
+            off += (size_t)w;
+        }
+        fprintf(stderr, "signs  : %zu values across %zu widths\n",
+                g.sign_values.size(), g.sign_widths.size());
+    }
+    auto sgn = [&](int width) -> Buf& {
+        auto it = m.signbuf.find(width);
+        if (it == m.signbuf.end()) {
+            fprintf(stderr, "no Hadamard signs for width %d\n", width);
+            exit(1);
+        }
+        return it->second;
+    };
+
+    // ============================================================ buffers
+    // windows.h defines min/max as macros, which breaks std::max even with <algorithm>
+    // included. Explicit comparisons, same as the Vulkan engine does.
+    int work = (m.D > m.NFF) ? m.D : m.NFF;
+    if (m.NV * m.HK > work) work = m.NV * m.HK;
+    Buf h = mkbuf((size_t)m.D * 4), xn = mkbuf((size_t)m.D * 4);
+    Buf xp = mkbuf((size_t)work * 4), yD = mkbuf((size_t)m.D * 4);
+    Buf qkv = mkbuf((size_t)m.CONV_CH * 4), cs = mkbuf((size_t)m.CONV_CH * 4);
+    Buf qkbuf = mkbuf((size_t)2 * m.NK * m.HK * 4);   // l2-normalised q and k
+    Buf gb = mkbuf((size_t)m.NV * 4), gg = mkbuf((size_t)m.NV * 4);
+    Buf gout = mkbuf((size_t)m.NV * m.HK * 4), outgdn = mkbuf((size_t)m.NV * m.HK * 4);
+    Buf zv = mkbuf((size_t)m.NV * m.HK * 4);
+    Buf qn = mkbuf((size_t)m.NH * 2 * m.HD * 4), qr = mkbuf((size_t)m.NH * m.HD * 4);
+    Buf kro = mkbuf((size_t)m.NHKV * m.HD * 4), kn = mkbuf((size_t)m.NHKV * m.HD * 4);
+    Buf fo = mkbuf((size_t)m.NH * m.HD * 4), qkvbuf = mkbuf((size_t)m.NHKV * m.HD * 4);
+    Buf sbuf = mkbuf((size_t)m.NH * ctx * 4), att = mkbuf((size_t)m.NH * m.HD * 4);
+    Buf ffg = mkbuf((size_t)m.NFF * 4), ffu = mkbuf((size_t)m.NFF * 4), fo6 = mkbuf((size_t)m.NFF * 4);
+    Buf logits = mkbuf((size_t)m.VOCAB * 4), argout = mkbuf(4), token_d = mkbuf(4);
+    Buf cosB = mkbuf((size_t)ctx * m.nrot * 4), sinB = mkbuf((size_t)ctx * m.nrot * 4);
+
+    std::vector<Buf> M, convst, Kc, Vc;
+    for (int i = 0; i < m.NL; ++i) {
+        M.push_back(mkbuf((size_t)m.NV * m.HK * m.HK * 4));
+        convst.push_back(mkbuf((size_t)3 * m.CONV_CH * 4));
+    }
+    for (int i = 0; i < m.NATT; ++i) {
+        Kc.push_back(mkbuf((size_t)ctx * m.NHKV * m.HD * 4));
+        Vc.push_back(mkbuf((size_t)ctx * m.NHKV * m.HD * 4));
+    }
+    for (auto& b : M) fillzero(b);
+    for (auto& b : convst) fillzero(b);
+    for (auto& b : Kc) fillzero(b);
+    for (auto& b : Vc) fillzero(b);
+
+    // rope tables
+    {
+        std::vector<float> cv((size_t)ctx * m.nrot), sv((size_t)ctx * m.nrot);
+        for (int p = 0; p < ctx; ++p)
+            for (int i = 0; i < m.nrot; ++i) {
+                double th = (double)p * pow((double)m.rope_base, -2.0 * i / (double)(m.nrot * 2));
+                cv[(size_t)p * m.nrot + i] = (float)cos(th);
+                sv[(size_t)p * m.nrot + i] = (float)sin(th);
+            }
+        upload(&cosB, cv.data(), cv.size() * 4);
+        upload(&sinB, sv.data(), sv.size() * 4);
+    }
+    fprintf(stderr, "buffers: %.2f GB (states + KV for ctx %d)\n", g_alloc_total / 1073741824.0, ctx);
+
+    // ---- the head. The 2B ties it to token_embd, which is Hadamard-folded, so the folded
+    // activation xp is the right input.
+    std::string head_name = m.w.count("output.weight") ? "output.weight" : "token_embd.weight";
+    bool pending = false;
+    fprintf(stderr, "head   : %s\n", head_name.c_str());
+
+#include "graph_hip.h"
+
+    // ============================================================ generate
+    std::vector<int> ids = prompt ? tok.encode(prompt) : std::vector<int>{};
+    if (ids.empty()) ids.push_back(tok.bos >= 0 ? tok.bos : 0);
+    fprintf(stderr, "\nprompt ids (%zu):", ids.size());
+    for (size_t i = 0; i < ids.size() && i < 24; ++i) fprintf(stderr, " %d", ids[i]);
+    fprintf(stderr, "\n");
+
+    double t0 = ktrace::now_us();
+    // prefill: every prompt token but the last
+    for (size_t i = 0; i + 1 < ids.size(); ++i) {
+        int tk = ids[i];
+        upload(&token_d, &tk, 4);
+        body(tk, (int)i);
+    }
+    double t1 = ktrace::now_us();
+    fprintf(stderr, "prefill: %zu tokens in %.0f ms (%.2f tok/s)\n",
+            ids.size() > 0 ? ids.size() - 1 : 0, (t1 - t0) / 1000.0,
+            ids.size() > 1 ? (ids.size() - 1) / ((t1 - t0) / 1e6) : 0.0);
+
+    std::vector<int> out;
+    int pos = (int)ids.size() - 1;
+    int cur = ids.back();
+    double t2 = ktrace::now_us();
+    for (int k = 0; k < ngen; ++k) {
+        int nxt = step(cur, pos);
+        if (nxt == tok.eos) break;
+        out.push_back(nxt);
+        ktrace::accuracy_token(nxt);
+        cur = nxt;
+        pos++;
+        if (pos + 2 >= ctx) break;
+    }
+    double t3 = ktrace::now_us();
+    if (!out.empty())
+        fprintf(stderr, "decode: %zu tokens in %.1f ms = %.3f tok/s (%.1f ms/token)\n",
+                out.size(), (t3 - t2) / 1000.0, out.size() / ((t3 - t2) / 1e6),
+                (t3 - t2) / 1000.0 / out.size());
+
+    fprintf(stderr, "\nGenerated %zu tokens: ", out.size());
+    for (int t : out) fprintf(stderr, "%d ", t);
+    fprintf(stderr, "\nDecoded: %s\n", tok.decode(out).c_str());
+    (void)temp;
+
     ktrace::dump();
     ktrace::shutdown();
     return 0;
