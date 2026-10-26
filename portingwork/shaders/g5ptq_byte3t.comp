@@ -1,0 +1,150 @@
+// g5ptq_byte3t.comp - PTQ1_0 5-trit GEMV, up to THREE tensors, FOUR rows/workgroup.
+//
+// Combines the two wins that are independently bit-identical to g5ptq_byte:
+//   - fusion of up to three tensors sharing one input (removes the dispatch and the
+//     COMPUTE->COMPUTE barrier between them)
+//   - 4 rows per 256-thread workgroup (4x fewer workgroups to schedule, LUT build
+//     amortised across four waves)
+// and keeps the shared-memory TREE reduction, so the values are bit-identical to
+// g5ptq_byte and the speculative verify guarantee is untouched. A subgroupAdd
+// reduction was measured 1.09x on its own but sums the lane partials in a different
+// order, which is why it is not used here.
+//
+// The tensor branch is taken once per wave, not per byte: three-way dynamic buffer
+// selection in the inner loop cost 772 us/op against 563 in an earlier attempt.
+//
+// Row space is the concatenation [0,R0) + [R0,R0+R1) + [R0+R1,R0+R1+R2).
+//
+// PTQ1_0 block = 128 weights in 28 bytes: 26 trit bytes then an fp16 scale at
+// bytes 26..27. Each trit byte carries five base-3 digits (3^5 = 243 < 256):
+//   bytes  0..15 -> trits j, 16+j, 32+j, 48+j, 64+j        (j = 0..15)
+//   bytes 16..23 -> trits 80+j, 88+j, 96+j, 104+j, 112+j   (j = 0..7)
+//   bytes 24..25 -> trits 120+j, 122+j, 124+j, 126+j       (j = 0..1)
+//
+// Push: { int R0; int R1; int R2; int C; }
+// Bindings: 0 W0 1 Y0 2 W1 3 Y1 4 W2 5 Y2 6 X
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer W0B { uint W0[]; };
+layout(set = 0, binding = 1) buffer Y0B { float Y0[]; };
+layout(set = 0, binding = 2) readonly buffer W1B { uint W1[]; };
+layout(set = 0, binding = 3) buffer Y1B { float Y1[]; };
+layout(set = 0, binding = 4) readonly buffer W2B { uint W2[]; };
+layout(set = 0, binding = 5) buffer Y2B { float Y2[]; };
+layout(set = 0, binding = 6) readonly buffer XB { float x[]; };
+
+layout(push_constant) uniform PC { int R0; int R1; int R2; int C; } pc;
+
+shared float sh[4][64];
+// trit-1 as a float, five per byte: 5 KB of LDS, built once per workgroup.
+//
+// This replaces the integer decode in the inner loop. Previously each of the five
+// weights per byte cost (shift, and, int->float, subtract 1) before its FMA, about
+// 25 integer/convert ops per byte. With the table the loop is one LDS load and one
+// FMA per weight, which measured 1.09x on the 27B. The arithmetic is identical (the
+// same float values in the same order), so the tokens are unchanged.
+//
+// A vec4-padded variant (two 32-byte-aligned vec4 loads) was measured at 0.98x, so
+// scalar loads are kept: the padded form hits LDS bank conflicts.
+shared float tlf[1280];
+
+const uint P3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
+
+// One row of one tensor. `W` must be statically known at the call site.
+#define DECODE_ROW(W, ROW, BPR, NTB)                                        \
+    float acc = 0.0;                                                        \
+    for (int bi = int(lane); bi < (NTB); bi += int(sgsz)) {                 \
+        int blk = bi / 26;                                                  \
+        int off = bi - blk * 26;                                            \
+        int w0 = ((ROW) * (BPR) + blk) * 28 + off;                          \
+        uint raw = (W[w0 >> 2] >> (8u * uint(w0 & 3))) & 0xFFu;             \
+        int s0 = ((ROW) * (BPR) + blk) * 28 + 26;                           \
+        uint dlo = (W[s0 >> 2] >> (8u * uint(s0 & 3))) & 0xFFu;             \
+        uint dhi = (W[(s0 + 1) >> 2] >> (8u * uint((s0 + 1) & 3))) & 0xFFu; \
+        float s = unpackHalf2x16(dlo | (dhi << 8)).x;                       \
+        int base = blk << 7;                                                \
+        int b5 = int(raw) * 5;                                                  \
+        float sub = 0.0;                                                    \
+        if (off < 16) {                                                     \
+            for (int n = 0; n < 5; ++n) {                                   \
+                                        \
+                sub += tlf[b5 + n] * x[base + off + (n << 4)];            \
+            }                                                               \
+        } else if (off < 24) {                                              \
+            int j = off - 16;                                               \
+            for (int n = 0; n < 5; ++n) {                                   \
+                                        \
+                sub += tlf[b5 + n] * x[base + 80 + j + (n << 3)];         \
+            }                                                               \
+        } else {                                                            \
+            int j = off - 24;                                               \
+            for (int n = 0; n < 4; ++n) {                                   \
+                                        \
+                sub += tlf[b5 + n] * x[base + 120 + (n << 1) + j];        \
+            }                                                               \
+        }                                                                   \
+        acc += s * sub;                                                     \
+    }
+
+// Tree reduction per row, identical arithmetic to g5ptq_byte.
+//
+// Every wave in the workgroup must reach every barrier(), so a wave whose row is
+// out of range still runs the reduction; only the store is suppressed. Returning
+// early here would leave the other waves' barrier() undefined.
+#define REDUCE_STORE(Y, ROW, OK)                                            \
+    sh[sub][lane] = acc;                                                    \
+    barrier();                                                              \
+    for (int st = 32; st > 0; st >>= 1) {                                   \
+        if (int(lane) < st) sh[sub][lane] += sh[sub][lane + st];            \
+        barrier();                                                          \
+    }                                                                       \
+    if (lane == 0u && (OK)) (Y)[ROW] = sh[sub][0];
+
+void main() {
+    int sub   = int(gl_SubgroupID);
+    uint lane = gl_SubgroupInvocationID;
+    uint sgsz = gl_SubgroupSize;
+    uint nsub = uint(gl_WorkGroupSize.x) / sgsz;
+    int gid = int(gl_WorkGroupID.x) * int(nsub) + sub;
+
+    // byte -> 5 trit floats, one entry per thread
+    {
+        uint b = uint(gl_LocalInvocationID.x);
+        for (int n = 0; n < 5; ++n) {
+            uint tr = (((b * P3[n]) & 0xFFu) * 3u) >> 8;
+            tlf[b * 5 + n] = float(int(tr) - 1);
+        }
+    }
+    barrier();
+
+    int R0 = pc.R0, R1 = pc.R1, R2 = pc.R2;
+    int C = pc.C;
+    int bpr = C >> 7;
+    int ntb = bpr * 26;
+
+    int total = R0 + R1 + R2;
+    bool ok = gid < total;
+
+    // One branch per wave, then a statically-known weight buffer. The row is
+    // clamped so an out-of-range wave still does the same work and the same
+    // barriers, and only its store is dropped.
+    int t, row;
+    if (gid < R0)          { t = 0; row = gid; }
+    else if (gid < R0 + R1){ t = 1; row = gid - R0; }
+    else                   { t = 2; row = gid - R0 - R1; }
+    if (!ok) { t = 0; row = 0; }
+
+    if (t == 0) {
+        DECODE_ROW(W0, row, bpr, ntb)
+        REDUCE_STORE(Y0, row, ok)
+    } else if (t == 1) {
+        DECODE_ROW(W1, row, bpr, ntb)
+        REDUCE_STORE(Y1, row, ok)
+    } else {
+        DECODE_ROW(W2, row, bpr, ntb)
+        REDUCE_STORE(Y2, row, ok)
+    }
+}

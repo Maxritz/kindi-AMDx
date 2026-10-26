@@ -1,0 +1,121 @@
+// g5ptq_byte4t.comp - PTQ1_0 5-trit GEMV, FOUR rows per workgroup, TREE reduction.
+//
+// Same decode as g5ptq_byte (byte-granular, 5 weights per byte, shared byte->trit
+// LUT, scale hoisted per byte) and the SAME shared-memory tree reduction, but four
+// 64-wide waves share one 256-thread workgroup so each wave owns one output row.
+//
+// Why the tree is kept: an earlier 4-row variant used subgroupAdd and measured 1.09x,
+// but a butterfly reduction sums the 64 lane partials in a different order than the
+// tree, so it is not bit-identical to g5ptqM and the speculative verify pass could
+// pick a different token on a near-tie. Keeping the tree per row means this shader
+// produces exactly the values g5ptq_byte does, which --selftest asserts at 0.000e+00.
+//
+// The gain, if any, is purely from geometry: 4 rows per workgroup means 4x fewer
+// workgroups to schedule (1280 instead of 5120 for a 5120-row matrix), and the
+// byte->trit LUT build is amortised across four waves instead of one.
+//
+// PTQ1_0 block = 128 weights in 28 bytes: 26 trit bytes then an fp16 scale at
+// bytes 26..27. Each trit byte carries five base-3 digits (3^5 = 243 < 256):
+//   bytes  0..15 -> trits j, 16+j, 32+j, 48+j, 64+j        (j = 0..15)
+//   bytes 16..23 -> trits 80+j, 88+j, 96+j, 104+j, 112+j   (j = 0..7)
+//   bytes 24..25 -> trits 120+j, 122+j, 124+j, 126+j       (j = 0..1)
+//
+// Push: { int R; int C; }
+// Bindings: 0 raw blocks as uint words, 1 x (float), 2 out (float)
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer BW { uint w[]; };
+layout(set = 0, binding = 1) readonly buffer BX { float x[]; };
+layout(set = 0, binding = 2) buffer BO { float out_[]; };
+
+layout(push_constant) uniform PC { int R; int C; } pc;
+
+shared float sh[4][64];
+// trit-1 as a float, five per byte: 5 KB of LDS, built once per workgroup.
+//
+// This replaces the integer decode in the inner loop. Previously each of the five
+// weights per byte cost (shift, and, int->float, subtract 1) before its FMA, about
+// 25 integer/convert ops per byte. With the table the loop is one LDS load and one
+// FMA per weight, which measured 1.09x on the 27B. The arithmetic is identical (the
+// same float values in the same order), so the tokens are unchanged.
+//
+// A vec4-padded variant (two 32-byte-aligned vec4 loads) was measured at 0.98x, so
+// scalar loads are kept: the padded form hits LDS bank conflicts.
+shared float tlf[1280];
+
+const uint P3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
+
+uint block_byte(int row, int bpr, int blk, int byteInBlk) {
+    int bi = (row * bpr + blk) * 28 + byteInBlk;
+    return (w[bi >> 2] >> (8u * uint(bi & 3))) & 0xFFu;
+}
+
+void main() {
+    uint sgsz = gl_SubgroupSize;                 // 64 on gfx803
+    uint nsub = uint(gl_WorkGroupSize.x) / sgsz; // 4
+    int sub = int(gl_SubgroupID);
+    int row = int(gl_WorkGroupID.x) * int(nsub) + sub;
+    int R = pc.R;
+
+    // byte -> 5 trit floats, one entry per thread
+    {
+        uint b = uint(gl_LocalInvocationID.x);
+        for (int n = 0; n < 5; ++n) {
+            uint tr = (((b * P3[n]) & 0xFFu) * 3u) >> 8;
+            tlf[b * 5 + n] = float(int(tr) - 1);
+        }
+    }
+    barrier();
+    // Every invocation in the workgroup must reach every barrier(), so an
+    // out-of-range row is clamped and only its store is dropped. Returning
+    // early here would leave the other waves barrier() undefined.
+    bool ok = row < R;
+    if (!ok) row = 0;
+
+    uint lane = gl_SubgroupInvocationID;
+    int C = pc.C;
+    int bpr = C >> 7;
+    int ntb = bpr * 26;
+
+    float acc = 0.0;
+    for (int bi = int(lane); bi < ntb; bi += int(sgsz)) {
+        int blk = bi / 26;
+        int off = bi - blk * 26;
+        uint raw = block_byte(row, bpr, blk, off);
+        uint dlo = block_byte(row, bpr, blk, 26);
+        uint dhi = block_byte(row, bpr, blk, 27);
+        float s = unpackHalf2x16(dlo | (dhi << 8)).x;
+        int base = blk << 7;
+        int b5 = int(raw) * 5;
+
+        float subacc = 0.0;
+        if (off < 16) {                    // five digits, stride 16
+            for (int n = 0; n < 5; ++n) {
+                                subacc += tlf[b5 + n] * x[base + off + (n << 4)];
+            }
+        } else if (off < 24) {             // five digits, stride 8, from trit 80
+            int j = off - 16;
+            for (int n = 0; n < 5; ++n) {
+                                subacc += tlf[b5 + n] * x[base + 80 + j + (n << 3)];
+            }
+        } else {                           // four digits, from trit 120
+            int j = off - 24;
+            for (int n = 0; n < 4; ++n) {
+                                subacc += tlf[b5 + n] * x[base + 120 + (n << 1) + j];
+            }
+        }
+        acc += s * subacc;
+    }
+
+    // Tree reduction, per row, identical arithmetic to g5ptq_byte.
+    sh[sub][lane] = acc;
+    barrier();
+    for (int st = 32; st > 0; st >>= 1) {
+        if (int(lane) < st) sh[sub][lane] += sh[sub][lane + st];
+        barrier();
+    }
+    if (lane == 0u && ok) out_[row] = sh[sub][0];
+}

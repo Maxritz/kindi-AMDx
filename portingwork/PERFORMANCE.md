@@ -83,6 +83,58 @@ I first concluded from that table that the barrier cost was dominated by the sma
 shaders. **That was wrong, and the experiment that disproved it is below.** Barrier cost
 scales with the work in flight at the barrier, not with the barrier's existence.
 
+## A float LUT instead of integer decode: 1.09x
+
+The inner loop turned a byte into five trits with, per trit, a shift, an and, an
+int-to-float convert and a subtract before the FMA. Storing the already-converted
+float in LDS removes all of it: the loop becomes one LDS load and one FMA per weight.
+
+| variant | us/op | gain |
+|---|---|---|
+| integer decode, 5 packed trits in one uint | 581.9 | 1.00x |
+| `float` LUT, 5 floats per byte (5 KB LDS) | **535.8** | **1.09x** |
+| `float` LUT padded to 8, two vec4 loads | 595.4 | 0.98x |
+
+The vec4 variant is slower because the padded stride hits LDS bank conflicts, so
+scalar loads are kept. The arithmetic is identical, so tokens are unchanged, and the
+same table is used by both the single-tensor and the fused kernel.
+
+End to end: 3.586 -> **3.752 tok/s** serial, device 4340 -> 4053 ms.
+
+Also tried and rejected: `bitfieldExtract` in place of shift+and, which measured
+1.00x (no gain, and the naive form sign-extends when the packed value has bit 31 set).
+
+## Tiling: 4 rows per workgroup, 1.07x, bit-identical
+
+The GEMV launched one 64-thread workgroup per output row, so a 5120-row matrix meant
+5120 workgroups. Putting four rows in one 256-thread workgroup, one wave per row,
+cuts that 4x and amortises the byte-to-trit LUT build across four waves instead of one.
+
+| kernel | 1 row/WG | 4 rows/WG | gain |
+|---|---|---|---|
+| `g5ptq_byte` (1 tensor) | 609.1 us/op | **568.5 us/op** | 1.07x |
+| `g5ptq_byte3` (3 tensors fused) | 1121.5 us/op | **1045.5 us/op** | 1.07x |
+
+Together with the ffn fusion: wall 5948 -> 5577 ms, **3.362 -> 3.586 tok/s**.
+
+### The reduction was kept as a tree on purpose
+
+An earlier 4-row variant used `subgroupAdd` and measured 1.09x, slightly better than
+the 1.07x here. It is not used. A butterfly reduction sums the 64 lane partials in a
+different order than the shared-memory tree, so it is not bit-identical to `g5ptqM`,
+and the speculative verify pass compares trunk rows across those two kernels. A
+near-tie in the logits could then accept a draft the serial path would have rejected.
+0.02x is not worth that.
+
+### A barrier hazard the first version had
+
+`barrier()` must be reached by every invocation in the workgroup. The first version
+wrote `if (row >= R) return;` before the reduction, which is a whole-wave exit: the
+waves that returned would never reach the barrier that the surviving waves wait on,
+which is undefined behaviour. It happened to work because every 27B row count is
+divisible by 4. The shipped version clamps the row instead and suppresses only the
+store, so all four waves always reach every barrier.
+
 ## Fusing ffn_gate/ffn_up, and why barrier count is the wrong metric
 
 Two more fusions were tried, and they disagree, which is the useful part.
@@ -201,7 +253,7 @@ changes, each measured, each with the tokens checked afterwards:
 | byte-granular decode (5 weights per byte load) | 721.2 | 22.7 | 3.66x |
 | + shared-memory byte-to-trits LUT | 526.9 | 31.1 | 5.02x |
 | + scale read from the block (drops the buffer) | 563.3 | 29.1 | 4.69x |
-| 4 rows per 256-thread workgroup (`KINDI_byte4`) | 485.0 | 33.8 | 5.45x |
+| 4 rows per 256-thread workgroup, tree kept | 568.5 | 30.4 | 4.65x |
 
 End to end on the 27B PTQ1_0 + MTP, 20 tokens, greedy, serial:
 **0.848 -> 3.29 tok/s** (3.88x), tokens byte-identical.
