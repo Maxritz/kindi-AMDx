@@ -1977,7 +1977,12 @@ int main(int argc, char**argv){
         std::vector<Buf> bufs={codebufs[wname],xbuf,outbuf};
         struct{int R,C,T,xstride;}pc{rows,cols,T,xstride};
         const char* g5 = getenv("KINDI_G5");
-        if(g5 && !strcmp(g5,"Mold")){
+        // g5ptqM2r* has exactly two token chains, so it is only valid for T<=2. The
+        // speculative verify pass uses T=2; chunked prefill uses T=4. Sending T=4 to
+        // the 2-token kernel left tokens 2 and 3 uncomputed and prefill emitted
+        // different tokens from the serial path, so anything above 2 falls back to
+        // the generic batched kernel.
+        if(T > 2 || (g5 && !strcmp(g5,"Mold"))){
             bindbufs(pg5M,bufs);
             dispatch(pg5M,G.q0,G.cp,(uint32_t)rows,1,1,&pc,16);
         } else {
