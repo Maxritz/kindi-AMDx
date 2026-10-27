@@ -60,7 +60,7 @@ layout(set = 0, binding = 0) readonly buffer BW { uint w[]; };
 layout(set = 0, binding = 1) readonly buffer BX { float x[]; };
 layout(set = 0, binding = 2) buffer BO { float out_[]; };
 
-layout(push_constant) uniform PC { int R; int C; } pc;
+layout(push_constant) uniform PC { int R; int C; int T; int xs; } pc;
 
 // SLM unused: reduction is subgroupAdd, trits decode inline. Zero shared
 // memory = the Xe-core keeps its full 160 KB L1 for the weight stream.
@@ -100,6 +100,12 @@ void main() {
 
   int R = pc.R;
     int C = pc.C;
+    // Token axis on gl_WorkGroupID.y: T workgroups per row-block share the same
+    // weight stream through L2 (4 MB) while keeping bytenr4's proven 4-chain
+    // lane shape. T=1, xs=C is bit-identical to the original single-token path.
+    int T = pc.T; if (T <= 0) T = 1;
+    int xs = pc.xs; if (xs <= 0) xs = C;
+    int tok = int(gl_WorkGroupID.y);
 
     int row0 = (int(gl_WorkGroupID.x) * int(nsub) + sub) * RPW;
 
@@ -177,7 +183,7 @@ void main() {
 
         if (off < 16) {                    // five digits, stride 16
             for (int n = 0; n < 5; ++n) {
-                float xv = x[base + off + (n << 4)];
+                float xv = x[tok * xs + base + off + (n << 4)];
                 p0 += TRIT(b50, n) * xv;
 #if RPW >= 2
                 p1 += TRIT(b51, n) * xv;
@@ -196,7 +202,7 @@ void main() {
         } else if (off < 24) {             // five digits, stride 8, from trit 80
             int j = off - 16;
             for (int n = 0; n < 5; ++n) {
-                float xv = x[base + 80 + j + (n << 3)];
+                float xv = x[tok * xs + base + 80 + j + (n << 3)];
                 p0 += TRIT(b50, n) * xv;
 #if RPW >= 2
                 p1 += TRIT(b51, n) * xv;
@@ -215,7 +221,7 @@ void main() {
         } else {                           // four digits, from trit 120
             int j = off - 24;
             for (int n = 0; n < 4; ++n) {
-                float xv = x[base + 120 + (n << 1) + j];
+                float xv = x[tok * xs + base + 120 + (n << 1) + j];
                 p0 += TRIT(b50, n) * xv;
 #if RPW >= 2
                 p1 += TRIT(b51, n) * xv;
@@ -264,19 +270,19 @@ void main() {
     acc7 = subgroupAdd(acc7);
 #endif
     if (lane == 0u) {
-        if (k0) out_[r0] = acc0;
+        if (k0) out_[tok * R + r0] = acc0;
 #if RPW >= 2
-        if (k1) out_[r1] = acc1;
+        if (k1) out_[tok * R + r1] = acc1;
 #endif
 #if RPW >= 4
-        if (k2) out_[r2] = acc2;
-        if (k3) out_[r3] = acc3;
+        if (k2) out_[tok * R + r2] = acc2;
+        if (k3) out_[tok * R + r3] = acc3;
 #endif
 #if RPW >= 8
-        if (k4) out_[r4] = acc4;
-        if (k5) out_[r5] = acc5;
-        if (k6) out_[r6] = acc6;
-        if (k7) out_[r7] = acc7;
+        if (k4) out_[tok * R + r4] = acc4;
+        if (k5) out_[tok * R + r5] = acc5;
+        if (k6) out_[tok * R + r6] = acc6;
+        if (k7) out_[tok * R + r7] = acc7;
 #endif
     }
 }

@@ -46,7 +46,15 @@ struct Buf { VkBuffer buf=VK_NULL_HANDLE; VkDeviceMemory mem=VK_NULL_HANDLE; VkD
 // took, which is only known after they are uploaded
 static size_t g_alloc_total = 0;
 static Buf mkbuf(VkDeviceSize sz, VkBufferUsageFlags u, VkMemoryPropertyFlags f){
-    Buf b; b.size=sz; VkBufferCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; ci.size=sz; ci.usage=u | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT; ci.sharingMode=VK_SHARING_MODE_CONCURRENT; uint32_t qf[2]={G.cf,G.tf}; ci.queueFamilyIndexCount=2; ci.pQueueFamilyIndices=qf;
+    Buf b; b.size=sz;
+    // Storage buffers receive vkCmdCopyBuffer uploads (weights, embeddings), so
+    // they must carry TRANSFER_DST or the copy is spec-UB (VUID-vkCmdCopyBuffer-dstBuffer-00120).
+    if(u & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) u |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    // SHADER_DEVICE_ADDRESS was added speculatively but no shader uses device
+    // addresses, and without VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT on every
+    // allocation the usage bit is spec-UB (VUID-vkBindBufferMemory-bufferDeviceAddress-03339).
+    // Removed until buffer-device-address is actually wired into shaders.
+    VkBufferCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; ci.size=sz; ci.usage=u; ci.sharingMode=VK_SHARING_MODE_CONCURRENT; uint32_t qf[2]={G.cf,G.tf}; ci.queueFamilyIndexCount=2; ci.pQueueFamilyIndices=qf;
     VK_CHECK(vkCreateBuffer(G.dev,&ci,nullptr,&b.buf));
     VkMemoryRequirements r; vkGetBufferMemoryRequirements(G.dev,b.buf,&r);
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; ai.allocationSize=r.size; ai.memoryTypeIndex=findmt((uint32_t)r.memoryTypeBits,f);
@@ -60,7 +68,8 @@ static Buf mkbuf(VkDeviceSize sz, VkBufferUsageFlags u, VkMemoryPropertyFlags f)
 // checkpoint) must degrade to "feature off" on an 8 GB card, not kill the server.
 static bool mkbuf_try(VkDeviceSize sz, VkBufferUsageFlags u, VkMemoryPropertyFlags f, Buf& out){
     out = Buf{};
-    VkBufferCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; ci.size=sz; ci.usage=u | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    if(u & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) u |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    VkBufferCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; ci.size=sz; ci.usage=u;
     ci.sharingMode=VK_SHARING_MODE_CONCURRENT;
     uint32_t qf[2]={G.cf,G.tf}; ci.queueFamilyIndexCount=2; ci.pQueueFamilyIndices=qf;
     if(vkCreateBuffer(G.dev,&ci,nullptr,&out.buf)!=VK_SUCCESS){ out=Buf{}; return false; }
@@ -126,7 +135,7 @@ static void initdev(){
     // pQueuePriorities is the WITHIN-family priority (1.0 = already maximum).
     // The hardware scheduling class is separate: VK_KHR_global_priority. Vulkan offers no
     // core/CU-affinity control, so this is the strongest lever for "give compute the GPU".
-    static float qprio = 1.0f;
+    static float qprio[2] = {1.0f, 1.0f};   // one entry per requested queue
     // KINDI_QUEUE_PRIORITY lets the priority request be A/B measured rather than assumed.
     VkQueueGlobalPriorityKHR want_gp = VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR;
     bool gp_pinned=false;
@@ -182,10 +191,15 @@ static void initdev(){
     VkDeviceQueueGlobalPriorityCreateInfoKHR gpqci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR};
     gpqci.globalPriority = want_gp;
     std::vector<VkDeviceQueueCreateInfo> qcis;
-    for(int qi=0;qi<2;++qi){ VkDeviceQueueCreateInfo q{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}; q.queueFamilyIndex=G.cf; q.queueCount=1; q.pQueuePriorities=&qprio;
+    // One VkDeviceQueueCreateInfo per family (VUID-VkDeviceCreateInfo-queueFamilyIndex-02802:
+    // the same family must not be listed twice). The compute family exposes 2 queues,
+    // so queueCount=2 makes both vkGetDeviceQueue indices legal (VUID-vkGetDeviceQueue-queueIndex-00385).
+    {
+        VkDeviceQueueCreateInfo q{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}; q.queueFamilyIndex=G.cf; q.queueCount=2; q.pQueuePriorities=qprio;
         if(have_gp) q.pNext=&gpqci;
-        qcis.push_back(q); }
-    { VkDeviceQueueCreateInfo q{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}; q.queueFamilyIndex=G.tf; q.queueCount=1; q.pQueuePriorities=&qprio; qcis.push_back(q); }
+        qcis.push_back(q);
+    }
+    { VkDeviceQueueCreateInfo q{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}; q.queueFamilyIndex=G.tf; q.queueCount=1; q.pQueuePriorities=qprio; qcis.push_back(q); }
     VkPhysicalDeviceFeatures f{};   // request fp64 only when the device actually has it
     {   // Meteor Lake iGPU reports shaderFloat64=false (no FP64 hardware); RX 580 reports true.
         VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
@@ -272,17 +286,16 @@ static Pipe mkpipe(const char* spv, int nbind, int pushsz){
     {   // Derive the push-constant size from the SPIR-V: the largest
         // OpMemberDecorate <PC> <member> Offset <n> plus one word. Never trust the
         // literal passed in - a short range silently feeds the shader garbage.
+        // Word layout of OpMemberDecorate: [opcode][target][member][decoration][value]
+        // so the decoration enum is code[i+3] (35 = Offset) and the offset value is
+        // code[i+4]. (This scan previously read code[i+2]/code[i+3] - the member
+        // number and the decoration - so the derived size never fired and every
+        // pipeline silently used its literal range; widened pushes then truncated.)
         uint32_t maxoff = 0;
-        for(size_t i=0;i+3<code.size();++i){
-            if(code[i]==71){                       // OpDecorate
-                // OpDecorate target MemberDecorate? handled below via OpMemberDecorate (72)
-            }
-            if(code[i]==72 && i+4<code.size()){    // OpMemberDecorate: target, member, decoration, value
-                uint32_t decoration = code[i+2];
-                if(decoration==35){                // Offset
-                    uint32_t off = code[i+3];
-                    if(off > maxoff) maxoff = off;
-                }
+        for(size_t i=0;i+4<code.size();++i){
+            if(code[i]==72 && code[i+3]==35){    // OpMemberDecorate, Offset
+                uint32_t off = code[i+4];
+                if(off > maxoff) maxoff = off;
             }
         }
         if(maxoff > 0){
@@ -1097,14 +1110,14 @@ Pipe pffn_fused=mkpipe((shdir+"/ffn_fused.comp.spv").c_str(),9,12);
     int g5rpw_eff = g5rpw;
     { const char* e = getenv("KINDI_RPW");
       if (e && *e) { int v = atoi(e); if (v==1||v==2||v==4||v==8) g5rpw_eff = v; } }
-    Pipe pg5nr1=mkpipe((shdir+"/g5ptq_bytenr1.comp.spv").c_str(),3,8);
-    Pipe pg5nr2=mkpipe((shdir+"/g5ptq_bytenr2.comp.spv").c_str(),3,8);
-    Pipe pg5nr4=mkpipe((shdir+"/g5ptq_bytenr4.comp.spv").c_str(),3,8);
-    Pipe pg5nr8=mkpipe((shdir+"/g5ptq_bytenr8.comp.spv").c_str(),3,8);
+    Pipe pg5nr1=mkpipe((shdir+"/g5ptq_bytenr1.comp.spv").c_str(),3,16);
+    Pipe pg5nr2=mkpipe((shdir+"/g5ptq_bytenr2.comp.spv").c_str(),3,16);
+    Pipe pg5nr4=mkpipe((shdir+"/g5ptq_bytenr4.comp.spv").c_str(),3,16);
+    Pipe pg5nr8=mkpipe((shdir+"/g5ptq_bytenr8.comp.spv").c_str(),3,16);
     // Fused 3-tensor variants at the same three widths.
-    Pipe pg53nr1=mkpipe((shdir+"/g5ptq_byte3nr1.comp.spv").c_str(),7,16);
-    Pipe pg53nr2=mkpipe((shdir+"/g5ptq_byte3nr2.comp.spv").c_str(),7,16);
-    Pipe pg53nr4=mkpipe((shdir+"/g5ptq_byte3nr4.comp.spv").c_str(),7,16);
+    Pipe pg53nr1=mkpipe((shdir+"/g5ptq_byte3nr1.comp.spv").c_str(),7,24);
+    Pipe pg53nr2=mkpipe((shdir+"/g5ptq_byte3nr2.comp.spv").c_str(),7,24);
+    Pipe pg53nr4=mkpipe((shdir+"/g5ptq_byte3nr4.comp.spv").c_str(),7,24);
     fprintf(stderr,"PTQ1_0 GEMV: %d row(s) per wave (wave %u%s)\n", g5rpw_eff, g_wave,
             g5rpw_eff != g5rpw ? ", KINDI_RPW override" : "");
     // Speculative-verify kernels: T tokens x RPW rows per wave, one per width.
@@ -1324,13 +1337,13 @@ Buf ffn_ctr=mkbuf(4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST
         if(pq2_names.count(wname)){
             std::vector<Buf> bufs={codebufs[wname],xbuf,outbuf};
             bindbufs(pg2,bufs);
-            struct{int R,C;}pc{rows,cols};
+            struct{int R,C,T,xs;}pc{rows,cols,1,0};   // T=1: the token axis is gy
             dispatch(pg2,G.q0,G.cp,rows,1,1,&pc,8);
             return;
         }
         if(native_names.count(wname)){
             std::vector<Buf> bufs={codebufs[wname],xbuf,outbuf};
-            struct{int R,C;}pc{rows,cols};
+            struct{int R,C,T,xs;}pc{rows,cols,1,0};   // T=1: the token axis is gy
             // Default: byte-granular decode (one load per byte, five weights).
             // KINDI_G5=byte4 selects the 4-rows-per-workgroup shape, which is a
             // further 1.09x but sums the lanes with subgroupAdd instead of the
@@ -1359,7 +1372,7 @@ Buf ffn_ctr=mkbuf(4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST
                 int wg = 256 / (int)g_wave;
                 int per = wg * g5rpw_eff;
                 bindbufs(*P,bufs);
-                dispatch(*P,G.q0,G.cp,(uint32_t)((rows + per - 1) / per),1,1,&pc,8);
+                dispatch(*P,G.q0,G.cp,(uint32_t)((rows + per - 1) / per),1,1,&pc,16);
             }
             return;
         }
@@ -1421,7 +1434,7 @@ Buf ffn_ctr=mkbuf(4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST
             codebufs[ns.size()>1?ns[1]:ns[0]], scalebufs[ns.size()>1?ns[1]:ns[0]], *(os.size()>1?os[1]:os[0]),
             codebufs[ns.size()>2?ns[2]:ns[0]], scalebufs[ns.size()>2?ns[2]:ns[0]], *(os.size()>2?os[2]:os[0]),
             xbuf };
-        struct{int R0,R1,R2,C;}pc{R[0],R[1],R[2],C};
+        struct{int R0,R1,R2,C,T,xs;}pc{R[0],R[1],R[2],C,1,0};
         const char* g4 = getenv("KINDI_G4");
         // g4lut3r (rows per wave) is DISABLED: it produced wrong values. The 2B emitted
         // garbage token ids with it, so the row-space mapping is wrong somewhere. Kept in
@@ -1438,7 +1451,7 @@ Buf ffn_ctr=mkbuf(4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST
             auto grp = [&](int R){ return (R + g5rpw - 1) / g5rpw; };
             int total = grp(R[0]) + grp(R[1]) + grp(R[2]);
             bindbufs(*P,bufs);
-            dispatch(*P,G.q0,G.cp,(uint32_t)((total + wg - 1) / wg),1,1,&pc,16);
+            dispatch(*P,G.q0,G.cp,(uint32_t)((total + wg - 1) / wg),1,1,&pc,24);
         }
         return true;
     };
@@ -1471,7 +1484,7 @@ Buf ffn_ctr=mkbuf(4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST
             codebufs[ns.size()>1?ns[1]:ns[0]], *(os.size()>1?os[1]:os[0]),
             codebufs[ns.size()>2?ns[2]:ns[0]], *(os.size()>2?os[2]:os[0]),
             xbuf };
-        struct{int R0,R1,R2,C;}pc{R[0],R[1],R[2],C};
+        struct{int R0,R1,R2,C,T,xs;}pc{R[0],R[1],R[2],C,1,0};
         const char* g5 = getenv("KINDI_G5");
         if(g5 && !strcmp(g5,"byte3")){
             bindbufs(pg5b3,bufs);
@@ -1487,7 +1500,7 @@ Buf ffn_ctr=mkbuf(4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST
             auto groups = [&](int R){ return (R + g5rpw - 1) / g5rpw; };
             int total = groups(R[0]) + groups(R[1]) + groups(R[2]);
             bindbufs(*P,bufs);
-            dispatch(*P,G.q0,G.cp,(uint32_t)((total + wg - 1) / wg),1,1,&pc,16);
+            dispatch(*P,G.q0,G.cp,(uint32_t)((total + wg - 1) / wg),1,1,&pc,24);
         }
         return true;
     };
@@ -2070,37 +2083,32 @@ Buf ffn_ctr=mkbuf(4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST
     auto gemvM5ptq=[&](const std::string&wname, Buf&xbuf, Buf&outbuf, int T, int xstride, bool colmaj=false)->bool{
         if(T < 1 || T > 4) return false;
         if(!native_names.count(wname)) return false;
+        if(colmaj) return false;   // token-major only: the transposes are gone
         auto it = tinfo.find(wname);
         if(it == tinfo.end()) return false;
         int rows = it->second.first, cols = it->second.second;
         if(xstride<0) xstride=cols;
         std::vector<Buf> bufs={codebufs[wname],xbuf,outbuf};
         struct{int R,C,T,xstride;}pc{rows,cols,T,xstride};
+        // TOKENS ON THE WORKGROUP AXIS: the T-batched kernels (g5ptq_pf2r, g5ptqM)
+        // hold 8 accumulator chains per lane, which drops the Intel driver's SIMD
+        // width and measured 3x SLOWER than running the serial kernel T times
+        // (1244 us/op vs 4x110 us). bytenr keeps its proven 4-chain lane shape and
+        // puts T on gl_WorkGroupID.y: T workgroups per row-block share the same
+        // weight stream through the 4 MB L2. Per-(row,token) FMA order is unchanged,
+        // so the result is bit-identical to the serial path.
         const char* g5 = getenv("KINDI_G5");
-        // Each kernel has a fixed number of token chains, so the token count picks it:
-        //   T=1  g5ptq_bytenr*   (rows per wave, decode)
-        //   T=2  g5ptqM2r*       (2 tokens x 2 rows, speculative verify)
-        //   T=4  g5ptq_pf        (4 token chains, prefill)
-        //   else g5ptqM          (generic fallback)
-        // Sending T=4 to the 2-token kernel left tokens 2 and 3 uncomputed and prefill
-        // emitted different tokens from the serial path.
-        if(T == 4 && colmaj && !(g5 && !strcmp(g5,"Mold"))){
-            // xbuf is column-major [C][T]. g5ptq_pf2r does 2 rows x 4 tokens, so the
-            // workgroup covers 8 rows.
-            bindbufs(pg5pf2,bufs);
-            dispatch(pg5pf2,G.q0,G.cp,(uint32_t)((rows+7)/8),1,1,&pc,16);
-        } else if(T > 2 || (g5 && !strcmp(g5,"Mold"))){
+        if(g5 && !strcmp(g5,"Mold")){
             bindbufs(pg5M,bufs);
             dispatch(pg5M,G.q0,G.cp,(uint32_t)rows,1,1,&pc,16);
-        } else {
-            // Same rows-per-wave selection as the serial kernel, so spec keeps pace
-            // with it instead of falling behind.
-            Pipe* P = (g5rpw == 1) ? &pg5M1 : (g5rpw == 2) ? &pg5M2 : &pg5M4;
-            int wg = 256 / (int)g_wave;
-            int per = wg * g5rpw;
-            bindbufs(*P,bufs);
-            dispatch(*P,G.q0,G.cp,(uint32_t)((rows + per - 1) / per),1,1,&pc,16);
+            return true;
         }
+        Pipe* P = (g5rpw_eff == 1) ? &pg5nr1 : (g5rpw_eff == 2) ? &pg5nr2
+                : (g5rpw_eff == 8) ? &pg5nr8 : &pg5nr4;
+        int wg = 256 / (int)g_wave;
+        int per = wg * g5rpw_eff;
+        bindbufs(*P,bufs);
+        dispatch(*P,G.q0,G.cp,(uint32_t)((rows + per - 1) / per),(uint32_t)T,1,&pc,16);
         return true;
     };
     // Batched GEMV for any supported format: Q8_0, PQ2_0, native 5-trit or 4-trit.
@@ -2257,7 +2265,6 @@ Buf ffn_ctr=mkbuf(4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST
                     struct{int Cc,add,HB,nchunk,stride,ostride;}pc{D,pending,hbArg,D/chunkLen,D,work};
                     dispatch(prmsfoldT,G.q0,G.cp,(uint32_t)(T*pc.nchunk),1,1,&pc,24);
                     for(int t=0;t<T;++t) fold_hi_off(xpT, D, t, work);
-                    xpose_pre(D, T, work);
                     if(pending>0) std::swap(hT,h2T);   // only when a residual was added
                     pending=0;
                 }
@@ -2268,10 +2275,9 @@ Buf ffn_ctr=mkbuf(4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST
                 Buf& Lgg  = cap ? ggL[il]  : ggT;
                 Buf& Lgb  = cap ? gbL[il]  : gbT;
                 {
-                    const bool cm = (T == 4);
-                    Buf& XG = cm ? xpcT : xpT;
-                    if(!gemvT(p+"attn_qkv.weight", XG, Lqkv, T, work, cm)) return false;
-                    if(!gemvT(p+"attn_gate.weight", XG, zvT, T, work, cm)) return false;
+                    // Token-major x (xpT), no transpose: see gemvM5ptq.
+                    if(!gemvT(p+"attn_qkv.weight", xpT, Lqkv, T, work)) return false;
+                    if(!gemvT(p+"attn_gate.weight", xpT, zvT, T, work)) return false;
                 }
                 // gates
                 {
@@ -2318,9 +2324,8 @@ Buf ffn_ctr=mkbuf(4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST
                     struct{int HB,phd,pnk,prep,nchunk,C,stride,ostride;}pc{hbArg,HK,NK,NV/NK,(NV*HK)/chunkLen,NV*HK,NV*HK,work};
                     dispatch(psmfoldT,G.q0,G.cp,(uint32_t)(T*pc.nchunk),1,1,&pc,32);
                     for(int t=0;t<T;++t) fold_hi_off(xpT, NV*HK, t, work);
-                    xpose_pre(NV*HK, T, work);
                 }
-                if(!gemvT(p+"ssm_out.weight", (T == 4) ? xpcT : xpT, yT, T, work, T == 4)) return false;
+                if(!gemvT(p+"ssm_out.weight", xpT, yT, T, work)) return false;
                 pending=1;
             } else {
                 // ---------------- attention layer, per token ----------------
@@ -2353,10 +2358,10 @@ Buf ffn_ctr=mkbuf(4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST
                 pending=0;
             }
             {
-                const bool cm = (T == 4);
-                Buf& XG = cm ? xpcT : xpT;
-                if(!gemvT(p+"ffn_gate.weight", XG, ffgT, T, work, cm)) return false;
-                if(!gemvT(p+"ffn_up.weight", XG, ffuT, T, work, cm)) return false;
+                // Token-major x (xpT) straight into the GEMV: the xpose_pre transpose
+                // existed only to feed pf2r's column-major layout, which is retired.
+                if(!gemvT(p+"ffn_gate.weight", xpT, ffgT, T, work)) return false;
+                if(!gemvT(p+"ffn_up.weight",   xpT, ffuT, T, work)) return false;
             }
             {
                 std::vector<Buf> bufs={ffgT, ffuT, sFb, fo6T};
@@ -2365,9 +2370,8 @@ Buf ffn_ctr=mkbuf(4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST
                 struct{int HB,phd,pnk,prep,nchunk,C,stride,ostride;}pc{hbArg,0,0,0,NFF/chunkLen,NFF,NFF,NFF};
                 dispatch(psmfoldT,G.q0,G.cp,(uint32_t)(T*pc.nchunk),1,1,&pc,32);
                 for(int t=0;t<T;++t) fold_hi_off(fo6T, NFF, t, NFF);
-                xpose_ff(NFF, T, NFF);
             }
-            if(!gemvT(p+"ffn_down.weight", (T == 4) ? fpcT : fo6T, yT, T, NFF, T == 4)) return false;
+            if(!gemvT(p+"ffn_down.weight", fo6T, yT, T, NFF)) return false;
             pending=1;
         }
         return true;
@@ -2644,8 +2648,8 @@ Buf ffn_ctr=mkbuf(4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST
                           : (g5rpw_eff == 8) ? &pg5nr8 : &pg5nr4;
                   int wg = 256 / (int)g_wave, per = wg * g5rpw_eff;
                   bindbufs(*P,b);
-                  struct{int R,C;}pc{R,C};
-                  dispatch(*P,G.q0,G.cp,(uint32_t)((R+per-1)/per),1,1,&pc,8); }
+                  struct{int R,C,T,xs;}pc{R,C,1,0};
+                  dispatch(*P,G.q0,G.cp,(uint32_t)((R+per-1)/per),1,1,&pc,16); }
                 batch_flush();
                 { std::vector<Buf> b={codebufs[n5],xb,z2};
                   Pipe* P = (g5rpw == 1) ? &pg5M1 : (g5rpw == 2) ? &pg5M2 : &pg5M4;
@@ -2666,6 +2670,50 @@ Buf ffn_ctr=mkbuf(4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST
                 fprintf(stderr,"selftest PTQ1_0 rpw%d: %s\n", g5rpw,
                         o5b ? "PASS (bit-identical)" : "FAIL");
                 ok = ok && o5b;
+
+                // bytenr T=2 on the WORKGROUP AXIS (gy=2) vs two T=1 launches on the
+                // same input. Gates the chunked-prefill GEMV: per-(row,token) FMA
+                // order must be unchanged, so the T-axis launch is bit-identical.
+                {
+                    Buf zt=mkbuf((VkDeviceSize)(R*2+4)*4,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                    // x2: two token rows at the REAL body_T stride (work = max(D,NFF)
+                    // = 3*C here), replicating the exact prefill call shape.
+                    int W = 3*C;
+                    Buf x2=mkbuf((VkDeviceSize)W*2*4,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                    {   std::vector<float> v((size_t)W*2, 0.0f);
+                        auto a0=rd(xb,C);
+                        for(int i=0;i<C;++i){ v[i]=a0[i]; v[W+i]=a0[i]; }
+                        // gap [C,W) filled with -a0 pattern: if the kernel's xs is lost
+                        // (defaults to C) token 1 reads -a0 -> output -c1 (max diff ~2x);
+                        // if xs arrives, token 1 reads x[W..] = a0 -> output c1 (diff 0).
+                        for(int i=C;i<W;++i){ v[i] = -a0[i % C]; }
+                        upload(&x2, v.data(), v.size()*4); }
+                    { std::vector<Buf> b={codebufs[n5],x2,zt};
+                      Pipe* P = (g5rpw_eff == 1) ? &pg5nr1 : (g5rpw_eff == 2) ? &pg5nr2
+                              : (g5rpw_eff == 8) ? &pg5nr8 : &pg5nr4;
+                      int wg = 256 / (int)g_wave, per = wg * g5rpw_eff;
+                      bindbufs(*P,b);
+                      struct{int R,C,T,xs;}pc{R,C,2,W};
+                      dispatch(*P,G.q0,G.cp,(uint32_t)((R+per-1)/per),2,1,&pc,16); }
+                    batch_flush();
+                    auto ct=rd(zt,R*2);
+                    std::vector<float> zfull = rd(zt, R*2+4);
+                    fprintf(stderr,"  push debug: xs=%.1f T=%.1f tok=%.1f C=%.1f\n",
+                            zfull[R*2+0], zfull[R*2+1], zfull[R*2+2], zfull[R*2+3]);
+                    double g0=0,g1=0;
+                    for(int i=0;i<R;++i){
+                        double d0=std::fabs(c1[i]-ct[i]);     if(d0>g0) g0=d0;
+                        double d1=std::fabs(c1[i]-ct[R+i]);   if(d1>g1) g1=d1;
+                    }
+                    fprintf(stderr,"selftest PTQ1_0 bytenr gy=2 xs=3C: max|t0-t1x|=%.3e  max|t1-t1x|=%.3e\n", g0, g1);
+                    fprintf(stderr,"  c1[0..2]   = %.5f %.5f %.5f\n", c1[0], c1[1], c1[2]);
+                    fprintf(stderr,"  ct[0..2]   = %.5f %.5f %.5f   (token 0)\n", ct[0], ct[1], ct[2]);
+                    fprintf(stderr,"  ct[R..R+2] = %.5f %.5f %.5f   (token 1)\n", ct[R], ct[R+1], ct[R+2]);
+                    bool o5t = (g0 == 0.0) && (g1 == 0.0);
+                    fprintf(stderr,"selftest PTQ1_0 bytenr gy=2 xs=3C: %s\n", o5t ? "PASS" : "FAIL");
+                    ok = ok && o5t;
+                    freebuf(zt); freebuf(x2);
+                }
                 freebuf(z1); freebuf(z2);
 
                 // The fused 3-tensor shader must equal three separate launches.
@@ -2680,8 +2728,8 @@ Buf ffn_ctr=mkbuf(4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST
                           : (g5rpw_eff == 8) ? &pg5nr8 : &pg5nr4;
                   int wg = 256 / (int)g_wave, per = wg * g5rpw_eff;
                   bindbufs(*P,b);
-                  struct{int R,C;}pc{R,C};
-                  dispatch(*P,G.q0,G.cp,(uint32_t)((R+per-1)/per),1,1,&pc,8); }
+                  struct{int R,C,T,xs;}pc{R,C,1,0};
+                  dispatch(*P,G.q0,G.cp,(uint32_t)((R+per-1)/per),1,1,&pc,16); }
                 batch_flush();
                 { std::vector<Buf> b={codebufs[n5],fu1,codebufs[n5],fu2,codebufs[n5],fu3,xb};
                   int rpw3 = (g5rpw_eff > 4) ? 4 : g5rpw_eff;   // byte3nr ships RPW 1/2/4
@@ -2689,8 +2737,8 @@ Buf ffn_ctr=mkbuf(4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST
                   int wg = 256 / (int)g_wave;
                   int g = (R + rpw3 - 1) / rpw3;
                   bindbufs(*P,b);
-                  struct{int R0,R1,R2,C;}pc{R,R,R,C};
-                  dispatch(*P,G.q0,G.cp,(uint32_t)((3*g + wg - 1) / wg),1,1,&pc,16); }
+                  struct{int R0,R1,R2,C,T,xs;}pc{R,R,R,C,1,0};
+                  dispatch(*P,G.q0,G.cp,(uint32_t)((3*g + wg - 1) / wg),1,1,&pc,24); }
                 batch_flush();
                 auto v0=rd(fu0,R), v1=rd(fu1,R), v2=rd(fu2,R), v3=rd(fu3,R);
                 double fg1e=0,fg2e=0,fg3e=0;

@@ -54,7 +54,7 @@ layout(push_constant) uniform PC { int R; int C; int T; int xstride; } pc;
 
 // One row per wave, TT token sums per row.
 shared float sh[NSUB][TT][64];
-shared float tlf[1280];
+// SLM freed: trit LUT removed (inline tritf below, bit-identical).
 
 const uint P3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
 
@@ -63,7 +63,11 @@ uint block_byte(int row, int bpr, int blk, int byteInBlk) {
     return (w[bi >> 2] >> (8u * uint(bi & 3))) & 0xFFu;
 }
 
-#define TRIT(B5, N) tlf[(B5) + (N)]
+float tritf(uint b, int n) {
+    uint tr = (((b * P3[n]) & 0xFFu) * 3u) >> 8u;
+    return float(tr) - 1.0f;
+}
+#define TRIT(B, N) tritf((B), (N))
 
 void main() {
     uint sgsz = gl_SubgroupSize;
@@ -71,13 +75,7 @@ void main() {
     int sub = int(gl_SubgroupID);
     uint lane = gl_SubgroupInvocationID;
 
-    for (uint e = gl_LocalInvocationID.x; e < 256u; e += uint(gl_WorkGroupSize.x)) {
-        for (int n = 0; n < 5; ++n) {
-            uint tr = (((e * P3[n]) & 0xFFu) * 3u) >> 8;
-            tlf[e * 5u + uint(n)] = float(int(tr) - 1);
-        }
-    }
-    barrier();
+    // tlf build loop removed: trits decode inline (tritf).
 
     int R = pc.R;
     int C = pc.C;
@@ -96,7 +94,7 @@ void main() {
         int off = bi - blk * 26;
         int base = blk << 7;
 
-        int b5 = int(block_byte(row, bpr, blk, off)) * 5;
+        uint b5 = block_byte(row, bpr, blk, off);
         // Bytes 26..27 of a 28-byte block; a block starts at a multiple of 28, so
         // byte 26 is the high half of word (base/4 + 6).
         int sb = ((row * bpr + blk) * 28) >> 2;

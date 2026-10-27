@@ -59,7 +59,7 @@ layout(set = 0, binding = 4) readonly buffer W2B { uint W2[]; };
 layout(set = 0, binding = 5) buffer Y2B { float Y2[]; };
 layout(set = 0, binding = 6) readonly buffer XB { float x[]; };
 
-layout(push_constant) uniform PC { int R0; int R1; int R2; int C; } pc;
+layout(push_constant) uniform PC { int R0; int R1; int R2; int C; int T; int xs; } pc;
 
 // SLM freed: the trit LUT is gone (inline decode above), so this kernel uses
 // zero shared memory — the full 160 KB L1 stays available to the weight stream.
@@ -116,7 +116,7 @@ float tritf(uint b, int n) {
             float pA = 0.0, pB = 0.0, pC = 0.0, pD = 0.0;                   \
             if (off < 16) {                                                 \
                 for (int n = 0; n < 5; ++n) {                               \
-                    float xv = x[bs + off + (n << 4)];                     \
+                    float xv = x[tok * xs + bs + off + (n << 4)];                     \
                     pA += TRIT(b5a, n) * xv;                                \
                     if (RPW >= 2) pB += TRIT(b5b, n) * xv;                  \
                     if (RPW >= 4) { pC += TRIT(b5c, n) * xv; pD += TRIT(b5d, n) * xv; } \
@@ -124,7 +124,7 @@ float tritf(uint b, int n) {
             } else if (off < 24) {                                          \
                 int j = off - 16;                                           \
                 for (int n = 0; n < 5; ++n) {                               \
-                    float xv = x[bs + 80 + j + (n << 3)];                  \
+                    float xv = x[tok * xs + bs + 80 + j + (n << 3)];                  \
                     pA += TRIT(b5a, n) * xv;                                \
                     if (RPW >= 2) pB += TRIT(b5b, n) * xv;                  \
                     if (RPW >= 4) { pC += TRIT(b5c, n) * xv; pD += TRIT(b5d, n) * xv; } \
@@ -132,7 +132,7 @@ float tritf(uint b, int n) {
             } else {                                                        \
                 int j = off - 24;                                           \
                 for (int n = 0; n < 4; ++n) {                               \
-                    float xv = x[bs + 120 + (n << 1) + j];                 \
+                    float xv = x[tok * xs + bs + 120 + (n << 1) + j];                 \
                     pA += TRIT(b5a, n) * xv;                                \
                     if (RPW >= 2) pB += TRIT(b5b, n) * xv;                  \
                     if (RPW >= 4) { pC += TRIT(b5c, n) * xv; pD += TRIT(b5d, n) * xv; } \
@@ -146,10 +146,10 @@ float tritf(uint b, int n) {
         if (RPW >= 2) accB = subgroupAdd(accB);                                 \
         if (RPW >= 4) { accC = subgroupAdd(accC); accD = subgroupAdd(accD); }   \
         if (lane == 0u) {                                                   \
-            if (ka) (Y)[ra] = accA;                                        \
-            if (kb) (Y)[rb] = accB;                                         \
-            if (kc) (Y)[rc] = accC;                                         \
-            if (kd) (Y)[rd] = accD;                                         \
+            if (ka) (Y)[tok * (RR) + ra] = accA;                                        \
+            if (kb) (Y)[tok * (RR) + rb] = accB;                                         \
+            if (kc) (Y)[tok * (RR) + rc] = accC;                                         \
+            if (kd) (Y)[tok * (RR) + rd] = accD;                                         \
         }                                                                   \
     }
 
@@ -164,6 +164,10 @@ void main() {
     // SLM is unused: no LUT, no staging, no barriers. Both the trit decode and
     // the per-row sums (subgroupAdd) stay in registers/ALU.
     int R0 = pc.R0, R1 = pc.R1, R2 = pc.R2;
+    // Token axis on gl_WorkGroupID.y (same rationale as g5ptq_bytenr.comp).
+    int T = pc.T; if (T <= 0) T = 1;
+    int xs = pc.xs; if (xs <= 0) xs = C;
+    int tok = int(gl_WorkGroupID.y);
     int bpr = C >> 7;
     int ntb = bpr * 26;
 

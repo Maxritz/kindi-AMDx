@@ -55,7 +55,7 @@ layout(push_constant) uniform PC { int R; int C; int T; int xstride; } pc;
 // Four slots per row for the four token sums; fixed width so a constant index is
 // always in range (GLSL bounds-checks even preprocessor-dead branches).
 shared float sh[NSUB][2][4][64];
-shared float tlf[1280];
+// SLM freed: trit LUT removed (inline tritf below, bit-identical).
 
 const uint P3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
 
@@ -71,7 +71,11 @@ float block_scale(int row, int bpr, int blk) {
     return unpackHalf2x16(w[sb + 6] >> 16).x;
 }
 
-#define TRIT(B5, N) tlf[(B5) + (N)]
+float tritf(uint b, int n) {
+    uint tr = (((b * P3[n]) & 0xFFu) * 3u) >> 8u;
+    return float(tr) - 1.0f;
+}
+#define TRIT(B, N) tritf((B), (N))
 
 // The digit n loop for one byte group: stride in columns, plus the four-token offset.
 #define DIGITS(N, BASEEXPR, STRIDE)                                    \
@@ -90,13 +94,7 @@ void main() {
     int sub = int(gl_SubgroupID);
     uint lane = gl_SubgroupInvocationID;
 
-    for (uint e = gl_LocalInvocationID.x; e < 256u; e += uint(gl_WorkGroupSize.x)) {
-        for (int n = 0; n < 5; ++n) {
-            uint tr = (((e * P3[n]) & 0xFFu) * 3u) >> 8;
-            tlf[e * 5u + uint(n)] = float(int(tr) - 1);
-        }
-    }
-    barrier();
+    // tlf build loop removed: trits decode inline (tritf).
 
     int R = pc.R;
     int C = pc.C;
@@ -118,12 +116,12 @@ void main() {
         int off = bi - blk * 26;
         int base = blk << 7;
 
-        int b5a = int(block_byte(ra, bpr, blk, off)) * 5;
+        uint b5a = block_byte(ra, bpr, blk, off);
         float sa = block_scale(ra, bpr, blk);
-        int b5b = 0;
+        uint b5b = 0;
         float sb = 0.0;
         if (RPW >= 2) {
-            b5b = int(block_byte(rb, bpr, blk, off)) * 5;
+            b5b = block_byte(rb, bpr, blk, off);
             sb = block_scale(rb, bpr, blk);
         }
 
