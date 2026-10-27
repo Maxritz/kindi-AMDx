@@ -20,7 +20,8 @@ $variants = @{
     "g4lutMr"       = @(1, 2, 4)
     "g5ptqM2r"      = @(1, 2, 4)
     "g5ptq_byte3nr" = @(1, 2, 4)
-    "g5ptq_bytenr"  = @(1, 2, 4)
+    "g5ptq_byte3nr_silu" = @(1, 2, 4)
+    "g5ptq_bytenr"  = @(1, 2, 4, 8)
     "g5ptq_pf2r"    = @(2)
 }
 foreach ($base in $variants.Keys) {

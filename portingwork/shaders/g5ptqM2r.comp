@@ -58,7 +58,6 @@ layout(push_constant) uniform PC { int R; int C; int T; int xstride; } pc;
 // Eight slots: four rows x two tokens. Fixed width so a constant index is always in
 // range, and one reduction pass covers all of them.
 shared float sh[NSUB][8][32];
-shared float tlf[1280];
 
 const uint P3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
 
@@ -72,21 +71,21 @@ float block_scale(int row, int bpr, int blk) {
     return unpackHalf2x16(w[sb + 6] >> 16).x;
 }
 
-#define TRIT(B5, N) tlf[(B5) + (N)]
+// Inline trit decode — the SAME formula the old 5 KB tlf[] LUT was built from.
+// Bit-identity vs the LUT is proven by the engine selftest, which compares this
+// kernel's T=2 output directly against the (now LUT-free) bytenr kernel.
+// Same win as g5ptq_bytenr.comp: ~2x on the GEMV-bound path in a same-window A/B.
+float tritf(uint b, int n) {
+    uint tr = (((b * P3[n]) & 0xFFu) * 3u) >> 8u;
+    return float(tr) - 1.0f;
+}
+#define TRIT(B, N) tritf((B), (N))
 
 void main() {
     uint sgsz = gl_SubgroupSize;
     uint nsub = uint(gl_WorkGroupSize.x) / sgsz;
     int sub = int(gl_SubgroupID);
     uint lane = gl_SubgroupInvocationID;
-
-    for (uint e = gl_LocalInvocationID.x; e < 256u; e += uint(gl_WorkGroupSize.x)) {
-        for (int n = 0; n < 5; ++n) {
-            uint tr = (((e * P3[n]) & 0xFFu) * 3u) >> 8;
-            tlf[e * 5u + uint(n)] = float(int(tr) - 1);
-        }
-    }
-    barrier();
 
     int R = pc.R;
     int C = pc.C;
@@ -121,16 +120,16 @@ void main() {
         int off = bi - blk * 26;
         int base = blk << 7;
 
-        int b50 = int(block_byte(r0, bpr, blk, off)) * 5;
+        uint b50 = block_byte(r0, bpr, blk, off);
         float sc0 = block_scale(r0, bpr, blk);
 #if RPW >= 2
-        int b51 = int(block_byte(r1, bpr, blk, off)) * 5;
+        uint b51 = block_byte(r1, bpr, blk, off);
         float sc1 = block_scale(r1, bpr, blk);
 #endif
 #if RPW >= 4
-        int b52 = int(block_byte(r2, bpr, blk, off)) * 5;
+        uint b52 = block_byte(r2, bpr, blk, off);
         float sc2 = block_scale(r2, bpr, blk);
-        int b53 = int(block_byte(r3, bpr, blk, off)) * 5;
+        uint b53 = block_byte(r3, bpr, blk, off);
         float sc3 = block_scale(r3, bpr, blk);
 #endif
 

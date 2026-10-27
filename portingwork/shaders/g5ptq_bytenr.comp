@@ -38,6 +38,12 @@
 //
 // Push: { int R; int C; }
 // Bindings: 0 raw blocks as uint words, 1 x (float), 2 out (float)
+//
+// SHERLOCKED (2026-10-28): staging x[] in shared memory measured 20.6 -> 10.8
+// tok/s (XMAX=6144: 10.3). The stage buffer (8-24 KB on top of the 5 KB tlf LUT)
+// cuts resident workgroups per Xe-core ~3-6x, and the occupancy loss dwarfs the
+// global-load latency it removes on this driver. Direct x loads + L1 caching win.
+// Do not re-add without an occupancy-aware redesign (e.g. staging only tlf-sized).
 #version 450
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require   // subgroupAdd replaces the shared-memory tree + 5 barriers per byte
@@ -56,8 +62,8 @@ layout(set = 0, binding = 2) buffer BO { float out_[]; };
 
 layout(push_constant) uniform PC { int R; int C; } pc;
 
-shared float sh[NSUB][RPW][32];   // only 32 lanes per subgroup are used (lane < sgsz, max 31)
-shared float tlf[1280];
+// SLM unused: reduction is subgroupAdd, trits decode inline. Zero shared
+// memory = the Xe-core keeps its full 160 KB L1 for the weight stream.
 
 const uint P3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
 
@@ -73,23 +79,28 @@ float block_scale(int row, int bpr, int blk) {
     return unpackHalf2x16(w[sb + 6] >> 16).x;
 }
 
-// one digit n of <byte> as a float in {-1,0,1}
-#define TRIT(B5, N) tlf[(B5) + (N)]
+// Inline trit decode — the SAME formula the old 5 KB tlf[] LUT was built from
+// (tr = (((b * 3^n) & 0xFF) * 3) >> 8, value tr-1 in {-1,0,1}), evaluated per
+// use. Identical inputs produce identical floats, so every row's FMA sequence
+// is unchanged and bit-identity holds. Replaces ~260 shared-memory loads per
+// lane (5 trits x RPW rows x 13 byte-iterations) with pipelined ALU, and frees
+// the 5 KB that hurt occupancy. (The earlier "on-the-fly decode broke
+// correctness" attempt failed on a GLSL cast issue, not the math: the fix is
+// doing all the digit math in uint and converting the finished digit once.)
+float tritf(uint b, int n) {
+    uint tr = (((b * P3[n]) & 0xFFu) * 3u) >> 8u;
+    return float(tr) - 1.0f;
+}
+#define TRIT(B, N) tritf((B), (N))
 
 void main() {
     uint sgsz = gl_SubgroupSize;
     uint nsub = uint(gl_WorkGroupSize.x) / sgsz;
     int sub = int(gl_SubgroupID);
 
-    for (uint e = gl_LocalInvocationID.x; e < 256u; e += uint(gl_WorkGroupSize.x)) {
-      for (int n = 0; n < 5; ++n) {
-          uint tr = (((e * P3[n]) & 0xFFu) * 3u) >> 8;
-          tlf[e * 5u + uint(n)] = float(int(tr) - 1);
-      }
-  }
-  barrier();
-
   int R = pc.R;
+    int C = pc.C;
+
     int row0 = (int(gl_WorkGroupID.x) * int(nsub) + sub) * RPW;
 
     // clamp instead of return: every invocation must reach every barrier()
@@ -101,37 +112,68 @@ void main() {
 #if RPW >= 4
     k2 = r2 < R; k3 = r3 < R;
 #endif
+    int r4 = 0, r5 = 0, r6 = 0, r7 = 0;   // only used at RPW >= 8 (declared
+    bool k4 = false, k5 = false, k6 = false, k7 = false;   // unconditionally so
+#if RPW >= 8                               // the phase macros compile at all widths)
+    r4 = row0 + 4; r5 = row0 + 5; r6 = row0 + 6; r7 = row0 + 7;
+    k4 = r4 < R; k5 = r5 < R; k6 = r6 < R; k7 = r7 < R;
+#endif
     if (!k0) r0 = 0;
     if (!k1) r1 = 0;
     if (!k2) r2 = 0;
     if (!k3) r3 = 0;
+#if RPW >= 8
+    if (!k4) r4 = 0;
+    if (!k5) r5 = 0;
+    if (!k6) r6 = 0;
+    if (!k7) r7 = 0;
+#endif
 
     uint lane = gl_SubgroupInvocationID;
-    int C = pc.C;
     int bpr = C >> 7;
     int ntb = bpr * 26;
 
     float acc0 = 0.0, acc1 = 0.0, acc2 = 0.0, acc3 = 0.0;
+    // acc4..7 declared unconditionally: dead code at RPW < 8.
+    float acc4 = 0.0, acc5 = 0.0, acc6 = 0.0, acc7 = 0.0;
 
+    // SHERLOCKED (2026-10-28): 3-phase uniform restructure (off 0..15 / 16..23 /
+    // 24..25 as separate branch-free loops) measured 33.1 -> 18.3 tok/s. The
+    // lockstep-divergence saved was outweighed by 3x loop setup and a worse x
+    // access pattern (phase C touches 2 of every 26 bytes per block). The
+    // interleaved loop below is the keeper; the LUT removal above is the win.
     for (int bi = int(lane); bi < ntb; bi += int(sgsz)) {
         int blk = bi / 26;
         int off = bi - blk * 26;
         int base = blk << 7;
 
-        int b50 = int(block_byte(r0, bpr, blk, off)) * 5;
+        uint b50 = block_byte(r0, bpr, blk, off);
         float sc0 = block_scale(r0, bpr, blk);
 #if RPW >= 2
-        int b51 = int(block_byte(r1, bpr, blk, off)) * 5;
+        uint b51 = block_byte(r1, bpr, blk, off);
         float sc1 = block_scale(r1, bpr, blk);
 #endif
 #if RPW >= 4
-        int b52 = int(block_byte(r2, bpr, blk, off)) * 5;
+        uint b52 = block_byte(r2, bpr, blk, off);
         float sc2 = block_scale(r2, bpr, blk);
-        int b53 = int(block_byte(r3, bpr, blk, off)) * 5;
+        uint b53 = block_byte(r3, bpr, blk, off);
         float sc3 = block_scale(r3, bpr, blk);
 #endif
+#if RPW >= 8
+        uint b54 = block_byte(r4, bpr, blk, off);
+        float sc4 = block_scale(r4, bpr, blk);
+        uint b55 = block_byte(r5, bpr, blk, off);
+        float sc5 = block_scale(r5, bpr, blk);
+        uint b56 = block_byte(r6, bpr, blk, off);
+        float sc6 = block_scale(r6, bpr, blk);
+        uint b57 = block_byte(r7, bpr, blk, off);
+        float sc7 = block_scale(r7, bpr, blk);
+#endif
 
-        float p0 = 0.0, p1 = 0.0, p2 = 0.0, p3 = 0.0;
+        float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;
+#if RPW >= 8
+        float p4 = 0.0f, p5 = 0.0f, p6 = 0.0f, p7 = 0.0f;
+#endif
 
         if (off < 16) {                    // five digits, stride 16
             for (int n = 0; n < 5; ++n) {
@@ -143,6 +185,12 @@ void main() {
 #if RPW >= 4
                 p2 += TRIT(b52, n) * xv;
                 p3 += TRIT(b53, n) * xv;
+#endif
+#if RPW >= 8
+                p4 += TRIT(b54, n) * xv;
+                p5 += TRIT(b55, n) * xv;
+                p6 += TRIT(b56, n) * xv;
+                p7 += TRIT(b57, n) * xv;
 #endif
             }
         } else if (off < 24) {             // five digits, stride 8, from trit 80
@@ -157,6 +205,12 @@ void main() {
                 p2 += TRIT(b52, n) * xv;
                 p3 += TRIT(b53, n) * xv;
 #endif
+#if RPW >= 8
+                p4 += TRIT(b54, n) * xv;
+                p5 += TRIT(b55, n) * xv;
+                p6 += TRIT(b56, n) * xv;
+                p7 += TRIT(b57, n) * xv;
+#endif
             }
         } else {                           // four digits, from trit 120
             int j = off - 24;
@@ -170,6 +224,12 @@ void main() {
                 p2 += TRIT(b52, n) * xv;
                 p3 += TRIT(b53, n) * xv;
 #endif
+#if RPW >= 8
+                p4 += TRIT(b54, n) * xv;
+                p5 += TRIT(b55, n) * xv;
+                p6 += TRIT(b56, n) * xv;
+                p7 += TRIT(b57, n) * xv;
+#endif
             }
         }
         acc0 += sc0 * p0;
@@ -179,6 +239,12 @@ void main() {
 #if RPW >= 4
         acc2 += sc2 * p2;
         acc3 += sc3 * p3;
+#endif
+#if RPW >= 8
+        acc4 += sc4 * p4;
+        acc5 += sc5 * p5;
+        acc6 += sc6 * p6;
+        acc7 += sc7 * p7;
 #endif
     }
 
@@ -191,6 +257,12 @@ void main() {
     acc2 = subgroupAdd(acc2);
     acc3 = subgroupAdd(acc3);
 #endif
+#if RPW >= 8
+    acc4 = subgroupAdd(acc4);
+    acc5 = subgroupAdd(acc5);
+    acc6 = subgroupAdd(acc6);
+    acc7 = subgroupAdd(acc7);
+#endif
     if (lane == 0u) {
         if (k0) out_[r0] = acc0;
 #if RPW >= 2
@@ -199,6 +271,12 @@ void main() {
 #if RPW >= 4
         if (k2) out_[r2] = acc2;
         if (k3) out_[r3] = acc3;
+#endif
+#if RPW >= 8
+        if (k4) out_[r4] = acc4;
+        if (k5) out_[r5] = acc5;
+        if (k6) out_[r6] = acc6;
+        if (k7) out_[r7] = acc7;
 #endif
     }
 }

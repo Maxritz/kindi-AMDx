@@ -35,6 +35,10 @@
 //
 // Push: { int R0; int R1; int R2; int C; }
 // Bindings: 0 W0 1 Y0 2 W1 3 Y1 4 W2 5 Y2 6 X
+//
+// SHERLOCKED (2026-10-28): x[] shared staging measured a large regression on the
+// Intel iGPU (see g5ptq_bytenr.comp header) — occupancy loss from the extra
+// shared bytes beats the global-load latency it removes. Direct x loads kept.
 #version 450
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require   // subgroupAdd replaces the shared-memory tree + barriers
@@ -57,17 +61,24 @@ layout(set = 0, binding = 6) readonly buffer XB { float x[]; };
 
 layout(push_constant) uniform PC { int R0; int R1; int R2; int C; } pc;
 
-// The byte->trit LUT is the only shared state now (5 KB). The per-row sums use
-// subgroupAdd, so no per-subgroup shared slots are needed.
-shared float tlf[1280];
-
+// SLM freed: the trit LUT is gone (inline decode above), so this kernel uses
+// zero shared memory — the full 160 KB L1 stays available to the weight stream.
 const uint P3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
 
-#define TRIT(B5, N) tlf[(B5) + (N)]
+// Inline trit decode — the SAME formula the old 5 KB tlf[] LUT was built from,
+// evaluated per use (bit-identical: identical inputs, identical floats, same
+// FMA sequence). Replaces ~260 shared-memory loads per lane with pipelined
+// ALU and frees the 5 KB SLM (which was also shrinking the 160 KB L1 to 64 KB).
+// See g5ptq_bytenr.comp for the full rationale.
+float tritf(uint b, int n) {
+    uint tr = (((b * P3[n]) & 0xFFu) * 3u) >> 8u;
+    return float(tr) - 1.0f;
+}
+#define TRIT(B, N) tritf((B), (N))
 // BPR is a DO_TENSOR parameter, so it must be passed IN: a nested macro body is not
 // rescanned for the outer macro's parameters (C-preprocessor rule) - referencing BPR
 // directly here compiled as an undeclared identifier and left the stale .spv in place.
-#define RD_BYTE(W, ROW, BPR) int((W[(((ROW)*(BPR)+blk)*28+off) >> 2] >> (8u*uint((((ROW)*(BPR)+blk)*28+off) & 3))) & 0xFFu)
+#define RD_BYTE(W, ROW, BPR) ((W[(((ROW)*(BPR)+blk)*28+off) >> 2] >> (8u*uint((((ROW)*(BPR)+blk)*28+off) & 3))) & 0xFFu)
 #define RD_SCALE(W, ROW, BPR) unpackHalf2x16(W[((ROW)*(BPR)+blk)*7+6] >> 16).x
 
 // One tensor's row group (RPW rows). W is the weight buffer, Y the output, G the
@@ -90,22 +101,22 @@ const uint P3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
             int off = bi - blk * 26;                                        \
             int bs = blk << 7;                                              \
             float sa = RD_SCALE(W, ra, BPR);                                     \
-            int b5a = RD_BYTE(W, ra, BPR) * 5;                                   \
-            int b5b = 0, b5c = 0, b5d = 0; float sb = 0.0, sc = 0.0, sd = 0.0; \
+            uint b5a = RD_BYTE(W, ra, BPR);                                      \
+            uint b5b = 0, b5c = 0, b5d = 0; float sb = 0.0, sc = 0.0, sd = 0.0; \
             if (RPW >= 2) {                                                 \
                 sb = RD_SCALE(W, rb, BPR);                                       \
-                b5b = RD_BYTE(W, rb, BPR) * 5;                                   \
+                b5b = RD_BYTE(W, rb, BPR);                                       \
             }                                                               \
             if (RPW >= 4) {                                                 \
                 sc = RD_SCALE(W, rc, BPR);                                       \
                 sd = RD_SCALE(W, rd, BPR);                                       \
-                b5c = RD_BYTE(W, rc, BPR) * 5;                                   \
-                b5d = RD_BYTE(W, rd, BPR) * 5;                                   \
+                b5c = RD_BYTE(W, rc, BPR);                                       \
+                b5d = RD_BYTE(W, rd, BPR);                                       \
             }                                                               \
             float pA = 0.0, pB = 0.0, pC = 0.0, pD = 0.0;                   \
             if (off < 16) {                                                 \
                 for (int n = 0; n < 5; ++n) {                               \
-                    float xv = x[bs + off + (n << 4)];                      \
+                    float xv = x[bs + off + (n << 4)];                     \
                     pA += TRIT(b5a, n) * xv;                                \
                     if (RPW >= 2) pB += TRIT(b5b, n) * xv;                  \
                     if (RPW >= 4) { pC += TRIT(b5c, n) * xv; pD += TRIT(b5d, n) * xv; } \
@@ -113,7 +124,7 @@ const uint P3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
             } else if (off < 24) {                                          \
                 int j = off - 16;                                           \
                 for (int n = 0; n < 5; ++n) {                               \
-                    float xv = x[bs + 80 + j + (n << 3)];                   \
+                    float xv = x[bs + 80 + j + (n << 3)];                  \
                     pA += TRIT(b5a, n) * xv;                                \
                     if (RPW >= 2) pB += TRIT(b5b, n) * xv;                  \
                     if (RPW >= 4) { pC += TRIT(b5c, n) * xv; pD += TRIT(b5d, n) * xv; } \
@@ -121,7 +132,7 @@ const uint P3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
             } else {                                                        \
                 int j = off - 24;                                           \
                 for (int n = 0; n < 4; ++n) {                               \
-                    float xv = x[bs + 120 + (n << 1) + j];                  \
+                    float xv = x[bs + 120 + (n << 1) + j];                 \
                     pA += TRIT(b5a, n) * xv;                                \
                     if (RPW >= 2) pB += TRIT(b5b, n) * xv;                  \
                     if (RPW >= 4) { pC += TRIT(b5c, n) * xv; pD += TRIT(b5d, n) * xv; } \
@@ -148,16 +159,11 @@ void main() {
     int sub = int(gl_SubgroupID);
     uint lane = gl_SubgroupInvocationID;
 
-    for (uint e = gl_LocalInvocationID.x; e < 256u; e += uint(gl_WorkGroupSize.x)) {
-        for (int n = 0; n < 5; ++n) {
-            uint tr = (((e * P3[n]) & 0xFFu) * 3u) >> 8;
-            tlf[e * 5u + uint(n)] = float(int(tr) - 1);
-        }
-    }
-    barrier();
-
-    int R0 = pc.R0, R1 = pc.R1, R2 = pc.R2;
     int C = pc.C;
+
+    // SLM is unused: no LUT, no staging, no barriers. Both the trit decode and
+    // the per-row sums (subgroupAdd) stay in registers/ALU.
+    int R0 = pc.R0, R1 = pc.R1, R2 = pc.R2;
     int bpr = C >> 7;
     int ntb = bpr * 26;
 

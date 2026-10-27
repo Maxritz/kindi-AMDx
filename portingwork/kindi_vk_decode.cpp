@@ -474,6 +474,9 @@ static void dispatch(const Pipe&P, VkQueue q, VkCommandPool pool, uint32_t gx,ui
     static const bool no_batch = getenv("KINDI_NO_BATCH") != nullptr;
     // bound the batch: a 144-token prefill is ~64k dispatches, which would overflow the
     // descriptor pool and the command buffer if left to accumulate.
+    // Tuning note (Shard C): KINDI_BATCH_MAX=3500 measured *slower* per pass than 2048
+    // (1885 vs 1767 ms, see PERFORMANCE.md), and 2048 already amortizes submit+fence
+    // to <0.1% of wall (446-936 ops/submit in measured traces). Keep 2048.
     static const uint64_t BATCH_MAX = [](){
         const char* e=getenv("KINDI_BATCH_MAX"); return e?(uint64_t)atoll(e):(uint64_t)2048; }();
     if(no_batch || g_batch_ops >= BATCH_MAX) batch_flush();
@@ -1087,14 +1090,23 @@ Pipe pffn_fused=mkpipe((shdir+"/ffn_fused.comp.spv").c_str(),9,12);
     // One source compiled at three rows-per-wave widths; the device's wave size picks
     // which one runs. See g5ptq_bytenr.comp.
     const int g5rpw = (g_wave >= 128) ? 1 : (g_wave >= 64) ? 2 : 4;
+    // A/B override for the rows-per-wave width (KINDI_RPW=1|2|4|8). RPW=8 halves
+    // the workgroup count per GEMV; bit-identity holds by construction (each row
+    // still receives exactly its single-row FMA sequence), so it is gated on
+    // measured tok/s, not on theory.
+    int g5rpw_eff = g5rpw;
+    { const char* e = getenv("KINDI_RPW");
+      if (e && *e) { int v = atoi(e); if (v==1||v==2||v==4||v==8) g5rpw_eff = v; } }
     Pipe pg5nr1=mkpipe((shdir+"/g5ptq_bytenr1.comp.spv").c_str(),3,8);
     Pipe pg5nr2=mkpipe((shdir+"/g5ptq_bytenr2.comp.spv").c_str(),3,8);
     Pipe pg5nr4=mkpipe((shdir+"/g5ptq_bytenr4.comp.spv").c_str(),3,8);
+    Pipe pg5nr8=mkpipe((shdir+"/g5ptq_bytenr8.comp.spv").c_str(),3,8);
     // Fused 3-tensor variants at the same three widths.
     Pipe pg53nr1=mkpipe((shdir+"/g5ptq_byte3nr1.comp.spv").c_str(),7,16);
     Pipe pg53nr2=mkpipe((shdir+"/g5ptq_byte3nr2.comp.spv").c_str(),7,16);
     Pipe pg53nr4=mkpipe((shdir+"/g5ptq_byte3nr4.comp.spv").c_str(),7,16);
-    fprintf(stderr,"PTQ1_0 GEMV: %d row(s) per wave (wave %u)\n", g5rpw, g_wave);
+    fprintf(stderr,"PTQ1_0 GEMV: %d row(s) per wave (wave %u%s)\n", g5rpw_eff, g_wave,
+            g5rpw_eff != g5rpw ? ", KINDI_RPW override" : "");
     // Speculative-verify kernels: T tokens x RPW rows per wave, one per width.
     Pipe pg5M1 =mkpipe((shdir+"/g5ptqM2r1.comp.spv").c_str(),3,16);
     Pipe pg5M2 =mkpipe((shdir+"/g5ptqM2r2.comp.spv").c_str(),3,16);
@@ -1340,10 +1352,12 @@ Buf ffn_ctr=mkbuf(4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST
             } else {
                 // Default: rows per wave chosen from the device's wave width, so the
                 // wave is filled the same way on wave32, wave64 and wave128 parts.
-                // 256 threads / wave * rpw rows per workgroup.
-                Pipe* P = (g5rpw == 1) ? &pg5nr1 : (g5rpw == 2) ? &pg5nr2 : &pg5nr4;
+                // 256 threads / wave * rpw rows per workgroup. KINDI_RPW overrides
+                // for A/B (8 halves the workgroup count; see g5ptq_bytenr.comp).
+                Pipe* P = (g5rpw_eff == 1) ? &pg5nr1 : (g5rpw_eff == 2) ? &pg5nr2
+                        : (g5rpw_eff == 8) ? &pg5nr8 : &pg5nr4;
                 int wg = 256 / (int)g_wave;
-                int per = wg * g5rpw;
+                int per = wg * g5rpw_eff;
                 bindbufs(*P,bufs);
                 dispatch(*P,G.q0,G.cp,(uint32_t)((rows + per - 1) / per),1,1,&pc,8);
             }
@@ -2626,8 +2640,9 @@ Buf ffn_ctr=mkbuf(4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST
                 Buf z1=mkbuf((VkDeviceSize)R*4,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
                 Buf z2=mkbuf((VkDeviceSize)R*2*4,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
                 { std::vector<Buf> b={codebufs[n5],xb,z1};
-                  Pipe* P = (g5rpw == 1) ? &pg5nr1 : (g5rpw == 2) ? &pg5nr2 : &pg5nr4;
-                  int wg = 256 / (int)g_wave, per = wg * g5rpw;
+                  Pipe* P = (g5rpw_eff == 1) ? &pg5nr1 : (g5rpw_eff == 2) ? &pg5nr2
+                          : (g5rpw_eff == 8) ? &pg5nr8 : &pg5nr4;
+                  int wg = 256 / (int)g_wave, per = wg * g5rpw_eff;
                   bindbufs(*P,b);
                   struct{int R,C;}pc{R,C};
                   dispatch(*P,G.q0,G.cp,(uint32_t)((R+per-1)/per),1,1,&pc,8); }
@@ -2661,16 +2676,18 @@ Buf ffn_ctr=mkbuf(4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST
                 Buf fu3=mkbuf((VkDeviceSize)R*4,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
                 Buf fu0=mkbuf((VkDeviceSize)R*4,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
                 { std::vector<Buf> b={codebufs[n5],xb,fu0};
-                  Pipe* P = (g5rpw == 1) ? &pg5nr1 : (g5rpw == 2) ? &pg5nr2 : &pg5nr4;
-                  int wg = 256 / (int)g_wave, per = wg * g5rpw;
+                  Pipe* P = (g5rpw_eff == 1) ? &pg5nr1 : (g5rpw_eff == 2) ? &pg5nr2
+                          : (g5rpw_eff == 8) ? &pg5nr8 : &pg5nr4;
+                  int wg = 256 / (int)g_wave, per = wg * g5rpw_eff;
                   bindbufs(*P,b);
                   struct{int R,C;}pc{R,C};
                   dispatch(*P,G.q0,G.cp,(uint32_t)((R+per-1)/per),1,1,&pc,8); }
                 batch_flush();
                 { std::vector<Buf> b={codebufs[n5],fu1,codebufs[n5],fu2,codebufs[n5],fu3,xb};
-                  Pipe* P = (g5rpw == 1) ? &pg53nr1 : (g5rpw == 2) ? &pg53nr2 : &pg53nr4;
+                  int rpw3 = (g5rpw_eff > 4) ? 4 : g5rpw_eff;   // byte3nr ships RPW 1/2/4
+                  Pipe* P = (rpw3 == 1) ? &pg53nr1 : (rpw3 == 2) ? &pg53nr2 : &pg53nr4;
                   int wg = 256 / (int)g_wave;
-                  int g = (R + g5rpw - 1) / g5rpw;
+                  int g = (R + rpw3 - 1) / rpw3;
                   bindbufs(*P,b);
                   struct{int R0,R1,R2,C;}pc{R,R,R,C};
                   dispatch(*P,G.q0,G.cp,(uint32_t)((3*g + wg - 1) / wg),1,1,&pc,16); }

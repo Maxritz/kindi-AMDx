@@ -1,0 +1,270 @@
+// g5ptq_byte3nr_silu.comp - PTQ1_0 5-trit GEMV with FUSED fold-free SwiGLU,
+// RPW rows per wave.
+//
+// Copy of g5ptq_byte3nr.comp (same tlf LUT, RD_BYTE/RD_SCALE, subgroupAdd
+// reduction, WGS=256, RPW variants, push {R0,R1,R2,C}, bindings
+// 0 W0 1 Y0 2 W1 3 Y1 4 W2 5 Y2 6 X) plus one extra mode:
+//
+//   R2 == 0  ->  paired gate+up path: W0 holds gate codes, W1 holds up codes,
+//                both have R0/R1 rows over the same input x. Each paired row
+//                accumulates with EXACTLY the FMA sequence DO_TENSOR gives it
+//                (same xv load feeds both accumulators, same n order, same
+//                acc += s * p order), then applies the silu_mul formula
+//                char-identically:  out = (x / (1.0 + exp(-x))) * u
+//                and writes the single fused output to Y0 (fo6 layout, NFF
+//                rows). Y1/Y2 are untouched. Saves the silu_mul dispatch:
+//                1 dispatch per FFN (24/token on the 2B).
+//
+//   R2 != 0  ->  bit-identical copy of the byte3nr 3-tensor path.
+//
+// Token-exactness: FMA order matches byte3nr + silu_mul run sequentially.
+// The interleaved up-row FMAs use separate accumulators, so neither row's
+// rounding chain is disturbed.
+//
+// PTQ1_0 block = 128 weights in 28 bytes: 26 trit bytes then an fp16 scale at
+// bytes 26..27. Each trit byte carries five base-3 digits (3^5 = 243 < 256):
+//   bytes  0..15 -> trits j, 16+j, 32+j, 48+j, 64+j        (j = 0..15)
+//   bytes 16..23 -> trits 80+j, 88+j, 96+j, 104+j, 112+j   (j = 0..7)
+//   bytes 24..25 -> trits 120+j, 122+j, 124+j, 126+j       (j = 0..1)
+//
+// Push: { int R0; int R1; int R2; int C; }
+// Bindings: 0 W0 1 Y0 2 W1 3 Y1 4 W2 5 Y2 6 X
+// Silu-mode wiring: W0=gate codes, Y0=fo6 out, W1=up codes, Y1/Y2/W2=dummy
+// valid buffers (unread/unwritten), X=input, push {NFF, NFF, 0, C}.
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require   // subgroupAdd replaces the shared-memory tree + barriers
+
+#ifndef RPW
+#define RPW 2
+#endif
+#define WGS 256
+#define NSUB 8   // 256/32 with 32-lane subgroups (engine pins 32); 4 on GCN wave64 - 8 covers both
+
+layout(local_size_x = WGS) in;
+
+layout(set = 0, binding = 0) readonly buffer W0B { uint W0[]; };
+layout(set = 0, binding = 1) buffer Y0B { float Y0[]; };
+layout(set = 0, binding = 2) readonly buffer W1B { uint W1[]; };
+layout(set = 0, binding = 3) buffer Y1B { float Y1[]; };
+layout(set = 0, binding = 4) readonly buffer W2B { uint W2[]; };
+layout(set = 0, binding = 5) buffer Y2B { float Y2[]; };
+layout(set = 0, binding = 6) readonly buffer XB { float x[]; };
+
+layout(push_constant) uniform PC { int R0; int R1; int R2; int C; } pc;
+
+// The byte->trit LUT is the only shared state now (5 KB). The per-row sums use
+// subgroupAdd, so no per-subgroup shared slots are needed.
+// SLM freed: trit LUT removed (inline tritf below, bit-identical).
+
+const uint P3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
+
+float tritf(uint b, int n) {
+    uint tr = (((b * P3[n]) & 0xFFu) * 3u) >> 8u;
+    return float(tr) - 1.0f;
+}
+#define TRIT(B, N) tritf((B), (N))
+// BPR is a DO_TENSOR parameter, so it must be passed IN: a nested macro body is not
+// rescanned for the outer macro's parameters (C-preprocessor rule) - referencing BPR
+// directly here compiled as an undeclared identifier and left the stale .spv in place.
+#define RD_BYTE(W, ROW, BPR) int((W[(((ROW)*(BPR)+blk)*28+off) >> 2] >> (8u*uint((((ROW)*(BPR)+blk)*28+off) & 3))) & 0xFFu)
+#define RD_SCALE(W, ROW, BPR) unpackHalf2x16(W[((ROW)*(BPR)+blk)*7+6] >> 16).x
+
+// One tensor's row group (RPW rows). W is the weight buffer, Y the output, G the
+// group index within this tensor, RR the row count of this tensor.
+#define DO_TENSOR(W, Y, G, RR, BPR, NTB)                                    \
+    {                                                                       \
+        int base_row = (G) * RPW;                                           \
+        int ra = base_row, rb = base_row + 1;                               \
+        int rc = base_row + 2, rd = base_row + 3;                           \
+        bool ka = ra < (RR), kb = false, kc = false, kd = false;            \
+        if (RPW >= 2) kb = rb < (RR);                                       \
+        if (RPW >= 4) { kc = rc < (RR); kd = rd < (RR); }                   \
+        if (!ka) ra = 0;                                                    \
+        if (!kb) rb = 0;                                                    \
+        if (!kc) rc = 0;                                                    \
+        if (!kd) rd = 0;                                                    \
+        float accA = 0.0, accB = 0.0, accC = 0.0, accD = 0.0;               \
+        for (int bi = int(lane); bi < (NTB); bi += int(sgsz)) {             \
+            int blk = bi / 26;                                              \
+            int off = bi - blk * 26;                                        \
+            int bs = blk << 7;                                              \
+            float sa = RD_SCALE(W, ra, BPR);                                     \
+            uint b5a = RD_BYTE(W, ra, BPR);                                   \
+            int b5b = 0, b5c = 0, b5d = 0; float sb = 0.0, sc = 0.0, sd = 0.0; \
+            if (RPW >= 2) {                                                 \
+                sb = RD_SCALE(W, rb, BPR);                                       \
+                b5b = RD_BYTE(W, rb, BPR);                                   \
+            }                                                               \
+            if (RPW >= 4) {                                                 \
+                sc = RD_SCALE(W, rc, BPR);                                       \
+                sd = RD_SCALE(W, rd, BPR);                                       \
+                b5c = RD_BYTE(W, rc, BPR);                                   \
+                b5d = RD_BYTE(W, rd, BPR);                                   \
+            }                                                               \
+            float pA = 0.0, pB = 0.0, pC = 0.0, pD = 0.0;                   \
+            if (off < 16) {                                                 \
+                for (int n = 0; n < 5; ++n) {                               \
+                    float xv = x[bs + off + (n << 4)];                      \
+                    pA += TRIT(b5a, n) * xv;                                \
+                    if (RPW >= 2) pB += TRIT(b5b, n) * xv;                  \
+                    if (RPW >= 4) { pC += TRIT(b5c, n) * xv; pD += TRIT(b5d, n) * xv; } \
+                }                                                           \
+            } else if (off < 24) {                                          \
+                int j = off - 16;                                           \
+                for (int n = 0; n < 5; ++n) {                               \
+                    float xv = x[bs + 80 + j + (n << 3)];                   \
+                    pA += TRIT(b5a, n) * xv;                                \
+                    if (RPW >= 2) pB += TRIT(b5b, n) * xv;                  \
+                    if (RPW >= 4) { pC += TRIT(b5c, n) * xv; pD += TRIT(b5d, n) * xv; } \
+                }                                                           \
+            } else {                                                        \
+                int j = off - 24;                                           \
+                for (int n = 0; n < 4; ++n) {                               \
+                    float xv = x[bs + 120 + (n << 1) + j];                  \
+                    pA += TRIT(b5a, n) * xv;                                \
+                    if (RPW >= 2) pB += TRIT(b5b, n) * xv;                  \
+                    if (RPW >= 4) { pC += TRIT(b5c, n) * xv; pD += TRIT(b5d, n) * xv; } \
+                }                                                           \
+            }                                                               \
+            accA += sa * pA;                                                \
+            if (RPW >= 2) accB += sb * pB;                                  \
+            if (RPW >= 4) { accC += sc * pC; accD += sd * pD; }             \
+        }                                                                   \
+        accA = subgroupAdd(accA);                                               \
+        if (RPW >= 2) accB = subgroupAdd(accB);                                 \
+        if (RPW >= 4) { accC = subgroupAdd(accC); accD = subgroupAdd(accD); }   \
+        if (lane == 0u) {                                                   \
+            if (ka) (Y)[ra] = accA;                                        \
+            if (kb) (Y)[rb] = accB;                                         \
+            if (kc) (Y)[rc] = accC;                                         \
+            if (kd) (Y)[rd] = accD;                                         \
+        }                                                                   \
+    }
+
+// Paired gate+up row group (RPW pairs). Gate weights come from W0, up weights
+// from W1, same row indices, same input x. Each row's FMA chain is statement-
+// for-statement identical to the DO_TENSOR chain above (same xv, same trit
+// order, same acc += s * p), so gate row r here is bit-identical to gate row r
+// from DO_TENSOR(W0,...) and up row r to DO_TENSOR(W1,...). After the
+// subgroupAdd reduction each pair is combined with the silu_mul formula,
+// copied char-identically:  out = (x / (1.0 + exp(-x))) * u.
+// RG = gate rows (R0), RU = up rows (R1); both must be NFF in FFN use.
+#define DO_PAIR(G, RG, RU, BPR, NTB)                                        \
+    {                                                                       \
+        int base_row = (G) * RPW;                                           \
+        int ra = base_row, rb = base_row + 1;                               \
+        int rc = base_row + 2, rd = base_row + 3;                           \
+        bool ka = ra < (RG), kb = false, kc = false, kd = false;            \
+        bool ua = ra < (RU), ub = false, uc = false, ud = false;            \
+        if (RPW >= 2) { kb = rb < (RG); ub = rb < (RU); }                   \
+        if (RPW >= 4) { kc = rc < (RG); kd = rd < (RG); uc = rc < (RU); ud = rd < (RU); } \
+        if (!ka) ra = 0;                                                    \
+        if (!kb) rb = 0;                                                    \
+        if (!kc) rc = 0;                                                    \
+        if (!kd) rd = 0;                                                    \
+        float gA = 0.0, gB = 0.0, gC = 0.0, gD = 0.0;                       \
+        float uA = 0.0, uB = 0.0, uC = 0.0, uD = 0.0;                       \
+        for (int bi = int(lane); bi < (NTB); bi += int(sgsz)) {             \
+            int blk = bi / 26;                                              \
+            int off = bi - blk * 26;                                        \
+            int bs = blk << 7;                                              \
+            float sa = RD_SCALE(W0, ra, BPR);                                    \
+            uint b5a = RD_BYTE(W0, ra, BPR);                                  \
+            float ta = RD_SCALE(W1, ra, BPR);                                    \
+            uint c5a = RD_BYTE(W1, ra, BPR);                                  \
+            int b5b = 0, b5c = 0, b5d = 0, c5b = 0, c5c = 0, c5d = 0;       \
+            float sb = 0.0, sc = 0.0, sd = 0.0, tb = 0.0, tc = 0.0, td = 0.0; \
+            if (RPW >= 2) {                                                 \
+                sb = RD_SCALE(W0, rb, BPR);                                       \
+                b5b = RD_BYTE(W0, rb, BPR);                                   \
+                tb = RD_SCALE(W1, rb, BPR);                                       \
+                c5b = RD_BYTE(W1, rb, BPR);                                   \
+            }                                                               \
+            if (RPW >= 4) {                                                 \
+                sc = RD_SCALE(W0, rc, BPR);                                       \
+                sd = RD_SCALE(W0, rd, BPR);                                       \
+                b5c = RD_BYTE(W0, rc, BPR);                                   \
+                b5d = RD_BYTE(W0, rd, BPR);                                   \
+                tc = RD_SCALE(W1, rc, BPR);                                       \
+                td = RD_SCALE(W1, rd, BPR);                                       \
+                c5c = RD_BYTE(W1, rc, BPR);                                   \
+                c5d = RD_BYTE(W1, rd, BPR);                                   \
+            }                                                               \
+            float pGA = 0.0, pGB = 0.0, pGC = 0.0, pGD = 0.0;               \
+            float pUA = 0.0, pUB = 0.0, pUC = 0.0, pUD = 0.0;               \
+            if (off < 16) {                                                 \
+                for (int n = 0; n < 5; ++n) {                               \
+                    float xv = x[bs + off + (n << 4)];                      \
+                    pGA += TRIT(b5a, n) * xv;                                \
+                    pUA += TRIT(c5a, n) * xv;                                \
+                    if (RPW >= 2) { pGB += TRIT(b5b, n) * xv; pUB += TRIT(c5b, n) * xv; } \
+                    if (RPW >= 4) { pGC += TRIT(b5c, n) * xv; pUC += TRIT(c5c, n) * xv; pGD += TRIT(b5d, n) * xv; pUD += TRIT(c5d, n) * xv; } \
+                }                                                           \
+            } else if (off < 24) {                                          \
+                int j = off - 16;                                           \
+                for (int n = 0; n < 5; ++n) {                               \
+                    float xv = x[bs + 80 + j + (n << 3)];                   \
+                    pGA += TRIT(b5a, n) * xv;                                \
+                    pUA += TRIT(c5a, n) * xv;                                \
+                    if (RPW >= 2) { pGB += TRIT(b5b, n) * xv; pUB += TRIT(c5b, n) * xv; } \
+                    if (RPW >= 4) { pGC += TRIT(b5c, n) * xv; pUC += TRIT(c5c, n) * xv; pGD += TRIT(b5d, n) * xv; pUD += TRIT(c5d, n) * xv; } \
+                }                                                           \
+            } else {                                                        \
+                int j = off - 24;                                           \
+                for (int n = 0; n < 4; ++n) {                               \
+                    float xv = x[bs + 120 + (n << 1) + j];                  \
+                    pGA += TRIT(b5a, n) * xv;                                \
+                    pUA += TRIT(c5a, n) * xv;                                \
+                    if (RPW >= 2) { pGB += TRIT(b5b, n) * xv; pUB += TRIT(c5b, n) * xv; } \
+                    if (RPW >= 4) { pGC += TRIT(b5c, n) * xv; pUC += TRIT(c5c, n) * xv; pGD += TRIT(b5d, n) * xv; pUD += TRIT(c5d, n) * xv; } \
+                }                                                           \
+            }                                                               \
+            gA += sa * pGA;                                                 \
+            uA += ta * pUA;                                                 \
+            if (RPW >= 2) { gB += sb * pGB; uB += tb * pUB; }                \
+            if (RPW >= 4) { gC += sc * pGC; uC += tc * pUC; gD += sd * pGD; uD += td * pUD; } \
+        }                                                                   \
+        gA = subgroupAdd(gA); uA = subgroupAdd(uA);                             \
+        if (RPW >= 2) { gB = subgroupAdd(gB); uB = subgroupAdd(uB); }           \
+        if (RPW >= 4) { gC = subgroupAdd(gC); uC = subgroupAdd(uC); gD = subgroupAdd(gD); uD = subgroupAdd(uD); } \
+        if (lane == 0u) {                                                   \
+            if (ka && ua) { float xx = gA; Y0[ra] = (xx / (1.0 + exp(-xx))) * uA; } \
+            if (kb && ub) { float xx = gB; Y0[rb] = (xx / (1.0 + exp(-xx))) * uB; } \
+            if (kc && uc) { float xx = gC; Y0[rc] = (xx / (1.0 + exp(-xx))) * uC; } \
+            if (kd && ud) { float xx = gD; Y0[rd] = (xx / (1.0 + exp(-xx))) * uD; } \
+        }                                                                   \
+    }
+
+void main() {
+    uint sgsz = gl_SubgroupSize;
+    uint nsub = uint(gl_WorkGroupSize.x) / sgsz;
+    int sub = int(gl_SubgroupID);
+    uint lane = gl_SubgroupInvocationID;
+
+    int R0 = pc.R0, R1 = pc.R1, R2 = pc.R2;
+    int C = pc.C;
+    int bpr = C >> 7;
+    int ntb = bpr * 26;
+
+    int G0 = (R0 + RPW - 1) / RPW;
+    int G1 = (R1 + RPW - 1) / RPW;
+    int G2 = (R2 + RPW - 1) / RPW;
+
+    int gid = int(gl_WorkGroupID.x) * int(nsub) + sub;
+
+    // Silu-fused path first: R2 == 0 selects paired gate+up with the SwiGLU
+    // folded in. Otherwise the original 3-tensor dispatch below is untouched.
+    if (R2 == 0) {
+        if (gid < G0) {
+            DO_PAIR(gid, R0, R1, bpr, ntb)
+        }
+    // One branch per wave; the weight buffer is then statically known.
+    } else if (gid < G0) {
+        DO_TENSOR(W0, Y0, gid, R0, bpr, ntb)
+    } else if (gid < G0 + G1) {
+        DO_TENSOR(W1, Y1, gid - G0, R1, bpr, ntb)
+    } else if (gid < G0 + G1 + G2) {
+        DO_TENSOR(W2, Y2, gid - G0 - G1, R2, bpr, ntb)
+    }
+}
