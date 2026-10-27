@@ -8,45 +8,42 @@
 //   wave  64 -> RPW 2   (gfx803 / RX 580: the case this was written for)
 //   wave  32 -> RPW 4   (RDNA and earlier 32-wide parts)
 //
-// The point is not "use both halves of a wave64" - a wave64 has no half to fill. The
-// point is independent work per wave. With one row per wave every lane runs a single
-// dependent accumulator and loads every x element for that one row. With RPW rows the
-// same x load feeds RPW accumulators:
+// The point is independent work per wave. With RPW rows the same x load feeds RPW
+// accumulators, so x traffic falls by RPW and the scheduler gets RPW independent
+// FMA chains. The accumulators are explicit scalars, not arrays indexed by a loop
+// variable: a runtime-indexed array lands in scratch memory on GCN.
 //
-//     xv = x[c]                    one load
-//     acc0 += w0 * xv
-//     acc1 += w1 * xv              same xv
+// Token axis: T rides gl_WorkGroupID.y (see the push constants). T workgroups per
+// row-block share the same weight stream through L2 while keeping the proven
+// 4-chain lane shape. Per-(row,token) FMA order is unchanged, so gy=T is
+// bit-identical to T=1 (selftest-verified, including a non-contiguous xs).
 //
-// so x traffic falls by RPW and the scheduler gets RPW independent FMA chains. That
-// matters because the kernel is issue-throughput bound: splitting a SINGLE row into
-// four accumulators measured 0.98x (same MACs, only reordered), whereas this does RPW
-// times the MACs per x load.
+// Inline trit decode: the same formula the old 5 KB tlf[] LUT was built from,
+// evaluated per use. Identical inputs produce identical floats, so every row's
+// FMA sequence is unchanged. Zero shared memory: the Xe-core keeps its full
+// 160 KB L1 for the weight stream.
 //
-// The accumulators are explicit scalars, not arrays indexed by a loop variable. An
-// array indexed at runtime lands in scratch memory on GCN: that mistake made the T=2
-// batched kernel 5.7x slower once already.
+// SOFTWARE PIPELINE: the next iteration's weight bytes and scales are loaded
+// BEFORE the current iteration's FMAs (2-stage). The FMA sequence per row is
+// exactly the interleaved order — prefetches only fill registers — but the
+// memory pipeline carries two iterations of independent loads per lane instead
+// of one. Bit-identical by construction.
 //
-// Bit-identity: each row's accumulator receives exactly the sequence of FMAs the
-// single-row kernel gives it, so every row is bit-identical and the speculative-verify
-// invariant is untouched.
+// SHERLOCKED (2026-10-28): x[] staged in SLM measured 20.6 -> 10.8 tok/s (SLM
+// allocation drops L1 160->64 KB); a 3-phase uniform restructure measured 18.3
+// vs the interleaved loop (loop setup + broken x locality beat the divergence
+// win); RPW=8 measured 2.3x below RPW=4 (driver SIMD-width downgrade, not VGPR
+// — Intel's register file is statically allocated). Do not re-add any of these
+// without an occupancy-aware redesign.
 //
 // PTQ1_0 block = 128 weights in 28 bytes: 26 trit bytes then an fp16 scale at
-// bytes 26..27. Each trit byte carries five base-3 digits (3^5 = 243 < 256):
-//   bytes  0..15 -> trits j, 16+j, 32+j, 48+j, 64+j        (j = 0..15)
-//   bytes 16..23 -> trits 80+j, 88+j, 96+j, 104+j, 112+j   (j = 0..7)
-//   bytes 24..25 -> trits 120+j, 122+j, 124+j, 126+j       (j = 0..1)
+// bytes 26..27. Each trit byte carries five base-3 digits (3^5 = 243 < 256).
 //
-// Push: { int R; int C; }
+// Push: { int R; int C; int T; int xs; }  (T=1, xs=C for the decode path)
 // Bindings: 0 raw blocks as uint words, 1 x (float), 2 out (float)
-//
-// SHERLOCKED (2026-10-28): staging x[] in shared memory measured 20.6 -> 10.8
-// tok/s (XMAX=6144: 10.3). The stage buffer (8-24 KB on top of the 5 KB tlf LUT)
-// cuts resident workgroups per Xe-core ~3-6x, and the occupancy loss dwarfs the
-// global-load latency it removes on this driver. Direct x loads + L1 caching win.
-// Do not re-add without an occupancy-aware redesign (e.g. staging only tlf-sized).
 #version 450
 #extension GL_KHR_shader_subgroup_basic : require
-#extension GL_KHR_shader_subgroup_arithmetic : require   // subgroupAdd replaces the shared-memory tree + 5 barriers per byte
+#extension GL_KHR_shader_subgroup_arithmetic : require
 
 #ifndef RPW
 #define RPW 2
@@ -62,9 +59,6 @@ layout(set = 0, binding = 2) buffer BO { float out_[]; };
 
 layout(push_constant) uniform PC { int R; int C; int T; int xs; } pc;
 
-// SLM unused: reduction is subgroupAdd, trits decode inline. Zero shared
-// memory = the Xe-core keeps its full 160 KB L1 for the weight stream.
-
 const uint P3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
 
 uint block_byte(int row, int bpr, int blk, int byteInBlk) {
@@ -79,14 +73,6 @@ float block_scale(int row, int bpr, int blk) {
     return unpackHalf2x16(w[sb + 6] >> 16).x;
 }
 
-// Inline trit decode — the SAME formula the old 5 KB tlf[] LUT was built from
-// (tr = (((b * 3^n) & 0xFF) * 3) >> 8, value tr-1 in {-1,0,1}), evaluated per
-// use. Identical inputs produce identical floats, so every row's FMA sequence
-// is unchanged and bit-identity holds. Replaces ~260 shared-memory loads per
-// lane (5 trits x RPW rows x 13 byte-iterations) with pipelined ALU, and frees
-// the 5 KB that hurt occupancy. (The earlier "on-the-fly decode broke
-// correctness" attempt failed on a GLSL cast issue, not the math: the fix is
-// doing all the digit math in uint and converting the finished digit once.)
 float tritf(uint b, int n) {
     uint tr = (((b * P3[n]) & 0xFFu) * 3u) >> 8u;
     return float(tr) - 1.0f;
@@ -97,12 +83,10 @@ void main() {
     uint sgsz = gl_SubgroupSize;
     uint nsub = uint(gl_WorkGroupSize.x) / sgsz;
     int sub = int(gl_SubgroupID);
+    uint lane = gl_SubgroupInvocationID;
 
-  int R = pc.R;
+    int R = pc.R;
     int C = pc.C;
-    // Token axis on gl_WorkGroupID.y: T workgroups per row-block share the same
-    // weight stream through L2 (4 MB) while keeping bytenr4's proven 4-chain
-    // lane shape. T=1, xs=C is bit-identical to the original single-token path.
     int T = pc.T; if (T <= 0) T = 1;
     int xs = pc.xs; if (xs <= 0) xs = C;
     int tok = int(gl_WorkGroupID.y);
@@ -120,7 +104,7 @@ void main() {
 #endif
     int r4 = 0, r5 = 0, r6 = 0, r7 = 0;   // only used at RPW >= 8 (declared
     bool k4 = false, k5 = false, k6 = false, k7 = false;   // unconditionally so
-#if RPW >= 8                               // the phase macros compile at all widths)
+#if RPW >= 8                               // the RPW>=8 blocks compile at all widths)
     r4 = row0 + 4; r5 = row0 + 5; r6 = row0 + 6; r7 = row0 + 7;
     k4 = r4 < R; k5 = r5 < R; k6 = r6 < R; k7 = r7 < R;
 #endif
@@ -135,51 +119,39 @@ void main() {
     if (!k7) r7 = 0;
 #endif
 
-    uint lane = gl_SubgroupInvocationID;
     int bpr = C >> 7;
     int ntb = bpr * 26;
 
     float acc0 = 0.0, acc1 = 0.0, acc2 = 0.0, acc3 = 0.0;
-    // acc4..7 declared unconditionally: dead code at RPW < 8.
-    float acc4 = 0.0, acc5 = 0.0, acc6 = 0.0, acc7 = 0.0;
+    float acc4 = 0.0, acc5 = 0.0, acc6 = 0.0, acc7 = 0.0;   // dead at RPW < 8
 
-    // SHERLOCKED (2026-10-28): 3-phase uniform restructure (off 0..15 / 16..23 /
-    // 24..25 as separate branch-free loops) measured 33.1 -> 18.3 tok/s. The
-    // lockstep-divergence saved was outweighed by 3x loop setup and a worse x
-    // access pattern (phase C touches 2 of every 26 bytes per block). The
-    // interleaved loop below is the keeper; the LUT removal above is the win.
-    for (int bi = int(lane); bi < ntb; bi += int(sgsz)) {
-        int blk = bi / 26;
-        int off = bi - blk * 26;
-        int base = blk << 7;
-
-        uint b50 = block_byte(r0, bpr, blk, off);
-        float sc0 = block_scale(r0, bpr, blk);
-#if RPW >= 2
-        uint b51 = block_byte(r1, bpr, blk, off);
-        float sc1 = block_scale(r1, bpr, blk);
-#endif
-#if RPW >= 4
-        uint b52 = block_byte(r2, bpr, blk, off);
-        float sc2 = block_scale(r2, bpr, blk);
-        uint b53 = block_byte(r3, bpr, blk, off);
-        float sc3 = block_scale(r3, bpr, blk);
-#endif
-#if RPW >= 8
-        uint b54 = block_byte(r4, bpr, blk, off);
-        float sc4 = block_scale(r4, bpr, blk);
-        uint b55 = block_byte(r5, bpr, blk, off);
-        float sc5 = block_scale(r5, bpr, blk);
-        uint b56 = block_byte(r6, bpr, blk, off);
-        float sc6 = block_scale(r6, bpr, blk);
-        uint b57 = block_byte(r7, bpr, blk, off);
-        float sc7 = block_scale(r7, bpr, blk);
-#endif
+    // ---- 2-stage software pipeline -----------------------------------------
+    // n* hold the NEXT iteration's loads; the loop body consumes them and then
+    // prefetches the iteration after. FMA order per row is exactly the
+    // interleaved bi sequence.
+    int bi = int(lane);
+    int nblk = bi / 26; int noff = bi - nblk * 26; int nbase = nblk << 7;
+    uint n50 = block_byte(r0, bpr, nblk, noff); float ns0 = block_scale(r0, bpr, nblk);
+    uint n51 = 0; float ns1 = 0.0f; uint n52 = 0, n53 = 0; float ns2 = 0.0f, ns3 = 0.0f;
+    if (RPW >= 2) { n51 = block_byte(r1, bpr, nblk, noff); ns1 = block_scale(r1, bpr, nblk); }
+    if (RPW >= 4) { n52 = block_byte(r2, bpr, nblk, noff); ns2 = block_scale(r2, bpr, nblk);
+                    n53 = block_byte(r3, bpr, nblk, noff); ns3 = block_scale(r3, bpr, nblk); }
+    while (bi < ntb) {
+        int blk = nblk, off = noff, base = nbase;
+        uint b50 = n50; float sc0 = ns0;
+        uint b51 = n51; float sc1 = ns1;
+        uint b52 = n52; float sc2 = ns2;
+        uint b53 = n53; float sc3 = ns3;
+        int nxt = bi + int(sgsz);
+        if (nxt < ntb) {
+            nblk = nxt / 26; noff = nxt - nblk * 26; nbase = nblk << 7;
+            n50 = block_byte(r0, bpr, nblk, noff); ns0 = block_scale(r0, bpr, nblk);
+            if (RPW >= 2) { n51 = block_byte(r1, bpr, nblk, noff); ns1 = block_scale(r1, bpr, nblk); }
+            if (RPW >= 4) { n52 = block_byte(r2, bpr, nblk, noff); ns2 = block_scale(r2, bpr, nblk);
+                            n53 = block_byte(r3, bpr, nblk, noff); ns3 = block_scale(r3, bpr, nblk); }
+        }
 
         float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;
-#if RPW >= 8
-        float p4 = 0.0f, p5 = 0.0f, p6 = 0.0f, p7 = 0.0f;
-#endif
 
         if (off < 16) {                    // five digits, stride 16
             for (int n = 0; n < 5; ++n) {
@@ -191,12 +163,6 @@ void main() {
 #if RPW >= 4
                 p2 += TRIT(b52, n) * xv;
                 p3 += TRIT(b53, n) * xv;
-#endif
-#if RPW >= 8
-                p4 += TRIT(b54, n) * xv;
-                p5 += TRIT(b55, n) * xv;
-                p6 += TRIT(b56, n) * xv;
-                p7 += TRIT(b57, n) * xv;
 #endif
             }
         } else if (off < 24) {             // five digits, stride 8, from trit 80
@@ -211,12 +177,6 @@ void main() {
                 p2 += TRIT(b52, n) * xv;
                 p3 += TRIT(b53, n) * xv;
 #endif
-#if RPW >= 8
-                p4 += TRIT(b54, n) * xv;
-                p5 += TRIT(b55, n) * xv;
-                p6 += TRIT(b56, n) * xv;
-                p7 += TRIT(b57, n) * xv;
-#endif
             }
         } else {                           // four digits, from trit 120
             int j = off - 24;
@@ -230,12 +190,6 @@ void main() {
                 p2 += TRIT(b52, n) * xv;
                 p3 += TRIT(b53, n) * xv;
 #endif
-#if RPW >= 8
-                p4 += TRIT(b54, n) * xv;
-                p5 += TRIT(b55, n) * xv;
-                p6 += TRIT(b56, n) * xv;
-                p7 += TRIT(b57, n) * xv;
-#endif
             }
         }
         acc0 += sc0 * p0;
@@ -246,12 +200,7 @@ void main() {
         acc2 += sc2 * p2;
         acc3 += sc3 * p3;
 #endif
-#if RPW >= 8
-        acc4 += sc4 * p4;
-        acc5 += sc5 * p5;
-        acc6 += sc6 * p6;
-        acc7 += sc7 * p7;
-#endif
+        bi = nxt;
     }
 
     // Per-row sums via subgroupAdd (no shared-memory tree, no barriers).
@@ -263,12 +212,6 @@ void main() {
     acc2 = subgroupAdd(acc2);
     acc3 = subgroupAdd(acc3);
 #endif
-#if RPW >= 8
-    acc4 = subgroupAdd(acc4);
-    acc5 = subgroupAdd(acc5);
-    acc6 = subgroupAdd(acc6);
-    acc7 = subgroupAdd(acc7);
-#endif
     if (lane == 0u) {
         if (k0) out_[tok * R + r0] = acc0;
 #if RPW >= 2
@@ -278,12 +221,5 @@ void main() {
         if (k2) out_[tok * R + r2] = acc2;
         if (k3) out_[tok * R + r3] = acc3;
 #endif
-#if RPW >= 8
-        if (k4) out_[tok * R + r4] = acc4;
-        if (k5) out_[tok * R + r5] = acc5;
-        if (k6) out_[tok * R + r6] = acc6;
-        if (k7) out_[tok * R + r7] = acc7;
-#endif
     }
 }
-

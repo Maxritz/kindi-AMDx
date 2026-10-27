@@ -1109,11 +1109,11 @@ Pipe pffn_fused=mkpipe((shdir+"/ffn_fused.comp.spv").c_str(),9,12);
     // measured tok/s, not on theory.
     int g5rpw_eff = g5rpw;
     { const char* e = getenv("KINDI_RPW");
-      if (e && *e) { int v = atoi(e); if (v==1||v==2||v==4||v==8) g5rpw_eff = v; } }
+      if (e && *e) { int v = atoi(e); if (v==1||v==2||v==4) g5rpw_eff = v; } }
     Pipe pg5nr1=mkpipe((shdir+"/g5ptq_bytenr1.comp.spv").c_str(),3,16);
     Pipe pg5nr2=mkpipe((shdir+"/g5ptq_bytenr2.comp.spv").c_str(),3,16);
     Pipe pg5nr4=mkpipe((shdir+"/g5ptq_bytenr4.comp.spv").c_str(),3,16);
-    Pipe pg5nr8=mkpipe((shdir+"/g5ptq_bytenr8.comp.spv").c_str(),3,16);
+    // pg5nr8 removed: RPW=8 measured 2.3x below RPW=4 on the Intel driver (SIMD-width downgrade).
     // Fused 3-tensor variants at the same three widths.
     Pipe pg53nr1=mkpipe((shdir+"/g5ptq_byte3nr1.comp.spv").c_str(),7,24);
     Pipe pg53nr2=mkpipe((shdir+"/g5ptq_byte3nr2.comp.spv").c_str(),7,24);
@@ -1368,7 +1368,7 @@ Buf ffn_ctr=mkbuf(4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST
                 // 256 threads / wave * rpw rows per workgroup. KINDI_RPW overrides
                 // for A/B (8 halves the workgroup count; see g5ptq_bytenr.comp).
                 Pipe* P = (g5rpw_eff == 1) ? &pg5nr1 : (g5rpw_eff == 2) ? &pg5nr2
-                        : (g5rpw_eff == 8) ? &pg5nr8 : &pg5nr4;
+                        : &pg5nr4;
                 int wg = 256 / (int)g_wave;
                 int per = wg * g5rpw_eff;
                 bindbufs(*P,bufs);
@@ -2104,7 +2104,7 @@ Buf ffn_ctr=mkbuf(4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST
             return true;
         }
         Pipe* P = (g5rpw_eff == 1) ? &pg5nr1 : (g5rpw_eff == 2) ? &pg5nr2
-                : (g5rpw_eff == 8) ? &pg5nr8 : &pg5nr4;
+                : &pg5nr4;
         int wg = 256 / (int)g_wave;
         int per = wg * g5rpw_eff;
         bindbufs(*P,bufs);
@@ -2645,7 +2645,7 @@ Buf ffn_ctr=mkbuf(4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST
                 Buf z2=mkbuf((VkDeviceSize)R*2*4,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
                 { std::vector<Buf> b={codebufs[n5],xb,z1};
                   Pipe* P = (g5rpw_eff == 1) ? &pg5nr1 : (g5rpw_eff == 2) ? &pg5nr2
-                          : (g5rpw_eff == 8) ? &pg5nr8 : &pg5nr4;
+                          : &pg5nr4;
                   int wg = 256 / (int)g_wave, per = wg * g5rpw_eff;
                   bindbufs(*P,b);
                   struct{int R,C,T,xs;}pc{R,C,1,0};
@@ -2690,7 +2690,7 @@ Buf ffn_ctr=mkbuf(4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST
                         upload(&x2, v.data(), v.size()*4); }
                     { std::vector<Buf> b={codebufs[n5],x2,zt};
                       Pipe* P = (g5rpw_eff == 1) ? &pg5nr1 : (g5rpw_eff == 2) ? &pg5nr2
-                              : (g5rpw_eff == 8) ? &pg5nr8 : &pg5nr4;
+                              : &pg5nr4;
                       int wg = 256 / (int)g_wave, per = wg * g5rpw_eff;
                       bindbufs(*P,b);
                       struct{int R,C,T,xs;}pc{R,C,2,W};
@@ -2725,7 +2725,7 @@ Buf ffn_ctr=mkbuf(4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST
                 Buf fu0=mkbuf((VkDeviceSize)R*4,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
                 { std::vector<Buf> b={codebufs[n5],xb,fu0};
                   Pipe* P = (g5rpw_eff == 1) ? &pg5nr1 : (g5rpw_eff == 2) ? &pg5nr2
-                          : (g5rpw_eff == 8) ? &pg5nr8 : &pg5nr4;
+                          : &pg5nr4;
                   int wg = 256 / (int)g_wave, per = wg * g5rpw_eff;
                   bindbufs(*P,b);
                   struct{int R,C,T,xs;}pc{R,C,1,0};
