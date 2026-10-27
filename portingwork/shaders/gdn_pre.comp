@@ -26,7 +26,7 @@
 //   (bit-identical); only exp()/log1p()/sqrt() last-ulp differences on GCN.
 #version 450
 #extension GL_KHR_shader_subgroup_shuffle : require
-#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+// Intel iGPU port (shaderFloat64=false): fp64 norm sum -> fp32, same XOR order
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer B0 { float xn[]; };
 layout(set = 0, binding = 1) readonly buffer B1 { uint bw[]; };
@@ -45,7 +45,7 @@ shared float sb[256];
 shared float sa[256];
 shared float row[128];
 shared float scl;
-float64_t wsum_d(float64_t v) {
+float wsum_d(float v) {
   v += subgroupShuffleXor(v, 16u);
   v += subgroupShuffleXor(v, 8u);
   v += subgroupShuffleXor(v, 4u);
@@ -91,15 +91,15 @@ void main() {
       row[t] = y;
     }
     barrier();
-    float64_t acc = float64_t(0.0);
+    float acc = 0.0f;
     if (t < 32u) {
       for (int e = int(t); e < HK; e += 32) {
-        float64_t vv = float64_t(row[uint(e)]);
+        float vv = row[uint(e)];
         acc += vv * vv;
       }
     }
     acc = wsum_d(acc);
-    if (t == 0u) scl = 1.0f / max(sqrt(float(acc)), 1e-6f);
+    if (t == 0u) scl = 1.0f / max(sqrt(acc), 1e-6f);
     barrier();
     if (t < uint(HK)) qk[(b - uint(NV)) * uint(HK) + t] = row[t] * scl;
     return;

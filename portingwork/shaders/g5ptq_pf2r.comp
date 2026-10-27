@@ -42,7 +42,7 @@
 #define RPW 2
 #endif
 #define WGS 256
-#define NSUB (WGS / 64)
+#define NSUB 8   // 256/32 with 32-lane subgroups (engine pins 32); 4 on GCN wave64 - 8 covers both
 
 layout(local_size_x = WGS) in;
 
@@ -154,7 +154,7 @@ void main() {
     sh[sub][1][2][lane] = B2;
     sh[sub][1][3][lane] = B3;
     barrier();
-    for (int st = 32; st > 0; st >>= 1) {
+    for (int st = int(gl_SubgroupSize) >> 1; st > 0; st >>= 1) {
         if (int(lane) < st) {
             for (int r = 0; r < 2; ++r) {
                 for (int t = 0; t < 4; ++t) {

@@ -38,7 +38,7 @@ layout(set = 0, binding = 6) readonly buffer XB { float x[]; };
 
 layout(push_constant) uniform PC { int R0; int R1; int R2; int C; } pc;
 
-shared float sh[4][64];
+shared float sh[8][32];   // 8 subgroups of 32 lanes in a 256-thread WG (4 of 64 on GCN)
 // trit-1 as a float, five per byte: 5 KB of LDS, built once per workgroup.
 //
 // This replaces the integer decode in the inner loop. Previously each of the five
@@ -95,7 +95,7 @@ const uint P3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
 #define REDUCE_STORE(Y, ROW, OK)                                            \
     sh[sub][lane] = acc;                                                    \
     barrier();                                                              \
-    for (int st = 32; st > 0; st >>= 1) {                                   \
+    for (int st = int(gl_SubgroupSize) >> 1; st > 0; st >>= 1) {                                   \
         if (int(lane) < st) sh[sub][lane] += sh[sub][lane + st];            \
         barrier();                                                          \
     }                                                                       \

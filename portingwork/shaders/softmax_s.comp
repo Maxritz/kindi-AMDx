@@ -3,15 +3,16 @@
 //   bindings: 0 s(float, nh*n), in place
 //   push: { int n; float scale; }   grid = nh
 #version 450
-#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+// Intel iGPU port (shaderFloat64=false): dp4a/probe verified; fp64 ext not needed
 layout(local_size_x = 256) in;
 
 layout(set = 0, binding = 0) buffer BS { float s[]; };
 
 layout(push_constant) uniform PC { int n; float scale; } pc;
 
+// Intel iGPU port (shaderFloat64=false): the exp-sum tree runs in fp32 (CPU mirror is fp32 too)
 shared float red[256];
-shared double dred[256];
+shared float dred[256];
 shared float pmax;
 shared float pinv;
 
@@ -33,15 +34,15 @@ void main() {
   barrier();
   float m = pmax;
 
-  double part = 0.0;
-  for (int i = t; i < n; i += 256) part += double(exp(s[base + i] * pc.scale - m));
+  float part = 0.0;
+  for (int i = t; i < n; i += 256) part += exp(s[base + i] * pc.scale - m);
   dred[t] = part;
   barrier();
   for (int st = 128; st > 0; st >>= 1) {
     if (t < st) dred[t] += dred[t + st];
     barrier();
   }
-  if (t == 0) pinv = float(1.0 / dred[0]);
+  if (t == 0) pinv = 1.0f / dred[0];
   barrier();
   float inv = pinv;
   for (int i = t; i < n; i += 256) s[base + i] = exp(s[base + i] * pc.scale - m) * inv;

@@ -19,7 +19,10 @@
 //   6: write   float xo[]     (len C, folded output)
 #version 450
 #extension GL_KHR_shader_subgroup_shuffle : require
-#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+// Intel iGPU port (Meteor Lake, shaderFloat64=false): fp64 accumulation replaced by
+// fp32 with the same add order (per-lane sequential + subtree XORs). The CPU mirror
+// is fp32 as well, so this matches reference precision without the driver's silent
+// fp64 emulation, which produced wrong results (constant 0.718x scale, later NaN).
 layout(local_size_x = 512) in;
 
 layout(set = 0, binding = 0) readonly buffer Bx { float x[]; };
@@ -33,10 +36,10 @@ layout(set = 0, binding = 6) buffer Bxo { float xo[]; };
 layout(push_constant) uniform PC { int C; int add; int HB; } pc;
 
 shared float xs[4096];
-shared float64_t red[16];
+shared float red[16];
 shared float bscale;
 
-float64_t wsum_d(float64_t v) {
+float wsum_d(float v) {
   v += subgroupShuffleXor(v, 16);
   v += subgroupShuffleXor(v, 8);
   v += subgroupShuffleXor(v, 4);
@@ -55,7 +58,7 @@ void main() {
   int chunk = (HB < 0 ? 512 : HB);
   uint c0 = gl_WorkGroupID.x * uint(chunk);
 
-  float64_t acc = float64_t(0.0);
+  float acc = 0.0f;
   for (int e = int(j); e < C; e += 512) {
     float xf = x[e];
     if (add != 0) {
@@ -63,16 +66,15 @@ void main() {
       for (int i = 1; i < add; ++i) s += r[i * C + e];
       xf = x[e] + s;
     }
-    float64_t v = float64_t(xf);
-    acc += v * v;
+    acc += xf * xf;
   }
   acc = wsum_d(acc);
   if (lane == 0u) red[wp] = acc;
   barrier();
   if (wp == 0u) {
-    float64_t t = (lane < 16u) ? red[lane] : float64_t(0.0);
+    float t = (lane < 16u) ? red[lane] : 0.0f;
     t = wsum_d(t);
-    if (lane == 0u) bscale = 1.0f / sqrt(float(t / float64_t(float(C))) + 1e-6f);
+    if (lane == 0u) bscale = 1.0f / sqrt(t / float(C) + 1e-6f);
   }
   barrier();
   float s = bscale;

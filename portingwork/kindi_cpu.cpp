@@ -203,6 +203,7 @@ int main(int argc, char**argv){
             float acc=0; for(int i=0;i<512;++i){ float ww=w[(c0<<9)+i]; acc+= (popc((uint32_t)(i&j))&1)? -ww : ww; }
             h[j2]=sD[j2]*(acc*0.044194173824159220878f);
         }
+        { static int first_call=1; if(dump&&first_call){ fprintf(stderr,"P embed_h: %.4f %.4f %.4f\n",h[0],h[1],h[2]); first_call=0; } }
     };
     int pending=0;
     auto fwht512=[&](F& xs){
@@ -324,6 +325,7 @@ int main(int argc, char**argv){
             F krow(HD); for(int e=0;e<HD;++e) krow[e]=half_to_float(Kc[kvi][(size_t)t*NHKV*HD+kv*HD+e]);
             for(int j=0;j<G;++j){ double a=0; for(int e=0;e<HD;++e) a+=(double)qr[(size_t)(kv*G+j)*HD+e]*krow[e]; sbuf[(size_t)(kv*G+j)*n+t]=(float)(a*0.0625); }
         }
+        if(dump&&il==3&&pos<5) fprintf(stderr,"C scores_raw: %.4f %.4f %.4f\n",sbuf[0],sbuf[1],sbuf[2]);
         for(int hh=0;hh<NH;++hh){ float mx=-1e30f; for(int t=0;t<n;++t) mx=fmaxf(mx,sbuf[(size_t)hh*n+t]); double tot=0; for(int t=0;t<n;++t){ sbuf[(size_t)hh*n+t]=expf(sbuf[(size_t)hh*n+t]-mx); tot+=sbuf[(size_t)hh*n+t]; } for(int t=0;t<n;++t) sbuf[(size_t)hh*n+t]/=(float)tot; }
         int nch=(n+255)/256;
         for(int kv=0;kv<NHKV;++kv) for(int c0=0;c0<nch;++c0){
@@ -339,7 +341,7 @@ int main(int argc, char**argv){
         }
         for(int hh=0;hh<NH;++hh) for(int f=0;f<HD;++f){ double acc=apart[(size_t)hh*HD+f]; for(int c0=1;c0<nch;++c0) acc+=apart[(size_t)(c0*NH+hh)*HD+f]; float g=qn[(size_t)hh*2*HD+HD+f]; att[(size_t)hh*HD+f]=(float)(acc*(1.0/(1.0+exp(-g)))); }
         for(int cc0=0;cc0<NH*HD;cc0+=HB){ F xs(512,0.0f); for(int q=0;q<HB;++q) xs[q]=sA[cc0+q]*att[cc0+q]; fwht512(xs); for(int q=0;q<HB;++q) xp[cc0+q]=xs[q]*0.044194173824159220878f; }
-        if(dump&&il==3&&pos==0){ fprintf(stderr,"C q_rope: %.4f %.4f %.4f\n",qr[0],qr[1],qr[2]);
+        if(dump&&il==3&&pos<5){ fprintf(stderr,"C q_rope: %.4f %.4f %.4f\n",qr[0],qr[1],qr[2]);
             fprintf(stderr,"C k_rope: %.4f %.4f %.4f\n",kro[0],kro[1],kro[2]);
             fprintf(stderr,"C scores: %.4f %.4f %.4f\n",sbuf[0],sbuf[1],sbuf[2]);
             fprintf(stderr,"C comb: %.4f %.4f %.4f\n",att[0],att[1],att[2]);

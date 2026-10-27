@@ -32,7 +32,7 @@
 #define RPW 2
 #endif
 #define WGS 256
-#define NSUB (WGS / 64)
+// (portable: uses runtime nsub = WGS/gl_SubgroupSize + subgroupAdd)
 
 layout(local_size_x = WGS) in;
 

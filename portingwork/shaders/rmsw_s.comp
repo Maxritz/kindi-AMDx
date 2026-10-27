@@ -16,13 +16,13 @@
 //   sum); only float(acc/n) division + sqrt() last-ulp differences on GCN.
 #version 450
 #extension GL_KHR_shader_subgroup_shuffle : require
-#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+// Intel iGPU port (shaderFloat64=false): fp64 norm sum -> fp32, same XOR order
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer B0 { float x[]; };
 layout(set = 0, binding = 1) readonly buffer B1 { float w[]; };
 layout(set = 0, binding = 2) buffer B2 { float out_[]; };
 layout(push_constant) uniform PC { int n; int rows; int xs; } pc;
-float64_t wsum_d(float64_t v) {
+float wsum_d(float v) {
   v += subgroupShuffleXor(v, 16u);
   v += subgroupShuffleXor(v, 8u);
   v += subgroupShuffleXor(v, 4u);
@@ -39,16 +39,16 @@ void main() {
   uint xr = r * uint(pc.xs);
   // All lanes run the shuffle chain (converged); OOB rows feed 0.0 and skip stores.
   bool valid = r < uint(pc.rows);
-  float64_t acc = float64_t(0.0);
+  float acc = 0.0f;
   if (valid) {
     for (uint e = lane; e < n; e += 32u) {
-      float64_t v = float64_t(x[xr + e]);
+      float v = x[xr + e];
       acc += v * v;
     }
   }
   acc = wsum_d(acc);
   if (!valid) return;
-  float sc = 1.0f / sqrt(float(acc / float64_t(pc.n)) + 1e-6f);
+  float sc = 1.0f / sqrt(acc / float(pc.n) + 1e-6f);
   uint orow = r * n;
   for (uint e = lane; e < n; e += 32u) out_[orow + e] = (x[xr + e] * sc) * w[e];
 }

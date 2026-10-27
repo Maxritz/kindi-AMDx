@@ -3,7 +3,7 @@
 //   bindings: 0 x(float, n)  1 w(float, n)  2 out(float, n)
 //   push: { int n; float eps; }   grid = rows, local 256
 #version 450
-#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+// Intel iGPU port (shaderFloat64=false): fp64 tree in fp32, same tree shape and add order
 layout(local_size_x = 256) in;
 
 layout(set = 0, binding = 0) readonly buffer Bx { float x[]; };
@@ -12,7 +12,7 @@ layout(set = 0, binding = 2) buffer Bo { float out_[]; };
 
 layout(push_constant) uniform PC { int n; float eps; } pc;
 
-shared double red[256];
+shared float red[256];
 shared float psc;
 
 void main() {
@@ -21,9 +21,9 @@ void main() {
   int n = pc.n;
   uint base = row * uint(n);
 
-  double acc = 0.0;
+  float acc = 0.0;
   for (int e = int(t); e < n; e += 256) {
-    double v = double(x[base + uint(e)]);
+    float v = x[base + uint(e)];
     acc += v * v;
   }
   red[t] = acc;
@@ -32,7 +32,7 @@ void main() {
     if (int(t) < st) red[t] += red[t + st];
     barrier();
   }
-  if (t == 0u) psc = 1.0 / sqrt(float(red[0] / double(n)) + pc.eps);
+  if (t == 0u) psc = 1.0f / sqrt(red[0] / float(n) + pc.eps);
   barrier();
   float sc = psc;
   for (int e = int(t); e < n; e += 256)

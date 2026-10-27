@@ -20,6 +20,11 @@
 // Compiled per rows-per-wave width (-DRPW=n) and selected from the device's wave size:
 // wave128 -> 1, wave64 -> 2, wave32 -> 4.
 //
+// RPW=4 (wave32: Intel and RDNA) needs FOUR rows, not two: an earlier version only
+// ever wrote rows row0 and row0+1, so half of every 32-row workgroup block was left
+// stale in the output buffer (selftest caught it: max|dy| = 7.9e-01 on the RX 580 it
+// never fired because wave64 selects RPW=2). Rows 2 and 3 are guarded by RPW >= 4.
+//
 // Bit-identity: each (row, token) accumulator receives exactly the FMA sequence the
 // single-row kernel gives it, so every value is bit-identical and the spec invariant
 // (batched == single-token) is preserved. --selftest asserts 0.000e+00.
@@ -34,12 +39,13 @@
 // Bindings: 0 raw blocks as uint words, 1 x, 2 out ([T][R])
 #version 450
 #extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require   // subgroupAdd replaces the shared-memory tree + barriers
 
 #ifndef RPW
 #define RPW 2
 #endif
 #define WGS 256
-#define NSUB (WGS / 64)
+#define NSUB 8   // 256/32 with 32-lane subgroups (engine pins 32); 4 on GCN wave64 - 8 covers both
 
 layout(local_size_x = WGS) in;
 
@@ -49,10 +55,9 @@ layout(set = 0, binding = 2) buffer BO { float out_[]; };
 
 layout(push_constant) uniform PC { int R; int C; int T; int xstride; } pc;
 
-// Four slots: row A token0, row A token1, row B token0, row B token1.
-// Fixed width so a constant index is always in range, and one reduction
-// pass covers all four instead of two passes with a barrier between.
-shared float sh[NSUB][4][64];
+// Eight slots: four rows x two tokens. Fixed width so a constant index is always in
+// range, and one reduction pass covers all of them.
+shared float sh[NSUB][8][32];
 shared float tlf[1280];
 
 const uint P3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
@@ -68,16 +73,6 @@ float block_scale(int row, int bpr, int blk) {
 }
 
 #define TRIT(B5, N) tlf[(B5) + (N)]
-
-// Four accumulate chains: two rows, two tokens. Explicit scalars, because an array
-// indexed by a runtime loop variable lands in scratch memory on GCN.
-#define ACC_ADD(P, XV0, XV1, B5, S)                                  \
-    {                                                                \
-        P##00 += TRIT(B5, 0) * (XV0);                                \
-        P##01 += TRIT(B5, 0) * (XV1);                                \
-        P##10 += TRIT(B5, 1) * (XV0);                                \
-        P##11 += TRIT(B5, 1) * (XV1);                                \
-    }
 
 void main() {
     uint sgsz = gl_SubgroupSize;
@@ -101,92 +96,132 @@ void main() {
     int ntb = bpr * 26;
 
     int row0 = (int(gl_WorkGroupID.x) * int(nsub) + sub) * RPW;
-    int ra = row0, rb = row0 + 1;
-    bool ka = ra < R;
-    bool kb = (RPW >= 2) && (rb < R);
-    if (!ka) ra = 0;
-    if (!kb) rb = 0;
+    int r0 = row0,     r1 = row0 + 1, r2 = row0 + 2, r3 = row0 + 3;
+    bool k0 = r0 < R,  k1 = false,    k2 = false,    k3 = false;
+#if RPW >= 2
+    k1 = r1 < R;
+#endif
+#if RPW >= 4
+    k2 = r2 < R; k3 = r3 < R;
+#endif
+    if (!k0) r0 = 0;
+    if (!k1) r1 = 0;
+    if (!k2) r2 = 0;
+    if (!k3) r3 = 0;
 
-    float a00 = 0.0, a01 = 0.0, a10 = 0.0, a11 = 0.0;
+    // Eight accumulate chains: four rows x two tokens. Explicit scalars, because an
+    // array indexed by a runtime loop variable lands in scratch memory on GCN.
+    float a00 = 0.0, a01 = 0.0;   // row0, tokens 0/1
+    float a10 = 0.0, a11 = 0.0;   // row1
+    float a20 = 0.0, a21 = 0.0;   // row2 (RPW >= 4)
+    float a30 = 0.0, a31 = 0.0;   // row3 (RPW >= 4)
 
     for (int bi = int(lane); bi < ntb; bi += int(sgsz)) {
         int blk = bi / 26;
         int off = bi - blk * 26;
         int base = blk << 7;
 
-        int b5a = int(block_byte(ra, bpr, blk, off)) * 5;
-        float sa = block_scale(ra, bpr, blk);
-        int b5b = 0;
-        float sb = 0.0;
-        if (RPW >= 2) {
-            b5b = int(block_byte(rb, bpr, blk, off)) * 5;
-            sb = block_scale(rb, bpr, blk);
-        }
+        int b50 = int(block_byte(r0, bpr, blk, off)) * 5;
+        float sc0 = block_scale(r0, bpr, blk);
+#if RPW >= 2
+        int b51 = int(block_byte(r1, bpr, blk, off)) * 5;
+        float sc1 = block_scale(r1, bpr, blk);
+#endif
+#if RPW >= 4
+        int b52 = int(block_byte(r2, bpr, blk, off)) * 5;
+        float sc2 = block_scale(r2, bpr, blk);
+        int b53 = int(block_byte(r3, bpr, blk, off)) * 5;
+        float sc3 = block_scale(r3, bpr, blk);
+#endif
 
-        float pa0 = 0.0, pa1 = 0.0, pb0 = 0.0, pb1 = 0.0;
+        float p00 = 0.0, p01 = 0.0, p10 = 0.0, p11 = 0.0;
+        float p20 = 0.0, p21 = 0.0, p30 = 0.0, p31 = 0.0;
 
         if (off < 16) {
             for (int n = 0; n < 5; ++n) {
                 float xv0 = x[base + off + (n << 4)];
                 float xv1 = x[xs + base + off + (n << 4)];
-                pa0 += TRIT(b5a, n) * xv0;
-                pa1 += TRIT(b5a, n) * xv1;
-                if (RPW >= 2) {
-                    pb0 += TRIT(b5b, n) * xv0;
-                    pb1 += TRIT(b5b, n) * xv1;
-                }
+                p00 += TRIT(b50, n) * xv0;
+                p01 += TRIT(b50, n) * xv1;
+#if RPW >= 2
+                p10 += TRIT(b51, n) * xv0;
+                p11 += TRIT(b51, n) * xv1;
+#endif
+#if RPW >= 4
+                p20 += TRIT(b52, n) * xv0;
+                p21 += TRIT(b52, n) * xv1;
+                p30 += TRIT(b53, n) * xv0;
+                p31 += TRIT(b53, n) * xv1;
+#endif
             }
         } else if (off < 24) {
             int j = off - 16;
             for (int n = 0; n < 5; ++n) {
                 float xv0 = x[base + 80 + j + (n << 3)];
                 float xv1 = x[xs + base + 80 + j + (n << 3)];
-                pa0 += TRIT(b5a, n) * xv0;
-                pa1 += TRIT(b5a, n) * xv1;
-                if (RPW >= 2) {
-                    pb0 += TRIT(b5b, n) * xv0;
-                    pb1 += TRIT(b5b, n) * xv1;
-                }
+                p00 += TRIT(b50, n) * xv0;
+                p01 += TRIT(b50, n) * xv1;
+#if RPW >= 2
+                p10 += TRIT(b51, n) * xv0;
+                p11 += TRIT(b51, n) * xv1;
+#endif
+#if RPW >= 4
+                p20 += TRIT(b52, n) * xv0;
+                p21 += TRIT(b52, n) * xv1;
+                p30 += TRIT(b53, n) * xv0;
+                p31 += TRIT(b53, n) * xv1;
+#endif
             }
         } else {
             int j = off - 24;
             for (int n = 0; n < 4; ++n) {
                 float xv0 = x[base + 120 + (n << 1) + j];
                 float xv1 = x[xs + base + 120 + (n << 1) + j];
-                pa0 += TRIT(b5a, n) * xv0;
-                pa1 += TRIT(b5a, n) * xv1;
-                if (RPW >= 2) {
-                    pb0 += TRIT(b5b, n) * xv0;
-                    pb1 += TRIT(b5b, n) * xv1;
-                }
+                p00 += TRIT(b50, n) * xv0;
+                p01 += TRIT(b50, n) * xv1;
+#if RPW >= 2
+                p10 += TRIT(b51, n) * xv0;
+                p11 += TRIT(b51, n) * xv1;
+#endif
+#if RPW >= 4
+                p20 += TRIT(b52, n) * xv0;
+                p21 += TRIT(b52, n) * xv1;
+                p30 += TRIT(b53, n) * xv0;
+                p31 += TRIT(b53, n) * xv1;
+#endif
             }
         }
-        a00 += sa * pa0;
-        a01 += sa * pa1;
-        if (RPW >= 2) {
-            a10 += sb * pb0;
-            a11 += sb * pb1;
-        }
+        a00 += sc0 * p00;
+        a01 += sc0 * p01;
+#if RPW >= 2
+        a10 += sc1 * p10;
+        a11 += sc1 * p11;
+#endif
+#if RPW >= 4
+        a20 += sc2 * p20;
+        a21 += sc2 * p21;
+        a30 += sc3 * p30;
+        a31 += sc3 * p31;
+#endif
     }
 
-    // Tree reduction, one pass over the four slots, identical arithmetic to the
-    // single-row kernel for each (row, token).
-    sh[sub][0][lane] = a00;
-    sh[sub][1][lane] = a01;
-    sh[sub][2][lane] = a10;
-    sh[sub][3][lane] = a11;
-    barrier();
-    for (int st = 32; st > 0; st >>= 1) {
-        if (int(lane) < st) {
-            sh[sub][0][lane] += sh[sub][0][lane + st];
-            sh[sub][1][lane] += sh[sub][1][lane + st];
-            sh[sub][2][lane] += sh[sub][2][lane + st];
-            sh[sub][3][lane] += sh[sub][3][lane + st];
-        }
-        barrier();
-    }
+    // Per-row sums via subgroupAdd (no shared-memory tree, no barriers).
+    float s00 = subgroupAdd(a00), s01 = subgroupAdd(a01);
+#if RPW >= 2
+    float s10 = subgroupAdd(a10), s11 = subgroupAdd(a11);
+#endif
+#if RPW >= 4
+    float s20 = subgroupAdd(a20), s21 = subgroupAdd(a21);
+    float s30 = subgroupAdd(a30), s31 = subgroupAdd(a31);
+#endif
     if (lane == 0u) {
-        if (ka) { out_[ra] = sh[sub][0][0]; out_[R + ra] = sh[sub][1][0]; }
-        if (kb) { out_[rb] = sh[sub][2][0]; out_[R + rb] = sh[sub][3][0]; }
+        if (k0) { out_[r0] = s00; out_[R + r0] = s01; }
+#if RPW >= 2
+        if (k1) { out_[r1] = s10; out_[R + r1] = s11; }
+#endif
+#if RPW >= 4
+        if (k2) { out_[r2] = s20; out_[R + r2] = s21; }
+        if (k3) { out_[r3] = s30; out_[R + r3] = s31; }
+#endif
     }
 }

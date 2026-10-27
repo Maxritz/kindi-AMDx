@@ -1,6 +1,6 @@
 #version 450
 #extension GL_KHR_shader_subgroup_shuffle : require
-#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+// Intel iGPU port (shaderFloat64=false): fp64 norm sum -> fp32, same XOR order
 // l2w_T.comp - L2 normalise q/k rows for T tokens.
 // Push: { int n; int rows; int stride; }  stride = per-token row stride in floats
 //   x[tok*stride + r*n + e], out same layout. rows = rows-per-token.
@@ -11,7 +11,7 @@ layout(set = 0, binding = 1) buffer Bo { float out_[]; };
 
 layout(push_constant) uniform PC { int n; int rows; int stride; int T; int ostride; } pc;
 
-float64_t wsum_d(float64_t v) {
+float wsum_d(float v) {
   v += subgroupShuffleXor(v, 16);
   v += subgroupShuffleXor(v, 8);
   v += subgroupShuffleXor(v, 4);
@@ -33,9 +33,9 @@ void main() {
   int rr  = (pc.rows != 0) ? (r % pc.rows) : 0;
   int off  = tok * pc.stride  + rr * n;
   int ooff = tok * pc.ostride + rr * n;
-  float64_t acc = float64_t(0.0);
+  float acc = 0.0f;
   for (int e = int(lane); e < n; e += 32) {
-    float64_t v = live ? float64_t(x[off + e]) : float64_t(0.0);
+    float v = live ? x[off + e] : 0.0f;
     acc += v * v;
   }
   acc = wsum_d(acc);

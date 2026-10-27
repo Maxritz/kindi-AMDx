@@ -1,6 +1,6 @@
 #version 450
 #extension GL_KHR_shader_subgroup_shuffle : require
-#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+// Intel iGPU port (shaderFloat64=false): fp64 norm sums -> fp32, same XOR order
 // rmsfold_T.comp - rmsfold for T tokens, one workgroup per (token, chunk).
 // Push: { int C; int add; int HB; int nchunk; }   nchunk = C/chunk
 // Buffers are token-major: x[t*C + e].
@@ -17,10 +17,10 @@ layout(set = 0, binding = 6) buffer Bxo { float xo[]; };
 layout(push_constant) uniform PC { int C; int add; int HB; int nchunk; int stride; int ostride; } pc;
 
 shared float xs[4096];
-shared float64_t red[16];
+shared float red[16];
 shared float bscale;
 
-float64_t wsum_d(float64_t v) {
+float wsum_d(float v) {
   v += subgroupShuffleXor(v, 16);
   v += subgroupShuffleXor(v, 8);
   v += subgroupShuffleXor(v, 4);
@@ -41,7 +41,7 @@ void main() {
   uint off  = tok * uint(pc.stride);   // x / r / xw / xn
   uint ooff = tok * uint(pc.ostride);  // xo (the folded output)
 
-  float64_t acc = float64_t(0.0);
+  float acc = 0.0f;
   for (int e = int(j); e < C; e += 512) {
     float xf = x[off + uint(e)];
     if (add != 0) {
@@ -49,16 +49,15 @@ void main() {
       for (int i = 1; i < add; ++i) s += r[uint(i) * uint(C) + off + uint(e)];
       xf = x[off + uint(e)] + s;
     }
-    float64_t v = float64_t(xf);
-    acc += v * v;
+    acc += xf * xf;
   }
   acc = wsum_d(acc);
   if (lane == 0u) red[wp] = acc;
   barrier();
   if (wp == 0u) {
-    float64_t t = (lane < 16u) ? red[lane] : float64_t(0.0);
+    float t = (lane < 16u) ? red[lane] : 0.0f;
     t = wsum_d(t);
-    if (lane == 0u) bscale = 1.0f / sqrt(float(t / float64_t(float(C))) + 1e-6f);
+    if (lane == 0u) bscale = 1.0f / sqrt(t / float(C) + 1e-6f);
   }
   barrier();
   float s = bscale;

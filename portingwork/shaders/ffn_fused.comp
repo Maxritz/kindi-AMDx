@@ -1,0 +1,100 @@
+// ffn_fused.comp - fused FFN part 1: gate+up GEMV, silu, Hadamard fold -> xp (fo6)
+#version 450
+
+layout(local_size_x = 1024) in;
+
+layout(set = 0, binding = 0) readonly buffer BG { uint gatew[]; };
+layout(set = 0, binding = 1) readonly buffer BU { uint upw[]; };
+layout(set = 0, binding = 2) readonly buffer BD { uint downw[]; };
+layout(set = 0, binding = 3) coherent buffer BX { float xp[]; };
+layout(set = 0, binding = 4) coherent buffer BY { float y[]; };
+layout(set = 0, binding = 5) readonly buffer BSC { float scales[]; };
+layout(set = 0, binding = 6) readonly buffer BN { float normw[]; };
+layout(set = 0, binding = 7) readonly buffer BSG { float sg[]; };
+layout(set = 0, binding = 8) buffer BC { uint counter; };
+
+layout(push_constant) uniform PC { int D; int NFF; int HB; } pc;
+
+const uint P3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
+
+shared float sh[1024];
+
+#define BLOCK_BYTE(W,row,bpr,blk,off) ( (W)[(((row)*(bpr)+(blk))*28+(off)) >> 2] >> (8u * uint((((row)*(bpr)+(blk))*28+(off)) & 3)) & 0xFFu )
+#define BLOCK_SCALE(W,row,bpr,blk) ( unpackHalf2x16( (W)[((((row)*(bpr)+(blk))*28)>>2) + 6] >> 16 ).x )
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    int HB = pc.HB;
+    int g = int(gl_WorkGroupID.x);
+    int baseRow = g * HB;
+
+    if (int(tid) < HB) {
+        int r = baseRow + int(tid);
+        if (r < pc.NFF) {
+            int bprC = pc.D >> 7;
+            int ntbC = bprC * 26;
+            float gate_acc = 0.0;
+            float up_acc = 0.0;
+            for (int lane = 0; lane < 32; ++lane) {
+            for (int bi = lane; bi < ntbC; bi += 32) {
+                int blk = bi / 26;
+                int off = bi - blk * 26;
+                int base = blk << 7;
+                uint byteG = BLOCK_BYTE(gatew, r, bprC, blk, off);
+                float scG = BLOCK_SCALE(gatew, r, bprC, blk);
+                float pG = 0.0;
+                uint byteU = BLOCK_BYTE(upw, r, bprC, blk, off);
+                float scU = BLOCK_SCALE(upw, r, bprC, blk);
+                float pU = 0.0;
+                if (off < 16) {
+                    for (int n = 0; n < 5; ++n) {
+                        int trG = int((((byteG * P3[n]) & 0xFFu) * 3u) >> 8) - 1;
+                        pG += float(trG) * xp[base + off + (n << 4)];
+                        int trU = int((((byteU * P3[n]) & 0xFFu) * 3u) >> 8) - 1;
+                        pU += float(trU) * xp[base + off + (n << 4)];
+                    }
+                } else if (off < 24) {
+                    int j = off - 16;
+                    for (int n = 0; n < 5; ++n) {
+                        int trG = int((((byteG * P3[n]) & 0xFFu) * 3u) >> 8) - 1;
+                        pG += float(trG) * xp[base + 80 + j + (n << 3)];
+                        int trU = int((((byteU * P3[n]) & 0xFFu) * 3u) >> 8) - 1;
+                        pU += float(trU) * xp[base + 80 + j + (n << 3)];
+                    }
+                } else {
+                    int j = off - 24;
+                    for (int n = 0; n < 4; ++n) {
+                        int trG = int((((byteG * P3[n]) & 0xFFu) * 3u) >> 8) - 1;
+                        pG += float(trG) * xp[base + 120 + (n << 1) + j];
+                        int trU = int((((byteU * P3[n]) & 0xFFu) * 3u) >> 8) - 1;
+                        pU += float(trU) * xp[base + 120 + (n << 1) + j];
+                    }
+                }
+                gate_acc += scG * pG;
+                up_acc += scU * pU;
+            }
+            }
+            float silu = gate_acc / (1.0f + exp(-gate_acc));
+            sh[tid] = sg[r] * silu * up_acc;
+        } else {
+            sh[tid] = 0.0;
+        }
+    }
+    barrier();
+    for (int h = 1; h < HB; h <<= 1) {
+        for (int t = int(tid); t < (HB >> 1); t += int(gl_WorkGroupSize.x)) {
+            int i = (t / h) * 2 * h + (t % h);
+            float av = sh[i];
+            float bv = sh[i + h];
+            sh[i] = av + bv;
+            sh[i + h] = av - bv;
+        }
+        barrier();
+    }
+    if (int(tid) < HB) {
+        int r = baseRow + int(tid);
+        if (r < pc.NFF) {
+            xp[r] = sh[tid] * inversesqrt(float(HB));
+        }
+    }
+}

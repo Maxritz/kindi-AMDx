@@ -40,12 +40,13 @@
 // Bindings: 0 raw blocks as uint words, 1 x (float), 2 out (float)
 #version 450
 #extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require   // subgroupAdd replaces the shared-memory tree + 5 barriers per byte
 
 #ifndef RPW
 #define RPW 2
 #endif
 #define WGS 256
-#define NSUB (WGS / 64)
+#define NSUB 8   // 256/32 with 32-lane subgroups (engine pins 32); 4 on GCN wave64 - 8 covers both
 
 layout(local_size_x = WGS) in;
 
@@ -55,7 +56,7 @@ layout(set = 0, binding = 2) buffer BO { float out_[]; };
 
 layout(push_constant) uniform PC { int R; int C; } pc;
 
-shared float sh[NSUB][RPW][64];
+shared float sh[NSUB][RPW][32];   // only 32 lanes per subgroup are used (lane < sgsz, max 31)
 shared float tlf[1280];
 
 const uint P3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
@@ -81,14 +82,14 @@ void main() {
     int sub = int(gl_SubgroupID);
 
     for (uint e = gl_LocalInvocationID.x; e < 256u; e += uint(gl_WorkGroupSize.x)) {
-        for (int n = 0; n < 5; ++n) {
-            uint tr = (((e * P3[n]) & 0xFFu) * 3u) >> 8;
-            tlf[e * 5u + uint(n)] = float(int(tr) - 1);
-        }
-    }
-    barrier();
+      for (int n = 0; n < 5; ++n) {
+          uint tr = (((e * P3[n]) & 0xFFu) * 3u) >> 8;
+          tlf[e * 5u + uint(n)] = float(int(tr) - 1);
+      }
+  }
+  barrier();
 
-    int R = pc.R;
+  int R = pc.R;
     int row0 = (int(gl_WorkGroupID.x) * int(nsub) + sub) * RPW;
 
     // clamp instead of return: every invocation must reach every barrier()
@@ -181,37 +182,24 @@ void main() {
 #endif
     }
 
-    // Tree reduction per row, identical arithmetic to the single-row kernel.
-    sh[sub][0][lane] = acc0;
+    // Per-row sums via subgroupAdd (no shared-memory tree, no barriers).
+    acc0 = subgroupAdd(acc0);
 #if RPW >= 2
-    sh[sub][1][lane] = acc1;
+    acc1 = subgroupAdd(acc1);
 #endif
 #if RPW >= 4
-    sh[sub][2][lane] = acc2;
-    sh[sub][3][lane] = acc3;
+    acc2 = subgroupAdd(acc2);
+    acc3 = subgroupAdd(acc3);
 #endif
-    barrier();
-    for (int st = 32; st > 0; st >>= 1) {
-        if (int(lane) < st) {
-            sh[sub][0][lane] += sh[sub][0][lane + st];
-#if RPW >= 2
-            sh[sub][1][lane] += sh[sub][1][lane + st];
-#endif
-#if RPW >= 4
-            sh[sub][2][lane] += sh[sub][2][lane + st];
-            sh[sub][3][lane] += sh[sub][3][lane + st];
-#endif
-        }
-        barrier();
-    }
     if (lane == 0u) {
-        if (k0) out_[r0] = sh[sub][0][0];
+        if (k0) out_[r0] = acc0;
 #if RPW >= 2
-        if (k1) out_[r1] = sh[sub][1][0];
+        if (k1) out_[r1] = acc1;
 #endif
 #if RPW >= 4
-        if (k2) out_[r2] = sh[sub][2][0];
-        if (k3) out_[r3] = sh[sub][3][0];
+        if (k2) out_[r2] = acc2;
+        if (k3) out_[r3] = acc3;
 #endif
     }
 }
+

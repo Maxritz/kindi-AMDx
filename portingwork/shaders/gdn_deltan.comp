@@ -18,7 +18,7 @@
 //   on GCN may differ ~1-2 ulp from CUDA, shifting scl's last ulp.
 #version 450
 #extension GL_KHR_shader_subgroup_shuffle : require
-#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+// Intel iGPU port (shaderFloat64=false): fp64 norm sum -> fp32, same XOR order
 layout(local_size_x = 128) in;
 layout(set = 0, binding = 0) buffer B0 { float M[]; };
 layout(set = 0, binding = 1) readonly buffer B1 { float q[]; };
@@ -33,7 +33,7 @@ shared float ks[128];
 shared float qs[128];
 shared float os[128];
 shared float scl;
-float64_t wsum_d(float64_t v) {
+float wsum_d(float v) {
   v += subgroupShuffleXor(v, 16u);
   v += subgroupShuffleXor(v, 8u);
   v += subgroupShuffleXor(v, 4u);
@@ -61,15 +61,15 @@ void main() {
   }
   os[j] = o * pc.scale;
   barrier();
-  float64_t acc = float64_t(0.0);
+  float acc = 0.0f;
   if (j < 32u) {
     for (int x = int(j); x < 128; x += 32) {
-      float64_t vv = float64_t(os[uint(x)]);
+      float vv = os[uint(x)];
       acc += vv * vv;
     }
   }
   acc = wsum_d(acc);
-  if (j == 0u) scl = 1.0f / sqrt(float(acc / float64_t(128)) + 1e-6f);
+  if (j == 0u) scl = 1.0f / sqrt(acc / 128.0f + 1e-6f);
   barrier();
   out_[h * 128u + j] = (os[j] * scl) * nw[j];
 }

@@ -13,7 +13,7 @@
 //   2: write float out[] (rows*n)
 #version 450
 #extension GL_KHR_shader_subgroup_shuffle : require
-#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+// Intel iGPU port (shaderFloat64=false): fp64 norm sum -> fp32, same XOR order
 layout(local_size_x = 256) in;
 
 layout(set = 0, binding = 0) readonly buffer Bx { float x[]; };
@@ -22,7 +22,7 @@ layout(set = 0, binding = 2) buffer Bo { float out_[]; };
 
 layout(push_constant) uniform PC { int n; int rows; } pc;
 
-float64_t wsum_d(float64_t v) {
+float wsum_d(float v) {
   v += subgroupShuffleXor(v, 16);
   v += subgroupShuffleXor(v, 8);
   v += subgroupShuffleXor(v, 4);
@@ -43,13 +43,13 @@ void main() {
   // xor offsets 16..1 never set bit 5, so the two 32-halves of a
   // 64-wide subgroup reduce independently, bit-identical to CUDA.
   bool live = (r < pc.rows);
-  float64_t acc = float64_t(0.0);
+  float acc = 0.0f;
   for (int e = int(lane); e < n; e += 32) {
-    float64_t v = live ? float64_t(x[r * n + e]) : float64_t(0.0);
+    float v = live ? x[r * n + e] : 0.0f;
     acc += v * v;
   }
   acc = wsum_d(acc);
   if (!live) return;
-  float sc = 1.0f / sqrt(float(acc / float64_t(n)) + 1e-6f);
+  float sc = 1.0f / sqrt(acc / float(n) + 1e-6f);
   for (int e = int(lane); e < n; e += 32) out_[r * n + e] = (x[r * n + e] * sc) * w[e];
 }

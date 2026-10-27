@@ -23,10 +23,11 @@
 #include <functional>
 #include <deque>
 #include <nlohmann/json.hpp>
+using json = nlohmann::json;
 #include "tokenizer.h"
 #include "trace.h"
 #include "http.h"
-using json = nlohmann::json;
+// (cleaned up: no xmx extern declaration)
 
 #define VK_CHECK(x) do { VkResult _r=(x); if(_r!=VK_SUCCESS){fprintf(stderr,"Vulkan error %d at %s:%d\n",(int)_r,__FILE__,__LINE__);exit(1);} } while(0)
 
@@ -38,13 +39,14 @@ static uint32_t findmt(uint32_t bits, VkMemoryPropertyFlags f){ for(uint32_t i=0
 // the PTQ1_0 GEMV: a wave128 already holds a full row of lanes, a wave64 wants two rows
 // per wave to fill its issue interval, a wave32 wants four.
 static uint32_t g_wave = 64;
+static bool     g_req32 = false;   // device supports + engine requested 32-lane compute subgroups
 
 struct Buf { VkBuffer buf=VK_NULL_HANDLE; VkDeviceMemory mem=VK_NULL_HANDLE; VkDeviceSize size=0; void* mapped=nullptr; };
 // live device allocation total: the context fit needs to know what the weights actually
 // took, which is only known after they are uploaded
 static size_t g_alloc_total = 0;
 static Buf mkbuf(VkDeviceSize sz, VkBufferUsageFlags u, VkMemoryPropertyFlags f){
-    Buf b; b.size=sz; VkBufferCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; ci.size=sz; ci.usage=u; ci.sharingMode=VK_SHARING_MODE_CONCURRENT; uint32_t qf[2]={G.cf,G.tf}; ci.queueFamilyIndexCount=2; ci.pQueueFamilyIndices=qf;
+    Buf b; b.size=sz; VkBufferCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; ci.size=sz; ci.usage=u | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT; ci.sharingMode=VK_SHARING_MODE_CONCURRENT; uint32_t qf[2]={G.cf,G.tf}; ci.queueFamilyIndexCount=2; ci.pQueueFamilyIndices=qf;
     VK_CHECK(vkCreateBuffer(G.dev,&ci,nullptr,&b.buf));
     VkMemoryRequirements r; vkGetBufferMemoryRequirements(G.dev,b.buf,&r);
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; ai.allocationSize=r.size; ai.memoryTypeIndex=findmt((uint32_t)r.memoryTypeBits,f);
@@ -58,7 +60,7 @@ static Buf mkbuf(VkDeviceSize sz, VkBufferUsageFlags u, VkMemoryPropertyFlags f)
 // checkpoint) must degrade to "feature off" on an 8 GB card, not kill the server.
 static bool mkbuf_try(VkDeviceSize sz, VkBufferUsageFlags u, VkMemoryPropertyFlags f, Buf& out){
     out = Buf{};
-    VkBufferCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; ci.size=sz; ci.usage=u;
+    VkBufferCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; ci.size=sz; ci.usage=u | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     ci.sharingMode=VK_SHARING_MODE_CONCURRENT;
     uint32_t qf[2]={G.cf,G.tf}; ci.queueFamilyIndexCount=2; ci.pQueueFamilyIndices=qf;
     if(vkCreateBuffer(G.dev,&ci,nullptr,&out.buf)!=VK_SUCCESS){ out=Buf{}; return false; }
@@ -184,10 +186,44 @@ static void initdev(){
         if(have_gp) q.pNext=&gpqci;
         qcis.push_back(q); }
     { VkDeviceQueueCreateInfo q{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}; q.queueFamilyIndex=G.tf; q.queueCount=1; q.pQueuePriorities=&qprio; qcis.push_back(q); }
-    VkPhysicalDeviceFeatures f{}; f.shaderFloat64=VK_TRUE;
+    VkPhysicalDeviceFeatures f{};   // request fp64 only when the device actually has it
+    {   // Meteor Lake iGPU reports shaderFloat64=false (no FP64 hardware); RX 580 reports true.
+        VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        vkGetPhysicalDeviceFeatures2(G.phys,&f2);
+        if(f2.features.shaderFloat64==VK_TRUE) f.shaderFloat64=VK_TRUE;
+    }
+    // Pin compute subgroups to exactly 32 lanes (VK_EXT_subgroup_size_control). Every
+    // shader's lane/warp mapping ("warp = one 32-lane subgroup", XOR masks 16..1) is
+    // written for 32-lane subgroups; on Intel the driver is otherwise free to dispatch
+    // 8-lane subgroups (reported minimum), which silently corrupts every reduction.
     std::vector<const char*> devext;
     if(have_gp) devext.push_back("VK_KHR_global_priority");
+    VkPhysicalDeviceSubgroupSizeControlFeatures ssc{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES};
+    ssc.subgroupSizeControl=VK_TRUE;
+    void* pnext_feat=nullptr;
+    {   // supported? then request it
+        uint32_t ec=0; vkEnumerateDeviceExtensionProperties(G.phys,nullptr,&ec,nullptr);
+        std::vector<VkExtensionProperties> ex(ec);
+        vkEnumerateDeviceExtensionProperties(G.phys,nullptr,&ec,ex.data());
+        for(auto&e:ex) if(!strcmp(e.extensionName,"VK_EXT_subgroup_size_control")){
+            devext.push_back("VK_EXT_subgroup_size_control"); g_req32=true; break;
+        }
+        if(g_req32) pnext_feat=(void*)&ssc;   // chained into dci below
+    // Buffer device address (P3): query support, request if available.
+    VkPhysicalDeviceBufferDeviceAddressFeatures bda{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
+    {
+        VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        f2.pNext=&bda;
+        vkGetPhysicalDeviceFeatures2(G.phys,&f2);
+    }
+    if(bda.bufferDeviceAddress==VK_TRUE){
+        bda.bufferDeviceAddress=VK_TRUE;
+        ssc.pNext=&bda;
+        if(!g_req32) pnext_feat=(void*)&bda;
+    }
+    }
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO}; dci.queueCreateInfoCount=(uint32_t)qcis.size(); dci.pQueueCreateInfos=qcis.data(); dci.pEnabledFeatures=&f;
+    dci.pNext=pnext_feat;
     dci.enabledExtensionCount=(uint32_t)devext.size(); dci.ppEnabledExtensionNames=devext.empty()?nullptr:devext.data();
     VkResult dcr = vkCreateDevice(G.phys,&dci,nullptr,&G.dev);
     if(dcr != VK_SUCCESS && have_gp){
@@ -204,8 +240,8 @@ static void initdev(){
     vkGetDeviceQueue(G.dev,G.cf,0,&G.q0); vkGetDeviceQueue(G.dev,G.cf,1,&G.q1); vkGetDeviceQueue(G.dev,G.tf,0,&G.qt);
     VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO}; cpci.queueFamilyIndex=G.cf; cpci.flags=VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     VK_CHECK(vkCreateCommandPool(G.dev,&cpci,nullptr,&G.cp)); cpci.queueFamilyIndex=G.tf; VK_CHECK(vkCreateCommandPool(G.dev,&cpci,nullptr,&G.tp));
-    if(ktrace::enabled()) ktrace::init(G.phys,G.dev);
-    {   // real compute-core topology (VK_AMD_shader_core_properties). Properties can be
+// (cleaned up: no vnpu globals)
+    {   // real compute-core topology
         // queried without enabling the extension.
         VkPhysicalDeviceShaderCorePropertiesAMD sc{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CORE_PROPERTIES_AMD};
         VkPhysicalDeviceVulkan11Properties v11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES};
@@ -271,6 +307,9 @@ static Pipe mkpipe(const char* spv, int nbind, int pushsz){
     VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT,0,(uint32_t)pushsz};
     VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO}; pl.setLayoutCount=1; pl.pSetLayouts=&P.dsl; pl.pushConstantRangeCount=1; pl.pPushConstantRanges=&pcr; VK_CHECK(vkCreatePipelineLayout(G.dev,&pl,nullptr,&P.pl));
     VkPipelineShaderStageCreateInfo st{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}; st.stage=VK_SHADER_STAGE_COMPUTE_BIT; st.module=P.mod; st.pName="main";
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rss{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
+    rss.requiredSubgroupSize=32;
+    if(g_req32) st.pNext=&rss;   // every shader's lane/warp/XOR-chain mapping assumes 32 lanes
     VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO}; cpi.stage=st; cpi.layout=P.pl; VK_CHECK(vkCreateComputePipelines(G.dev,VK_NULL_HANDLE,1,&cpi,nullptr,&P.pipe));
     VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,(uint32_t)nbind};
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; dpi.maxSets=1; dpi.poolSizeCount=1; dpi.pPoolSizes=&ps; VK_CHECK(vkCreateDescriptorPool(G.dev,&dpi,nullptr,&P.pool));
@@ -545,7 +584,10 @@ int main(int argc, char**argv){
     float temperature=0.0f;
     int topk=0;
     int dump=0;
-    int native5=0;   // PTQ1_0 kept in its 28-byte/128-weight form (27B does not fit expanded)
+    int native5=1;   // PTQ1_0 is ALWAYS kept in its 28-byte/128-weight form (GGUF as-is)
+                     // used as-is and decoded on the device (g5ptq family). Host expansion
+                     // to 4-trit bytes is disabled - no dequant to RAM. --native5 stays
+                     // accepted as a no-op for compatibility.
     int force_gen=0;
     int raw_embed=0;
     int ngt=5;       // -n / --n-predict: number of tokens to generate
@@ -582,6 +624,7 @@ int main(int argc, char**argv){
     if(!model){ fprintf(stderr,"usage: --model <path.gguf>\n"); return 1; }
     initdev();
     ktrace::clock_init();
+    ktrace::init(G.phys, G.dev);
     // ---- memory-map GGUF ----
     HANDLE hFile = CreateFileA(model, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE) { fprintf(stderr, "cannot open %s\n", model); return 1; }
@@ -910,56 +953,12 @@ int main(int argc, char**argv){
             q8names.insert(gt.name);
             n_q8++;
         } else if (gt.type == 143) {
-            int bpr = c / 128;
-            int nb = r * bpr;
-            std::vector<unsigned char> trits((size_t)nb * 128);
-            for (int bi = 0; bi < nb; ++bi) {
-                const unsigned char* raw = data + (size_t)bi * 28;
-                unsigned char* out = trits.data() + (size_t)bi * 128;
-                for (int n = 0; n < 5; ++n) {
-                    for (int j = 0; j < 16; ++j) {
-                        uint32_t q = ((uint32_t)raw[j] * pow3[n]) & 0xFF;
-                        out[n*16 + j] = (unsigned char)((q * 3) >> 8);
-                    }
-                }
-                for (int n = 0; n < 5; ++n) {
-                    for (int j = 0; j < 8; ++j) {
-                        uint32_t q = ((uint32_t)raw[16 + j] * pow3[n]) & 0xFF;
-                        out[80 + n*8 + j] = (unsigned char)((q * 3) >> 8);
-                    }
-                }
-                for (int n = 0; n < 4; ++n) {
-                    for (int j = 0; j < 2; ++j) {
-                        uint32_t q = ((uint32_t)raw[24 + j] * pow3[n]) & 0xFF;
-                        out[120 + n*2 + j] = (unsigned char)((q * 3) >> 8);
-                    }
-                }
-            }
-            std::vector<unsigned char> codes((size_t)r * bpr * 32);
-            std::vector<uint16_t> scales((size_t)r * bpr);
-            for (int bi = 0; bi < nb; ++bi) {
-                const unsigned char* raw = data + (size_t)bi * 28;
-                const unsigned char* tr = trits.data() + (size_t)bi * 128;
-                int row = bi / bpr;
-                int phase = bi % bpr;
-                unsigned char* cb = codes.data() + (size_t)row * (bpr * 32) + (size_t)phase * 32;
-                for (int s = 0; s < 32; ++s) {
-                    int t0 = tr[s*4+0], t1 = tr[s*4+1], t2 = tr[s*4+2], t3 = tr[s*4+3];
-                    cb[s] = (unsigned char)(t0 + 3*t1 + 9*t2 + 27*t3);
-                }
-                uint16_t v; memcpy(&v, raw + 26, 2);
-                scales[(size_t)row * bpr + phase] = v;
-            }
-            std::vector<uint32_t> scales32((size_t)r * bpr);
-            for (size_t si = 0; si < scales32.size(); ++si) scales32[si] = (uint32_t)scales[si];
-            Buf cb = mkbuf((size_t)r * bpr * 32, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            upload(&cb, codes.data(), (size_t)r * bpr * 32);
-            Buf sb = mkbuf((size_t)r * bpr * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            upload(&sb, scales32.data(), (size_t)r * bpr * 4);
-            codebufs[gt.name] = cb;
-            scalebufs[gt.name] = sb;
-            tinfo[gt.name] = std::make_pair(r, c);
-            n_tern++;
+            // Host expansion of PTQ1_0 to 4-trit bytes is disabled: the GGUF is used
+            // as-is and every PTQ1_0 tensor takes the native branch above. If one ever
+            // lands here, fail loud instead of silently dequantizing to host RAM.
+            fprintf(stderr,"PTQ1_0 tensor '%s' not taken by the native path - "
+                           "host dequant is disabled (GGUF as-is)\n", gt.name.c_str());
+            exit(1);
         } else if (gt.type == 0) {
             size_t n = (size_t)r * c;
             Buf f = mkbuf(n * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
@@ -1053,6 +1052,7 @@ int main(int argc, char**argv){
     Pipe prmsfold=mkpipe((shdir+"/rmsfold.comp.spv").c_str(),7,12);
     Pipe pdeq=mkpipe((shdir+"/deq_emb3.comp.spv").c_str(),4,8);
     Pipe psmfold=mkpipe((shdir+"/smfold.comp.spv").c_str(),4,16);
+Pipe pffn_fused=mkpipe((shdir+"/ffn_fused.comp.spv").c_str(),9,12);
     Pipe pfwh=mkpipe((shdir+"/fold_fwht.comp.spv").c_str(),3,4);
     Pipe prmsw=mkpipe((shdir+"/rmsw.comp.spv").c_str(),3,8);
     Pipe pl2w=mkpipe((shdir+"/l2w.comp.spv").c_str(),2,8);
@@ -1163,6 +1163,7 @@ int main(int argc, char**argv){
     // floats, leaving the last Hadamard block of every GDN layer uninitialised.
     const int work = ((D > NFF) ? D : NFF) > (NV*HK) ? ((D > NFF) ? D : NFF) : (NV*HK);
     Buf y=Z(VOCAB), xp=Z(work), h=Z(D), xn=Z(D), zv=Z(NV*HK), h2=Z(D), part=Z(4096);
+Buf ffn_ctr=mkbuf(4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     Buf qkv=Z(CONV_CH), cs=Z(CONV_CH), qkbuf=Z(2*NK*HK), qkvbuf=Z(NHKV*HD);
     Buf kn=Z(NHKV*HD), qn=Z(NH*2*HD), qr=Z(NH*HD), kro=Z(NHKV*HD);
     Buf fo=Z(NH*HD), fo6=Z(NFF), outgdn=Z(NV*HK), att=Z(NH*HD), ffg=Z(NFF), ffu=Z(NFF);
@@ -1775,8 +1776,10 @@ int main(int argc, char**argv){
         // sbuf layout: [NH*n] (n=pos+1)
         int n = pos+1;
         int Grp=NH/NHKV;   // q heads per KV head (G is the GPU context)
-        if(Grp==4 && !force_gen){
-            // specialised 2B path (NH=8, NHKV=2, G=4): 16-value butterfly, fastest
+        if(Grp==4 && !force_gen && g_wave==64){
+            // specialised 2B path (NH=8, NHKV=2, G=4): 16-value butterfly, fastest.
+            // Requires 64-lane subgroups (GCN wave64); on wave32 (Intel) the butterfly
+            // sums the wrong halves, so those devices take the generic path below.
             std::vector<Buf> bufs={Kc[kvi], qr, sbuf};
             bindbufs(pattns4,bufs);
             struct{int nn,nkv;}pc{n, NHKV};
@@ -1789,6 +1792,7 @@ int main(int argc, char**argv){
             dispatch(pattnsg,G.q0,G.cp,NHKV,(n+31)/32,1,&pc,16);
         }
         // softmax_rows: sbuf (NH rows x n)
+        if(dump&&pos<5&&il==(interval-1)) dumpv("scores_raw",sbuf,NH);
         {
             std::vector<Buf> bufs={sbuf};
             bindbufs(psoft,bufs);
@@ -1798,7 +1802,7 @@ int main(int argc, char**argv){
         // attn_v4p: sbuf + Vc -> apart
         // nch = (n+255)/256
         int nch = (n+255)/256;
-        if(Grp==4 && !force_gen){
+        if(Grp==4 && !force_gen && g_wave==64){
             std::vector<Buf> bufs={sbuf, Vc[kvi], apart};
             bindbufs(pattnv4,bufs);
             struct{int nn,nh,nkv;}pc{n, NH, NHKV};
@@ -1818,7 +1822,7 @@ int main(int argc, char**argv){
             dispatch(pattncomb,G.q0,G.cp,NH,1,1,&pc,8);
         }
         // fold_fwht: att -> xp (CUDA: k_fold_fwht(att, sA, xp, hb); HB=512 so C/HB groups)
-        if(dump&&pos==0&&il==(interval-1)){ dumpv("q_rope",qr,NH*HD); dumpv("k_rope",kro,NHKV*HD); dumpv("scores",sbuf,NH); dumpv("comb",att,NH*HD); }
+        if(dump&&pos<5&&il==(interval-1)){ dumpv("q_rope",qr,NH*HD); dumpv("k_rope",kro,NHKV*HD); dumpv("scores",sbuf,NH); dumpv("comb",att,NH*HD); }
         {
             std::vector<Buf> bufs={att, sAb, xp};
             bindbufs(pfwh,bufs);
@@ -2364,7 +2368,7 @@ int main(int argc, char**argv){
             if((il+1)%interval!=0){ gdn(il,pos); }
             else { attn(il,pos,kvi); kvi++; }
             ffn(il);
-            if(dump&&pos==0){
+            if(dump&&pos<5){
                 std::vector<float> hv=readbuf(h,3), yv=readbuf(y,3);
                 fprintf(stderr,"G L%02d res %.4f %.4f %.4f\n",il,hv[0]+yv[0],hv[1]+yv[1],hv[2]+yv[2]);
             }

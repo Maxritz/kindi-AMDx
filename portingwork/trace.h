@@ -154,7 +154,7 @@ inline void mark_before(VkCommandBuffer cb, uint32_t& idx) {
     State& s = st();
     if (!s.on || s.pool == VK_NULL_HANDLE || s.pairs >= s.max_pairs) { idx = UINT32_MAX; return; }
     idx = s.pairs;
-    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s.pool, idx * 2);
+    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, s.pool, idx * 2);
 }
 inline void mark_after(VkCommandBuffer cb, uint32_t idx) {
     State& s = st();

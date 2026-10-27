@@ -10,6 +10,11 @@
 // Compiled per width (-DRPW=n) and selected from the device's wave size, like the
 // single-tensor kernel: wave128 -> 1, wave64 -> 2, wave32 -> 4.
 //
+// RPW=4 (wave32: Intel and RDNA) covers FOUR rows per wave. An earlier version only
+// ever wrote rows base_row and base_row+1, so half of every wave block was left stale
+// in the output buffer (the selftest caught it: 7.9e-01; on the RX 580 it never fired
+// because wave64 selects RPW=2). Rows 2 and 3 are guarded by RPW >= 4.
+//
 // Layout of the wave space: the groups are laid out per tensor, so a wave's RPW rows
 // always belong to the SAME tensor. That keeps the weight-buffer choice outside the
 // inner loop. A first version of the fused kernel selected the buffer per byte with a
@@ -32,12 +37,13 @@
 // Bindings: 0 W0 1 Y0 2 W1 3 Y1 4 W2 5 Y2 6 X
 #version 450
 #extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require   // subgroupAdd replaces the shared-memory tree + barriers
 
 #ifndef RPW
 #define RPW 2
 #endif
 #define WGS 256
-#define NSUB (WGS / 64)
+#define NSUB 8   // 256/32 with 32-lane subgroups (engine pins 32); 4 on GCN wave64 - 8 covers both
 
 layout(local_size_x = WGS) in;
 
@@ -51,47 +57,58 @@ layout(set = 0, binding = 6) readonly buffer XB { float x[]; };
 
 layout(push_constant) uniform PC { int R0; int R1; int R2; int C; } pc;
 
-// Always 4 slots wide: GLSL bounds-checks a constant index even inside a branch
-// that RPW makes dead, so a [1][64] array cannot be named with sh[sub][1].
-// 4*4*64*4 = 4 KB of the 32 KB available.
-shared float sh[NSUB][4][64];
+// The byte->trit LUT is the only shared state now (5 KB). The per-row sums use
+// subgroupAdd, so no per-subgroup shared slots are needed.
 shared float tlf[1280];
 
 const uint P3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
 
 #define TRIT(B5, N) tlf[(B5) + (N)]
+// BPR is a DO_TENSOR parameter, so it must be passed IN: a nested macro body is not
+// rescanned for the outer macro's parameters (C-preprocessor rule) - referencing BPR
+// directly here compiled as an undeclared identifier and left the stale .spv in place.
+#define RD_BYTE(W, ROW, BPR) int((W[(((ROW)*(BPR)+blk)*28+off) >> 2] >> (8u*uint((((ROW)*(BPR)+blk)*28+off) & 3))) & 0xFFu)
+#define RD_SCALE(W, ROW, BPR) unpackHalf2x16(W[((ROW)*(BPR)+blk)*7+6] >> 16).x
 
-// One tensor's row-pair. W is the weight buffer, Y the output, G the group index
-// within this tensor, RR the row count of this tensor.
+// One tensor's row group (RPW rows). W is the weight buffer, Y the output, G the
+// group index within this tensor, RR the row count of this tensor.
 #define DO_TENSOR(W, Y, G, RR, BPR, NTB)                                    \
     {                                                                       \
         int base_row = (G) * RPW;                                           \
         int ra = base_row, rb = base_row + 1;                               \
-        bool ka = ra < (RR), kb = (RPW >= 2) && (rb < (RR));                \
+        int rc = base_row + 2, rd = base_row + 3;                           \
+        bool ka = ra < (RR), kb = false, kc = false, kd = false;            \
+        if (RPW >= 2) kb = rb < (RR);                                       \
+        if (RPW >= 4) { kc = rc < (RR); kd = rd < (RR); }                   \
         if (!ka) ra = 0;                                                    \
         if (!kb) rb = 0;                                                    \
-        float accA = 0.0, accB = 0.0;                                       \
+        if (!kc) rc = 0;                                                    \
+        if (!kd) rd = 0;                                                    \
+        float accA = 0.0, accB = 0.0, accC = 0.0, accD = 0.0;               \
         for (int bi = int(lane); bi < (NTB); bi += int(sgsz)) {             \
             int blk = bi / 26;                                              \
             int off = bi - blk * 26;                                        \
             int bs = blk << 7;                                              \
-            int wa = ((ra) * (BPR) + blk) * 7 + 6;                          \
-            float sa = unpackHalf2x16(W[wa] >> 16).x;                       \
-            int b5a = int((W[(((ra)*(BPR)+blk)*28+off) >> 2] >>               \
-                        (8u*uint((((ra)*(BPR)+blk)*28+off) & 3))) & 0xFFu) * 5; \
-            int wb = 0, b5b = 0; float sb = 0.0;                            \
+            float sa = RD_SCALE(W, ra, BPR);                                     \
+            int b5a = RD_BYTE(W, ra, BPR) * 5;                                   \
+            int b5b = 0, b5c = 0, b5d = 0; float sb = 0.0, sc = 0.0, sd = 0.0; \
             if (RPW >= 2) {                                                 \
-                wb = ((rb) * (BPR) + blk) * 7 + 6;                          \
-                sb = unpackHalf2x16(W[wb] >> 16).x;                         \
-                b5b = int((W[(((rb)*(BPR)+blk)*28+off) >> 2] >>               \
-                         (8u*uint((((rb)*(BPR)+blk)*28+off) & 3))) & 0xFFu) * 5; \
+                sb = RD_SCALE(W, rb, BPR);                                       \
+                b5b = RD_BYTE(W, rb, BPR) * 5;                                   \
             }                                                               \
-            float pA = 0.0, pB = 0.0;                                       \
+            if (RPW >= 4) {                                                 \
+                sc = RD_SCALE(W, rc, BPR);                                       \
+                sd = RD_SCALE(W, rd, BPR);                                       \
+                b5c = RD_BYTE(W, rc, BPR) * 5;                                   \
+                b5d = RD_BYTE(W, rd, BPR) * 5;                                   \
+            }                                                               \
+            float pA = 0.0, pB = 0.0, pC = 0.0, pD = 0.0;                   \
             if (off < 16) {                                                 \
                 for (int n = 0; n < 5; ++n) {                               \
                     float xv = x[bs + off + (n << 4)];                      \
                     pA += TRIT(b5a, n) * xv;                                \
                     if (RPW >= 2) pB += TRIT(b5b, n) * xv;                  \
+                    if (RPW >= 4) { pC += TRIT(b5c, n) * xv; pD += TRIT(b5d, n) * xv; } \
                 }                                                           \
             } else if (off < 24) {                                          \
                 int j = off - 16;                                           \
@@ -99,6 +116,7 @@ const uint P3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
                     float xv = x[bs + 80 + j + (n << 3)];                   \
                     pA += TRIT(b5a, n) * xv;                                \
                     if (RPW >= 2) pB += TRIT(b5b, n) * xv;                  \
+                    if (RPW >= 4) { pC += TRIT(b5c, n) * xv; pD += TRIT(b5d, n) * xv; } \
                 }                                                           \
             } else {                                                        \
                 int j = off - 24;                                           \
@@ -106,24 +124,21 @@ const uint P3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
                     float xv = x[bs + 120 + (n << 1) + j];                  \
                     pA += TRIT(b5a, n) * xv;                                \
                     if (RPW >= 2) pB += TRIT(b5b, n) * xv;                  \
+                    if (RPW >= 4) { pC += TRIT(b5c, n) * xv; pD += TRIT(b5d, n) * xv; } \
                 }                                                           \
             }                                                               \
             accA += sa * pA;                                                \
             if (RPW >= 2) accB += sb * pB;                                  \
+            if (RPW >= 4) { accC += sc * pC; accD += sd * pD; }             \
         }                                                                   \
-        sh[sub][0][lane] = accA;                                            \
-        if (RPW >= 2) sh[sub][1][lane] = accB;                              \
-        barrier();                                                          \
-        for (int st = 32; st > 0; st >>= 1) {                               \
-            if (int(lane) < st) {                                           \
-                sh[sub][0][lane] += sh[sub][0][lane + st];                  \
-                if (RPW >= 2) sh[sub][1][lane] += sh[sub][1][lane + st];    \
-            }                                                               \
-            barrier();                                                      \
-        }                                                                   \
+        accA = subgroupAdd(accA);                                               \
+        if (RPW >= 2) accB = subgroupAdd(accB);                                 \
+        if (RPW >= 4) { accC = subgroupAdd(accC); accD = subgroupAdd(accD); }   \
         if (lane == 0u) {                                                   \
-            if (ka) (Y)[ra] = sh[sub][0][0];                                \
-            if (kb) (Y)[rb] = sh[sub][1][0];                                \
+            if (ka) (Y)[ra] = accA;                                        \
+            if (kb) (Y)[rb] = accB;                                         \
+            if (kc) (Y)[rc] = accC;                                         \
+            if (kd) (Y)[rd] = accD;                                         \
         }                                                                   \
     }
 

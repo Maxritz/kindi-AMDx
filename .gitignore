@@ -1,18 +1,19 @@
-# model files and everything Kindi generates
-*.gguf
-pack/
-state/
-*.bin
-*.f32
-*.npz
-*.npy
-# local configuration (copy kindi.conf.example)
-kindi.conf
-*.local.*
-.env
-# python / tooling
-__pycache__/
-*.pyc
-*.log
-.vscode/
-.idea/
+# Build artifacts
+*.exe
+*.obj
+*.lib
+*.dll
+*.spv
+bin/
+build/
+*.o
+
+# Build junk
+portingwork/comp.spv
+portingwork/fix_bytenr.py
+
+# Vendor (large, optional)
+portingwork/vendor/
+
+# Prebuilt binaries
+kindi-as-is/
