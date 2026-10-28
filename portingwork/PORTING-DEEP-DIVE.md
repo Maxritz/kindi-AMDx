@@ -64,49 +64,50 @@ The 29% GEMV efficiency (10.8 vs 37) is the in-kernel gap to close.
 
 The 29% GEMV efficiency (10.8 vs 37) is the in-kernel gap to close.
 
-## 4. ROOT-CAUSE / DATA model of the GEMV gap
+## 4. ROOT-CAUSE (corrected by full-trace demoscene pass)
 
-Traced with bwtest.comp (streaming probe) vs g5ptq_bytenr (real decode).
+Per-shader trace (2B spec K=3, 40-token copy, throttled):
 
-FLOW (per-token, 2B, R=C=2048, wave 32, RPW=4):
+| shader | ops | dev us | us/op | role |
+|---|---|---|---|---|
+| `g5ptq_bytenr4` | 2688 | 610 ms | 226 | serial projections (T=1) |
+| `spec:g5ptq_bytenrT` (body) | 630 | 468 ms | **744** | verify body (T=4, 1 weight read) ✔ |
+| `spec:g5ptq_bytenr4` | 120 | 12 ms | 102 | serial fallback on mismatch |
+| `spec:g5ptq_byte3nr4` | 120 | 17 ms | 142 | fused gate+up |
+| `spec:gdn_delta_T` | 90 | 37 ms | 408 | recurrent per layer |
+| `argmax` | 20 | 3.5 ms | 174 | VOCAB-wide read |
+| **head `g5ptq_bytenrT`** | **11** | **436 ms** | **39 672** | ⚠ head, tiled wrong |
+
+**Original §3 analysis was INVERTED:** the head is *not* falling back to serial —
+it correctly routes through `pg5T` (bytenrT), confirmed at kindi_vk_decode.cpp:2281
+(`gemvT(head_name)` → `gemvM5ptq` → line 2174-2178). The pathology is the **grid
+shape** at `R = VOCAB = 248320` rows. `bytenrT` does one row per subgroup (good for
+the body, 2048 rows ⇒ 256 WGs). For the head,
+`gx = (VOCAB + nsub-1)/nsub ≈ 31040` workgroups of 8 rows each — each WG streams a
+unique 1.6 KB slice of the 5-GB weight buffer ⇒ **31K non-coalescing DRAM streams**
+the fabric cannot service at 37 GB/s (each stalls on a 128-byte block; the L2 has no
+reuse across 31K WGs). Body hits the same fabric with contiguous ~320 KB spans ⇒
+only ~11 GB/s sustained; head gets ~1 GB/s.
+
+Demoscene framing: **reuse-before-eviction** failure (ryg/farbrausch). Each 28 B
+weight block is read once and evicted because 31K WGs interleave accesses. Fix:
+**spatial tiling of the row axis** — one WG over a contiguous tile of 64 rows
+(64×28 = 1792 B, 4 per 64-B line) so 64 lanes share one fetch → reuse ×32, fabric
+saturates. Same bytenrT decode arithmetic (bit-identical), new `gx`.
+
+FLOW (per-token, 2B, spec K=3):
 ```
-body() -> [embed] -> L24 layers: gdn or attn -> ffn -> head -> argmax
-        -> each layer: 1-3 PTQ1_0 GEMVs (qkv/o/down/ffn_gate/up) via gemvM5ptq
-        -> gdn layers: pgdn_conv + pgdn_delta_T (serial-in-kernel T)
-        -> attn layers: pgdn... no, attn_sg/attn_sq/rope/attn_vq/attn_comb + store_h
-        -> ~116 GEMV dispatches/op for decode, 2324/op total incl. prefill-sized
+generate() -> [draft: NgramDraft prompt-lookup, K=3, zero bytes]
+   -> body_T([cur]+d, T)  // g5ptq_bytenrT body, weights 1x/pass ✔
+   -> head_rows(T)       // gemvT(head, xpT, logT, T) -> pg5T HEAD
+        -> argmax x T    // 31K-WG grid, 39.6 ms/op ⚠
+   -> accept prefix / reject -> restore+replay (gdn_delta_T re-run)
 ```
 
-DATA per weight byte: `w[bi>>2] >> (8*(bi&3))` — one 4-byte word fetched per byte,
-but 4 lanes share the word in L1, so the *group* is dense. So it is NOT 4×
-overfetch.
-
-BRANCHES considered:
-- B1 "overfetch from byte-decode" — BROKEN. L1 caches the uint32 word across the 4
-  lanes that share it (4 lanes / word × 32 lanes = 8 words per subgroup per block
-  row = exactly the 28-byte blocks padded to 32). Not it.
-- B2 "L2 thrashing (weights 530 MB >> 4 MB L2)" — PARTIAL. The probe (pure stream,
-  256 MB) also thrashes L2 yet hits 37. So DRAM streaming CAN reach 37 here.
-- B3 "kernel not latency-hiding: per-op fixed overhead" — STRONG. Trace shows
-  ~116 GEMV ops/token at ~459 us/op; a 4.5 MB op streamed at 37 GB/s = 121 us.
-  The other ~340 us/op is kernel launch + occupancy ramp + tail, amplified ×116.
-  The probe (16K+ workgroups, saturating) vs a GEMV op (64 workgroups for R=2048)
-  differ in occupancy headroom.
-- B4 "decode ALU bound" — PARTIAL. per byte: 5× mod-multiply decode (~6 int) + 1 FMA
-  = ~7 ops; 530 MB × 7 ≈ 3.7 G ops/tok. At Xe-LPG ≈ 1.5 T int-ops/s that's ~2 ms —
-  the ALU floor is tiny; the 340 us/op tail is launch/overhead, not decode.
-
-HYPOTHESES (ranked by cost-to-refute):
-- H1: per-op dispatch overhead dominates at 116 ops/tok. Fix: fewer, bigger ops —
-  BUT the layer-by-layer recurrence (gdn state) and attention dependencies prevent
-  fusing across layers. Partially fixable inside a layer (T-in-lane already does
-  this) and via batching T tokens.
-- H2: the T-in-lane kernel fixes the re-read-every-token bug (the spec verify
-  passes share 1 weight stream across T tokens). CONFIRMED: bytenrT bit-identical,
-  and a T=4 verify pass reads weights 1× not 4×.
-- H3: gdn_delta_T at 562 us/op × 16 gdn layers is a hidden recurrent tax on every
-  serial token (spec replay too). Needs its own kernel pass (vectorize the conv
-  ring; it is small state).
+DATA: head weight = 248320 × 32896 bytes ≈ 5 GB resident; body weights ≈ 530 MB.
+The head GEMV is the only op where `rows >> cols` (R=248320 vs C=32896) — bytenrT
+assumes R is small (one row/subgroup, C is the long axis). The dispatch
+`(rows+nsub-1)/nsub` is correct for the body but **wrong granularity for the head**.
 
 ## 5. WHAT SHIPPED THIS SESSION (validated)
 
@@ -160,4 +161,132 @@ Intel iGPU throttles ±25% under sustained load (this box was at the wall). The
 absolute tok/s numbers in §3 are lower-bound; the *ratios* (spec 4 tok/pass,
 force-reject 1 tok/pass, byte3nr 17 GB/s vs bytenr 9.8) are stable identifiers.
 Re-run final benchmarks on a cooled machine, interleaved by/th (A/B in the same
-thermal window).
+thermal window). No inference runs executed since throttle dominated all of the
+late §3 measurements; all shipped code is compile- + selftest-gated (token-exact).
+
+---
+
+# Demoscene Optimization — whole code (8-point × group specialties)
+
+> Framework: profile → eliminate intermediates → data layout → reduce traffic →
+> remove branches → inline → specialize → re-profile. GPU fabric here = ~37 GB/s
+> on a 9.46 GB shared-DDR5 heap (thermal throttle swings ±3×). Treat ratios, not
+> absolutes.
+
+## 1. PROFILE — the 1% that is 90% (trace, 2B spec K=3, throttled run)
+
+`projections` = **87%** of device time. Per-shader breakdown:
+
+| shader | ops | dev us | us/op | note |
+|---|---|---|---|---|
+| `spec:g5ptq_bytenrT` (verify body, 1 token/4 rows) | 1386 | 1.47 s | **1.06** | ✔ fast path we shipped |
+| `g5ptq_byte3nr4` (fused gate+up, serial) | 2688 | 835 ms | 311 | best ratio (17 GB/s) but T=1 |
+| `g5ptq_bytenr4` (plain serial projections) | 2688 | 635 ms | 236 | |
+| **`g5ptq_bytenrT` (head, 11 ops)** | 11 | 436 ms | **39 672** | ⚠ anomaly — grid-tail / occupancy cliff |
+| `gdn_delta` / `spec:gdn_delta_T` | 1008 / 216 | 111 / 530 ms | 109 / 2457 | recurrent tax |
+| `argmax` | 43 | 7.2 ms | 167 | reads VOCAB buffer |
+
+The head: 11 ops = one per spec pass (D=vocab projection out). 436 ms total because
+each `bytenrT` op hits `R=D=2048`, dispatched row-per-subgroup ⇒ `gx=257`, streaming a
+~32–64 MB weight buffer through too few concurrent WGs → fabric never saturates.
+**39.6 ms/op vs the verify-body 1.06 ms/op for the identical kernel** ⇒ pure
+dispatch-tail / occupancy cliff. Root cause of head cost on both 2B and 27B.
+
+## 2–8. FIX LIST (by demoscene specialty)
+
+### ryg (data layout) — head tiling (the big lever)
+Split vocab axis `C` into K-way slabs: one WG per `(row-slab)`, reduce partials;
+or dispatch `gx = (D/rowsPerWG) × (vocab/128)` with per-(row,vocabTile) kernel +
+parallel reduction. Raises WG count 32× ⇒ saturates the 37 GB/s fabric ⇒ head
+drops 436 ms → ~13 ms. Principle: every loaded byte reused before eviction;
+raise fan-in of the memory pipeline.
+
+### ryg (fused pipeline) — head+argmax, no VOCAB buffer
+`gemvT(head) → logT[T×VOCAB] → argmax` materializes a 512 KB–2 MB logits buffer read once.
+Fuse: head GEMM with a **running per-token argmax** in-lane (max+index accumulator),
+emit only T token IDs. Removes the logT allocation + one full VOCAB pass.
+(Haujobb: single-pass, no intermediates.)
+
+### farbrausch (inline + LUT) — branchless trit-position index
+`g5ptq_bytenr.comp` / `g5ptq_bytenrT.comp` branch on `off<16 / <24 / else` — `off`
+varies per lane across the subgroup ⇒ **3-way subgroup divergence** every byte
+iteration (~416 iterations/row). Replace with a 26-entry LUT `{col0, stride, ndig}`
+indexed by `off`, single loop, uniform trip count baked in. LUT ≤ 208 B constants.
+Keep TRIT order identical per byte so FMA order is unchanged ⇒ bit-identical.
+
+### ryg — x layout `[col][T]` (transposed)
+bytenrT loads `x[t*xs+col]` for t=0..3 (token-major, `xs=D=2048`). If stride isn't a
+multiple of 64 B, the 4 token loads cross two cache lines each. Transpose xpT to
+`[col][T]` (T contiguous, 16 B for 4×fp32) ⇒ all four tokens share one cache line,
+one load + subgroup shuffle. ~4× x-traffic cut on the verify path.
+
+### BeBo (throughput) — fuse GDN recurrent steps
+`gdn_delta` 109 us/op ×16 layers (2B) / ×48 (27B) is the per-token serial tax; spec
+replay pays it again on rejection. `gdn_conv_T` + `gdn_delta_T` = two kernels per
+layer per pass — **fuse conv+deltan+norm into one pass** over NV×HK state (3
+dispatches → 1, 3 buffer round-trips → 0). Non-temporal the conv ring to L2 (reused
+by delta). Fold the accepted-n advance into a single fused per-layer commit kernel.
+
+### Wayfinder (compute-not-store) — speculative itself
+Already done: spec reads weights 1× per K+1-token batch (compute drafts, reuse
+weights) vs serial 1×/token. The head-tiling + head-fusion above are the same
+principle (don't store the logits the head computes).
+
+### Fiver2 (bit-packing) — ruled out (see §6)
+Would pack trits into bytes + dot int8 via `OpSDotKHR`. Capability query:
+`4x8BitPacked*Accelerated=0` ⇒ scalarized ⇒ slower than float. Fiver2's
+XNOR+popcount is for BNN (1-bit); PTQ1_0 is 5-trit base-3 and needs mod-multiply
+decode regardless. Keep float FMA.
+
+### Chaos/KB (shrink) + BeBo (host ILP) — indirect dispatch
+27 098 dispatched ops/tok; host 60 ms (~220 us/op binding + push-const + dispatch).
+Pack a parameter buffer, one `vkCmdDispatchBase` per phase type (7 phases) instead
+of 27K. Bind descriptors once per layer-group, not per op; collapse the per-op
+`struct{...pc;}` memcpy.
+
+## 9. SPECIALIZATION ORDER (next to build)
+
+0. **FIX: head dispatch math was WRONG in the analysis.** The head *is* routed
+   through `pg5T` (bytenrT) — confirmed at kindi_vk_decode.cpp:2281
+   (`gemvT(head_name,...)` → `gemvM5ptq` → line 2174-2178). The slowness is NOT a
+   serial fallback. The 39.6 ms/op × 11 ops for the head is `bytenrT` running on
+   `R = VOCAB = 248320` rows with `gx = (VOCAB + nsub-1)/nsub` = ~31040 workgroups of
+   8 rows each. **Problem:** one row-per-subgroup × 8-subgroup/WG means each WG reads
+   a 5-GB weight buffer at offset (row/block), streaming ~1.6 KB chunks — the
+   fabric sees 31K tiny, non-coalescing streams that can't sustain 37 GB/s. **Fix:**
+   tile the head row-axis — `gx = (VOCAB + TILE-1)/TILE` with a TILE×rows-per-WG
+   kernel that shares ONE weight read across a tile (same bytenrT decode, but the
+   WG now walks a contiguous 28-byte-aligned span of rows). Raises reuse ×32,
+   saturates DRAM. ~4× expected.
+1. **Head grid-granularity (this fix).** Head is already T-batched via bytenrT;
+   the anomaly is the `gx=(VOCAB+nsub-1)/nsub` dispatch (31K tiny-WG streams).
+   Tile the row axis (e.g. 64 rows/WG contiguous over the block array → reads a
+   1792-byte span reused across 64 lanes). Same decode, shared weights. ~4×.
+2. **Head + argmax fusion** (ryg). Fold argmax into the head kernel's per-row
+   reduction (track max+index in-lane → emit T IDs); kills the VOCAB-wide logits
+   buffer (248320×4 = ~1 MB/T) + the `pargmax` dispatch pass.
+3. **Branchless trit LUT** (farbrausch/ryg). Low-risk, bit-identical, removes
+   3-way subgroup divergence in bytenrT's `if (off<16)/else if(<24)/else`. One
+   26-entry LUT `{col0, stride, ndig}` per off; validate on cool machine.
+4. **Fused conv+deltan+norm per GDN layer** (BeBo). `gdn_delta` 109 us/op ×
+   16 layers; conv+delta+norm currently 3 dispatches. Fold to one pass over state.
+5. **x layout `[col][T]`** (ryg). `x[t*xs + col]` → `[col][T]`; 4 tokens share
+   one 64 B cache line. Cuts x-fetch traffic on the verify path.
+6. **Indirect host dispatch** (Chaos/KB + BeBo). 27 098 ops/tok → 7 phase types.
+   One `vkCmdDispatchBase` per phase, descriptors bound once/layer-group.
+7. **4-bit KV cache (BONSAI_KV4)** — memory, not speed; 27B long-Ctx fit
+   (needs mean-centering bias per KV-CACHE.md). Post-speed work.
+
+## 10. WHAT NOT TO TOUCH (sherlocked)
+
+- g5tab shared tables (correct, slower on Xe-LPG per build tax; KINDI_G5TAB=1).
+- RPW=8 / 8-chain (SIMD-width downgrade). x-staging in SLM (160→64 KB L1 cut).
+- 3-phase restructure. g5ptqM / pf2r (8-chain, 3× slower). See g5tab.comp /
+  bytenr.comp headers + §6.
+
+## 11. GATES (unchanged, compile- + selftest-bound)
+
+- selftest: PASS (bit-identical, K=2 bytenrT vs serial).
+- 2B token-exact: plain / spec K=3 / spec K=3 force-reject (restore+replay) identical.
+- 27B plain: unchanged (`--prompt` path unaffected).
+- No inference re-run for numbers until thermal recovery — all edits re-gated on build."
