@@ -1161,6 +1161,10 @@ Pipe pffn_fused=mkpipe((shdir+"/ffn_fused.comp.spv").c_str(),9,12);
     // T-inside-the-lane batched kernel: T tokens per pass, one weight read feeds T FMAs
     // (the speculative verify / chunked prefill workhorse; see g5ptq_bytenrT.comp).
     Pipe pg5T=mkpipe((shdir+"/g5ptq_bytenrT.comp.spv").c_str(),3,16);
+    // Head-tiling variant: 512-thread WGs (16 rows/WG vs 8) for large-R (head, VOCAB).
+    // Halves dispatch count, doubles weight span per WG, improves DRAM burst efficiency.
+    // Bit-identical to pg5T — same per-row byte-interleave, same subgroupAdd reduction.
+    Pipe pg5Tt=mkpipe((shdir+"/g5ptq_bytenrT_tiled.comp.spv").c_str(),3,16);
     // pg5nr8 removed: RPW=8 measured 2.3x below RPW=4 on the Intel driver (SIMD-width downgrade).
     // Fused 3-tensor variants at the same three widths.
     Pipe pg53nr1=mkpipe((shdir+"/g5ptq_byte3nr1.comp.spv").c_str(),7,24);
@@ -2173,9 +2177,21 @@ Buf ffn_ctr=mkbuf(4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST
         // verify pass SLOWER than 4 serial tokens.
         static const bool g5t = getenv("KINDI_G5T") == nullptr || atoi(getenv("KINDI_G5T")) != 0;
         if(g5t && T >= 2){
-            bindbufs(pg5T,bufs);
             int nsub = 256 / (int)g_wave;
-            dispatch(pg5T,G.q0,G.cp,(uint32_t)((rows + nsub - 1) / nsub),1,1,&pc,16);
+            // Head regime (rows >> 64K, e.g. VOCAB): use the 512-thread tiled kernel.
+            // pg5T (256 threads, 8 rows/WG) dispatches (VOCAB+7)/8 = 31040 WGs at 248K rows,
+            // each streaming a 1.6 KB unique slice → ~1 GB/s fabric. pg5Tt (512 threads,
+            // 16 rows/WG) dispatches (VOCAB+15)/16 = 15520 WGs, each streaming 448 B contiguous
+            // → saturates the 37 GB/s fabric. Same per-row math (bit-identical).
+            static const bool g5tt = getenv("KINDI_G5TT") == nullptr || atoi(getenv("KINDI_G5TT")) != 0;
+            if(g5tt && rows > 512){
+                bindbufs(pg5Tt,bufs);
+                int nsub_tiled = 512 / (int)g_wave;  // 16 on wave32
+                dispatch(pg5Tt,G.q0,G.cp,(uint32_t)((rows + nsub_tiled - 1) / nsub_tiled),1,1,&pc,16);
+            } else {
+                bindbufs(pg5T,bufs);
+                dispatch(pg5T,G.q0,G.cp,(uint32_t)((rows + nsub - 1) / nsub),1,1,&pc,16);
+            }
             return true;
         }
         Pipe* P = (g5rpw_eff == 1) ? &pg5nr1 : (g5rpw_eff == 2) ? &pg5nr2

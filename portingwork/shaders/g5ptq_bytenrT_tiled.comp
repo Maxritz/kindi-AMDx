@@ -1,0 +1,135 @@
+// g5ptq_bytenrT_tiled.comp - PTQ1_0 5-trit batched GEMV, vocab-tiled grid for HEAD.
+//
+// PROBLEM (kindi_vk_decode.cpp:2178): head dispatch uses
+//   gx = (VOCAB + nsub - 1) / nsub   [line 2178]
+// At VOCAB=248320, nsub=8 → 31040 WGs of 8 rows each, each WG streaming a unique
+// 1.6 KB slice of the 5 GB head weight → 31K non-coalescing DRAM streams → ~1 GB/s.
+//
+// FIX: 512-thread WGs, 16 rows/WG (each subgroup handles 1 row, 32 lanes/row).
+// Halves WG count to 15520, doubles weight span per WG (224B → 448B = 7 cache lines).
+// SAME per-row byte→FMA sequence as g5ptq_bytenrT.comp → bit-identical.
+//
+// Intel Xe-LPG: maxComputeWorkGroupSize ≥ 1024 → 512 is safe.
+//
+// Push: { int R; int C; int T; int xs; }   Bindings: 0 words, 1 x, 2 out
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#define WGS 512
+#define HEAD_TILE 16    // rows per WG (nsub at 512 threads / 32 lane subgroups)
+
+layout(local_size_x = WGS) in;
+
+layout(set = 0, binding = 0) readonly buffer BW { uint w[]; };
+layout(set = 0, binding = 1) readonly buffer BX { float x[]; };
+layout(set = 0, binding = 2) buffer BO { float out_[]; };
+
+layout(push_constant) uniform PC { int R; int C; int T; int xs; } pc;
+
+const uint P3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
+
+uint block_byte(int row, int bpr, int blk, int byteInBlk) {
+    int bi = (row * bpr + blk) * 28 + byteInBlk;
+    return (w[bi >> 2] >> (8u * uint(bi & 3))) & 0xFFu;
+}
+
+float block_scale(int row, int bpr, int blk) {
+    int sb = ((row * bpr + blk) * 28) >> 2;
+    return unpackHalf2x16(w[sb + 6] >> 16).x;
+}
+
+float tritf(uint b, int n) {
+    uint tr = (((b * P3[n]) & 0xFFu) * 3u) >> 8u;
+    return float(tr) - 1.0f;
+}
+#define TRIT(B, N) tritf((B), (N))
+
+void main() {
+    uint sgsz = gl_SubgroupSize;           // 32 on Intel Xe-LPG
+    uint nsub = uint(gl_WorkGroupSize.x) / sgsz;  // 512/32 = 16
+    uint sub = uint(gl_SubgroupID);
+    uint lane = gl_SubgroupInvocationID;
+
+    int R = pc.R;
+    int C = pc.C;
+    int T = pc.T; if (T <= 0) T = 1;
+    int xs = pc.xs; if (xs <= 0) xs = C;
+
+    // One row per subgroup — identical to g5ptq_bytenrT.comp.
+    int row = int(gl_WorkGroupID.x) * int(nsub) + int(sub);
+    bool kok = row < R;
+    if (!kok) row = 0;
+
+    int bpr = C >> 7;
+    int ntb = bpr * 26;
+
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+
+    // 2-stage software pipeline, IDENTICAL to g5ptq_bytenrT.comp:
+    int bi = int(lane);
+    int nblk = bi / 26; int noff = bi - nblk * 26; int nbase = nblk << 7;
+    uint nb = block_byte(row, bpr, nblk, noff);
+    float ns = block_scale(row, bpr, nblk);
+
+    while (bi < ntb) {
+        int blk = nblk, off = noff, base = nbase;
+        uint bb = nb; float sc = ns;
+        int nxt = bi + int(sgsz);
+        if (nxt < ntb) {
+            nblk = nxt / 26; noff = nxt - nblk * 26; nbase = nblk << 7;
+            nb = block_byte(row, bpr, nblk, noff);
+            ns = block_scale(row, bpr, nblk);
+        }
+
+        float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;
+
+        if (off < 16) {
+            for (int n = 0; n < 5; ++n) {
+                float dv = TRIT(bb, n);
+                int col = base + off + (n << 4);
+                p0 += dv * x[col];
+                if (T >= 2) p1 += dv * x[xs + col];
+                if (T >= 3) p2 += dv * x[2 * xs + col];
+                if (T >= 4) p3 += dv * x[3 * xs + col];
+            }
+        } else if (off < 24) {
+            int j = off - 16;
+            for (int n = 0; n < 5; ++n) {
+                float dv = TRIT(bb, n);
+                int col = base + 80 + j + (n << 3);
+                p0 += dv * x[col];
+                if (T >= 2) p1 += dv * x[xs + col];
+                if (T >= 3) p2 += dv * x[2 * xs + col];
+                if (T >= 4) p3 += dv * x[3 * xs + col];
+            }
+        } else {
+            int j = off - 24;
+            for (int n = 0; n < 4; ++n) {
+                float dv = TRIT(bb, n);
+                int col = base + 120 + (n << 1) + j;
+                p0 += dv * x[col];
+                if (T >= 2) p1 += dv * x[xs + col];
+                if (T >= 3) p2 += dv * x[2 * xs + col];
+                if (T >= 4) p3 += dv * x[3 * xs + col];
+            }
+        }
+        a0 += sc * p0;
+        if (T >= 2) a1 += sc * p1;
+        if (T >= 3) a2 += sc * p2;
+        if (T >= 4) a3 += sc * p3;
+        bi = nxt;
+    }
+
+    // IDENTICAL reduction + write as g5ptq_bytenrT.comp:
+    a0 = subgroupAdd(a0);
+    if (T >= 2) a1 = subgroupAdd(a1);
+    if (T >= 3) a2 = subgroupAdd(a2);
+    if (T >= 4) a3 = subgroupAdd(a3);
+    if (lane == 0u && kok) {
+        out_[row] = a0;
+        if (T >= 2) out_[R + row] = a1;
+        if (T >= 3) out_[2 * R + row] = a2;
+        if (T >= 4) out_[3 * R + row] = a3;
+    }
+}

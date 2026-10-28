@@ -290,3 +290,8 @@ of 27K. Bind descriptors once per layer-group, not per op; collapse the per-op
 - 2B token-exact: plain / spec K=3 / spec K=3 force-reject (restore+replay) identical.
 - 27B plain: unchanged (`--prompt` path unaffected).
 - No inference re-run for numbers until thermal recovery — all edits re-gated on build."
+
+## 12. PONYTAIL-DIAG: HEAD-TUNING (full trace, code-as-data)
+
+### FLOW (spec verify head path)
+generate() -> spec(K=3) -> body_T(T=4) -> head_rows(T)
