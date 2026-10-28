@@ -1118,6 +1118,10 @@ Pipe pffn_fused=mkpipe((shdir+"/ffn_fused.comp.spv").c_str(),9,12);
     Pipe pg53nr1=mkpipe((shdir+"/g5ptq_byte3nr1.comp.spv").c_str(),7,24);
     Pipe pg53nr2=mkpipe((shdir+"/g5ptq_byte3nr2.comp.spv").c_str(),7,24);
     Pipe pg53nr4=mkpipe((shdir+"/g5ptq_byte3nr4.comp.spv").c_str(),7,24);
+    // g5tab: faithful port of the original g5_core (shared sum-table, byte=index).
+    // Shared tables rebuilt per 128-column group; replaces decode arithmetic and
+    // per-byte x loads with 26 table lookups per block. A/B via KINDI_G5TAB=0.
+    Pipe pg5tab=mkpipe((shdir+"/g5tab.comp.spv").c_str(),3,8);
     fprintf(stderr,"PTQ1_0 GEMV: %d row(s) per wave (wave %u%s)\n", g5rpw_eff, g_wave,
             g5rpw_eff != g5rpw ? ", KINDI_RPW override" : "");
     // Speculative-verify kernels: T tokens x RPW rows per wave, one per width.
@@ -1366,7 +1370,17 @@ Buf ffn_ctr=mkbuf(4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST
                 // Default: rows per wave chosen from the device's wave width, so the
                 // wave is filled the same way on wave32, wave64 and wave128 parts.
                 // 256 threads / wave * rpw rows per workgroup. KINDI_RPW overrides
-                // for A/B (8 halves the workgroup count; see g5ptq_bytenr.comp).
+                // for A/B (see g5ptq_bytenr.comp).
+                // KINDI_G5TAB=1 (default): g5tab - the original g5_core architecture
+                // (shared sum-table, byte=index, one row per thread). KINDI_G5TAB=0
+                // falls back to the bytenr family for A/B.
+                static const bool g5tab_on = getenv("KINDI_G5TAB") != nullptr && atoi(getenv("KINDI_G5TAB")) != 0;
+                if (g5tab_on) {
+                    bindbufs(pg5tab,bufs);
+                    struct{int R,C;}pc2{rows,cols};
+                    dispatch(pg5tab,G.q0,G.cp,(uint32_t)((rows + 1023) / 1024),1,1,&pc2,8);
+                    return;
+                }
                 Pipe* P = (g5rpw_eff == 1) ? &pg5nr1 : (g5rpw_eff == 2) ? &pg5nr2
                         : &pg5nr4;
                 int wg = 256 / (int)g_wave;
@@ -2713,6 +2727,33 @@ Buf ffn_ctr=mkbuf(4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST
                     fprintf(stderr,"selftest PTQ1_0 bytenr gy=2 xs=3C: %s\n", o5t ? "PASS" : "FAIL");
                     ok = ok && o5t;
                     freebuf(zt); freebuf(x2);
+                }
+
+                // g5tab (g5_core architecture: shared sum-table, byte=index) vs bytenr.
+                // Different FMA order by design (table-summed), so informational
+                // tolerance; the hard gates are token-exactness and the A/B trace.
+                {
+                    Buf z3=mkbuf((VkDeviceSize)R*4,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                    { std::vector<Buf> b={codebufs[n5],xb,z3};
+                      bindbufs(pg5tab,b);
+                      struct{int R,C;}pc{R,C};
+                      dispatch(pg5tab,G.q0,G.cp,(uint32_t)((R+511)/512),1,1,&pc,8); }
+                    batch_flush();
+                    auto c3=rd(z3,R);
+                    double h0=0; double nrm=0;
+                    for(int i=0;i<R;++i){
+                        double d=std::fabs(c1[i]-c3[i]); if(d>h0) h0=d;
+                        nrm += std::fabs(c3[i]);
+                    }
+                    fprintf(stderr,"selftest PTQ1_0 g5tab vs bytenr: max|dy|=%.3e (sum %.3f, informational)\n", h0, nrm);
+                    fprintf(stderr,"  c1[0..2] = %.5f %.5f %.5f | c3[0..2] = %.5f %.5f %.5f\n",
+                            c1[0], c1[1], c1[2], c3[0], c3[1], c3[2]);
+                    {   int bad = -1; double bd = 0; int nbad0=0, nbad1=0;
+                        for(int i=0;i<R;++i){ double d=std::fabs(c1[i]-c3[i]); if(d>1e-4){ if((i/256)%2) nbad1++; else nbad0++; } if(d>bd){bd=d; bad=i;} }
+                        fprintf(stderr,"  worst row %d (wg %d, k %d, t %d) diff %.5f: c1=%.5f c3=%.5f | badrows k0=%d k1=%d\n",
+                                bad, bad/512, (bad/256)%2, bad%256, bd, c1[bad], c3[bad], nbad0, nbad1);
+                    }
+                    freebuf(z3);
                 }
                 freebuf(z1); freebuf(z2);
 

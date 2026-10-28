@@ -1,0 +1,155 @@
+// g5tab.comp - PTQ1_0 5-trit GEMV, faithful port of the original g5_core
+// (kindi.cu Pascal path) - the architecture our bytenr kernels flattened away.
+//
+// Per 128-column group g, build shared SUM TABLES in which the weight byte
+// itself is the index:
+//
+//   T[j*243 + c]            = sum_i trit_i(c) * x[128g + pos(j,i)]    j = 0..23 (5-trit bytes)
+//   T[24*243 + m*81 + c]    = sum_i trit_i(c) * x[128g + 120+m+2i]    m = 0,1   (4-trit bytes)
+//
+// where trit_i(c) is the byte's i-th trit in {-1,0,1} and pos() is the RAW GGUF
+// column mapping (byte j<16 covers columns j+16i; byte 16..23 covers 80+j-16+8i;
+// bytes 24,25 cover 120+m+2i - strided, NOT the original's repacked consecutive
+// layout). The trits are recovered with the same mod-multiply formula the
+// bytenr kernels use (proven bit-identical to the LUT), decoded ONCE per byte
+// value and shared across all 24 positions. A row's block is 7 words = 26 trit
+// bytes + 1 scale word; the row sum is 26 table lookups + ONE scale multiply.
+// No decode arithmetic and no x loads in the hot loop.
+//
+// Shared budget: T = 5994 floats = 23.4 KB of the 48 KiB SLM (no AB scratch:
+// the c-outer/j-inner build order decodes each byte value once). Unlike the
+// sherlocked raw-x staging, this SLM replaces ~130 x-loads and ~500 decode-ALU
+// ops per block with 26 lookups, so the L1-for-SLM trade is positive.
+//
+// Rows: one row per thread, RPT rows per thread (r = r0 + k*WGS). Adjacent
+// threads read adjacent 7-word blocks, so each warp streams contiguous memory.
+//
+// NOTE: the lookup indexes with the raw byte (0..255); the mod-multiply decode
+// is injective over [0,243) and valid PTQ1_0 data only contains such bytes
+// (same assumption as the original kernel's 243-entry tables).
+//
+// SHERLOCKED (2026-10-28): correct (2.7e-07 vs bytenr) but NEUTRAL-TO-SLOWER on
+// Meteor Lake (15-18 vs 16-21 tok/s same-window). The per-(workgroup, group)
+// table build (~43K ALU) must be amortized over many rows, but filling the
+// 1024-thread GPU needs many small workgroups - the two pull against each other
+// and land at a wash. The original won because its loader REPACKS the weight
+// bytes to plain base-3 (table build = c%3 digit splits, nearly free) and the
+// Pascal path targeted 512-thread old cards. Our raw mod-multiply-encoded bytes
+// make the build a full mod-decode per table entry. Keep bytenr default;
+// g5tab behind KINDI_G5TAB=1.
+//
+// Push: { int R; int C; }   Bindings: 0 raw words, 1 x (float), 2 out (float)'
+#version 450
+
+#ifndef RPT
+#define RPT 4
+#endif
+#define WGS 256
+#define NTAB (24*256 + 2*256)   // 6656: RAW bytes span 0..255; every table must hold all 256 values or lookups overrun
+
+layout(local_size_x = WGS) in;
+
+layout(set = 0, binding = 0) readonly buffer BW { uint w[]; };
+layout(set = 0, binding = 1) readonly buffer BX { float x[]; };
+layout(set = 0, binding = 2) buffer BO { float out_[]; };
+
+layout(push_constant) uniform PC { int R; int C; } pc;
+
+shared float T[NTAB];      // 24 x 256-entry 5-trit tables + 2 x 81-entry 4-trit tables
+
+const uint P3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
+
+// the proven mod-multiply trit decode: digit n of byte b in {-1,0,1}
+float tritv(uint b, int n) {
+    uint tr = (((b * P3[n]) & 0xFFu) * 3u) >> 8u;
+    return float(tr) - 1.0f;
+}
+
+void main() {
+    int R = pc.R;
+    int C = pc.C;
+    int NG = C >> 7;                    // 128-column groups
+    int t  = int(gl_LocalInvocationID.x);
+    int r0 = int(gl_WorkGroupID.x) * (WGS * RPT) + t;
+
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;   // acc2/3 dead at RPT < 4
+
+    for (int g = 0; g < NG; ++g) {
+        barrier();
+        {   // ---- build: decode each byte value ONCE (mod-multiply), then fold
+            //      into all 24 position tables. c-outer/j-inner: no AB scratch.
+            for (int cc = t; cc < 256; cc += WGS) {
+                float d0 = tritv(uint(cc), 0);
+                float d1 = tritv(uint(cc), 1);
+                float d2 = tritv(uint(cc), 2);
+                float d3 = tritv(uint(cc), 3);
+                float d4 = tritv(uint(cc), 4);
+                for (int j = 0; j < 24; ++j) {
+                    int b0 = (j < 16) ? (g*128 + j) : (g*128 + 80 + j - 16);
+                    int st = (j < 16) ? 16 : 8;
+                    T[j*256 + cc] = d0*x[b0] + d1*x[b0+st] + d2*x[b0+2*st]
+                                  + d3*x[b0+3*st] + d4*x[b0+4*st];
+                }
+            }
+            // ---- 4-trit tables (bytes 24,25: columns 120+m+2i, interleaved)
+            for (int cc = t; cc < 256; cc += WGS) {
+                float d0 = tritv(uint(cc), 0);
+                float d1 = tritv(uint(cc), 1);
+                float d2 = tritv(uint(cc), 2);
+                float d3 = tritv(uint(cc), 3);
+                T[24*256 +        cc] = d0*x[g*128+120]   + d1*x[g*128+122] + d2*x[g*128+124] + d3*x[g*128+126];
+                T[24*256 + 256 + cc] = d0*x[g*128+121] + d1*x[g*128+123] + d2*x[g*128+125] + d3*x[g*128+127];
+            }
+        }
+        barrier();
+
+        // ---- rows: 7-word block, 26 table lookups, one scale
+        for (int k = 0; k < RPT; ++k) {
+            int r = r0 + k*WGS;
+            if (r < R) {
+                // RAW GGUF layout is ROW-major: block words at (r*NG + g)*7.
+                // (The original's repacked weights are group-major, (g*R + r)*7.)
+                int wb = (r * NG + g) * 7;
+                uint w0 = w[wb+0], w1 = w[wb+1], w2 = w[wb+2], w3 = w[wb+3];
+                uint w4 = w[wb+4], w5 = w[wb+5], w6 = w[wb+6];
+                float s = 0.0f;
+                s += T[ 0*256 + ((w0      ) & 255u)];
+                s += T[ 1*256 + ((w0 >>  8) & 255u)];
+                s += T[ 2*256 + ((w0 >> 16) & 255u)];
+                s += T[ 3*256 + ((w0 >> 24) & 255u)];
+                s += T[ 4*256 + ((w1      ) & 255u)];
+                s += T[ 5*256 + ((w1 >>  8) & 255u)];
+                s += T[ 6*256 + ((w1 >> 16) & 255u)];
+                s += T[ 7*256 + ((w1 >> 24) & 255u)];
+                s += T[ 8*256 + ((w2      ) & 255u)];
+                s += T[ 9*256 + ((w2 >>  8) & 255u)];
+                s += T[10*256 + ((w2 >> 16) & 255u)];
+                s += T[11*256 + ((w2 >> 24) & 255u)];
+                s += T[12*256 + ((w3      ) & 255u)];
+                s += T[13*256 + ((w3 >>  8) & 255u)];
+                s += T[14*256 + ((w3 >> 16) & 255u)];
+                s += T[15*256 + ((w3 >> 24) & 255u)];
+                s += T[16*256 + ((w4      ) & 255u)];
+                s += T[17*256 + ((w4 >>  8) & 255u)];
+                s += T[18*256 + ((w4 >> 16) & 255u)];
+                s += T[19*256 + ((w4 >> 24) & 255u)];
+                s += T[20*256 + ((w5      ) & 255u)];
+                s += T[21*256 + ((w5 >>  8) & 255u)];
+                s += T[22*256 + ((w5 >> 16) & 255u)];
+                s += T[23*256 + ((w5 >> 24) & 255u)];
+                s += T[24*256 +        (w6 & 255u)];
+                s += T[24*256 + 256 + ((w6 >> 8) & 255u)];
+                float sc = unpackHalf2x16(w6 >> 16).x;
+                if (k == 0) acc0 += s * sc;
+                if (k == 1) acc1 += s * sc;
+                if (k == 2) acc2 += s * sc;
+                if (k == 3) acc3 += s * sc;
+            }
+        }
+    }
+
+    if (r0       < R) out_[r0] = acc0;
+    if (r0+WGS   < R) out_[r0+WGS] = acc1;
+    if (r0+2*WGS < R) out_[r0+2*WGS] = acc2;
+    if (r0+3*WGS < R) out_[r0+3*WGS] = acc3;
+}
