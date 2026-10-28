@@ -1,0 +1,145 @@
+// g5ptq_bytenrT.comp - PTQ1_0 5-trit batched GEMV: T tokens per pass, one weight
+// read feeds T FMAs (the reference spec.py design's "one weight decode feeds four
+// FMAs, which is the whole point of prefill").
+//
+// WHY NOT gy=T: g5ptq_bytenr puts T on gl_WorkGroupID.y, but the Intel driver does
+// not co-schedule the gy siblings of a row-block, so each token's workgroup
+// re-reads the weight stream from DRAM - the 4 MB L2 never sees the reuse, and a
+// T=4 verify pass measured SLOWER than 4 serial tokens (159 vs 137 ms for 4x20
+// tokens at 100% acceptance). Here the tokens ride INSIDE the lane: one row per
+// subgroup (lanes split the block bytes exactly like the serial kernel), T
+// accumulators per lane. The weight byte is decoded once and multiplied into all
+// T token accumulators, so the weights cross the memory system exactly once per
+// pass regardless of T.
+//
+// Lane shape: 4 independent FMA chains per lane (T<=4) - the proven 4-chain shape
+// that keeps the driver's full SIMD width (8 chains trigger a downgrade).
+//
+// Bit-identical per (row, token): the byte sequence bi = lane, lane+sgsz, ... and
+// the per-digit FMA order match the serial kernel; the only change is that the
+// shared decode result feeds T accumulators instead of one.
+//
+// x is token-major [T][xs] (the engine's xpT layout); out is [T][R]
+// (out_[t*R + row]), same as the gy=T kernel.
+//
+// Push: { int R; int C; int T; int xs; }   Bindings: 0 words, 1 x, 2 out
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#define WGS 256
+
+layout(local_size_x = WGS) in;
+
+layout(set = 0, binding = 0) readonly buffer BW { uint w[]; };
+layout(set = 0, binding = 1) readonly buffer BX { float x[]; };
+layout(set = 0, binding = 2) buffer BO { float out_[]; };
+
+layout(push_constant) uniform PC { int R; int C; int T; int xs; } pc;
+
+const uint P3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
+
+uint block_byte(int row, int bpr, int blk, int byteInBlk) {
+    int bi = (row * bpr + blk) * 28 + byteInBlk;
+    return (w[bi >> 2] >> (8u * uint(bi & 3))) & 0xFFu;
+}
+
+float block_scale(int row, int bpr, int blk) {
+    int sb = ((row * bpr + blk) * 28) >> 2;
+    return unpackHalf2x16(w[sb + 6] >> 16).x;
+}
+
+float tritf(uint b, int n) {
+    uint tr = (((b * P3[n]) & 0xFFu) * 3u) >> 8u;
+    return float(tr) - 1.0f;
+}
+#define TRIT(B, N) tritf((B), (N))
+
+void main() {
+    uint sgsz = gl_SubgroupSize;
+    uint nsub = uint(gl_WorkGroupSize.x) / sgsz;
+    int sub = int(gl_SubgroupID);
+    uint lane = gl_SubgroupInvocationID;
+
+    int R = pc.R;
+    int C = pc.C;
+    int T = pc.T; if (T <= 0) T = 1;
+    int xs = pc.xs; if (xs <= 0) xs = C;
+
+    // one row per subgroup; clamp past-the-end rows to 0 (accumulate, never write)
+    int row = int(gl_WorkGroupID.x) * int(nsub) + sub;
+    bool kok = row < R;
+    if (!kok) row = 0;
+
+    int bpr = C >> 7;
+    int ntb = bpr * 26;
+
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+
+    // 2-stage software pipeline, same shape as the serial kernel: the next
+    // iteration's weight word + scale load before the current FMAs.
+    int bi = int(lane);
+    int nblk = bi / 26; int noff = bi - nblk * 26; int nbase = nblk << 7;
+    uint nb = block_byte(row, bpr, nblk, noff);
+    float ns = block_scale(row, bpr, nblk);
+
+    while (bi < ntb) {
+        int blk = nblk, off = noff, base = nbase;
+        uint bb = nb; float sc = ns;
+        int nxt = bi + int(sgsz);
+        if (nxt < ntb) {
+            nblk = nxt / 26; noff = nxt - nblk * 26; nbase = nblk << 7;
+            nb = block_byte(row, bpr, nblk, noff);
+            ns = block_scale(row, bpr, nblk);
+        }
+
+        float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;
+
+        if (off < 16) {                    // five digits, stride 16
+            for (int n = 0; n < 5; ++n) {
+                float dv = TRIT(bb, n);    // decoded ONCE, feeds all T tokens
+                int col = base + off + (n << 4);
+                p0 += dv * x[col];
+                if (T >= 2) p1 += dv * x[xs + col];
+                if (T >= 3) p2 += dv * x[2 * xs + col];
+                if (T >= 4) p3 += dv * x[3 * xs + col];
+            }
+        } else if (off < 24) {             // five digits, stride 8, from trit 80
+            int j = off - 16;
+            for (int n = 0; n < 5; ++n) {
+                float dv = TRIT(bb, n);
+                int col = base + 80 + j + (n << 3);
+                p0 += dv * x[col];
+                if (T >= 2) p1 += dv * x[xs + col];
+                if (T >= 3) p2 += dv * x[2 * xs + col];
+                if (T >= 4) p3 += dv * x[3 * xs + col];
+            }
+        } else {                           // four digits, from trit 120
+            int j = off - 24;
+            for (int n = 0; n < 4; ++n) {
+                float dv = TRIT(bb, n);
+                int col = base + 120 + (n << 1) + j;
+                p0 += dv * x[col];
+                if (T >= 2) p1 += dv * x[xs + col];
+                if (T >= 3) p2 += dv * x[2 * xs + col];
+                if (T >= 4) p3 += dv * x[3 * xs + col];
+            }
+        }
+        a0 += sc * p0;
+        if (T >= 2) a1 += sc * p1;
+        if (T >= 3) a2 += sc * p2;
+        if (T >= 4) a3 += sc * p3;
+        bi = nxt;
+    }
+
+    a0 = subgroupAdd(a0);
+    if (T >= 2) a1 = subgroupAdd(a1);
+    if (T >= 3) a2 = subgroupAdd(a2);
+    if (T >= 4) a3 = subgroupAdd(a3);
+    if (lane == 0u && kok) {
+        out_[row] = a0;
+        if (T >= 2) out_[R + row] = a1;
+        if (T >= 3) out_[2 * R + row] = a2;
+        if (T >= 4) out_[3 * R + row] = a3;
+    }
+}

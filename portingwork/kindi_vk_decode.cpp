@@ -14,6 +14,9 @@
 #include <cassert>
 #include <cstring>
 #include <cstdlib>
+#include <chrono>
+#include <map>
+#include <algorithm>
 #include <ctime>
 #include <algorithm>
 #include <set>
@@ -274,6 +277,41 @@ static void initdev(){
                     sc.computeUnitsPerShaderArray, cu,
                     sc.simdPerComputeUnit, sc.wavefrontsPerSimd, ws);
         }
+    }
+    if(getenv("KINDI_INFO")){
+        // vulkan-opt capability ladder: query the features this GPU actually exposes,
+        // not what the API version claims.
+        VkPhysicalDeviceProperties2 pp2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        VkPhysicalDeviceSubgroupProperties ssp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+        pp2.pNext=&ssp;
+        PFN_vkGetPhysicalDeviceProperties2 gp2=(PFN_vkGetPhysicalDeviceProperties2)
+            vkGetInstanceProcAddr(G.inst,"vkGetPhysicalDeviceProperties2");
+        if(gp2) gp2(G.phys,&pp2);
+        fprintf(stderr,"device: %s | vendor %x | api %u.%u | driver 0x%08x\n",
+                pp2.properties.deviceName, pp2.properties.vendorID,
+                VK_API_VERSION_MAJOR(pp2.properties.apiVersion), VK_API_VERSION_MINOR(pp2.properties.apiVersion),
+                pp2.properties.driverVersion);
+        fprintf(stderr,"subgroupSize=%u  maxComputeSharedMem=%u  maxWorkGroup=%u\n",
+                ssp.subgroupSize,
+                pp2.properties.limits.maxComputeSharedMemorySize, pp2.properties.limits.maxComputeWorkGroupSize[0]);
+        // integer dot product (VK_KHR_shader_integer_dot_product / Vulkan 1.3 core):
+        // decides whether a packed-ternary + int8-x idot4 path is even legal (SPIR-V
+        // OpSDotKHR needs VK_KHR_shader_integer_dot_product) and accelerated.
+        VkPhysicalDeviceShaderIntegerDotProductFeatures dpf{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES};
+        VkPhysicalDeviceShaderIntegerDotProductProperties pdp{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES};
+        dpf.pNext=&pdp;
+        VkPhysicalDeviceFeatures2 fq{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        fq.pNext=&dpf;
+        vkGetPhysicalDeviceFeatures2(G.phys,&fq);
+        fprintf(stderr,"shaderIntegerDotProduct feature bit: %d\n", dpf.shaderIntegerDotProduct);
+        fprintf(stderr,"dot4 4x8bit packed: signed-ACC=%d unsigned-ACC=%d saturating-%d (true = OpSDotKHR accelerated)\n",
+                pdp.integerDotProduct4x8BitPackedSignedAccelerated, pdp.integerDotProduct4x8BitPackedUnsignedAccelerated,
+                pdp.integerDotProductAccumulatingSaturating4x8BitPackedSignedAccelerated);
+        fprintf(stderr,"memory types: heap0=%u MB device-local, heap1=%u MB (cached/host)\n",
+                (uint32_t)(G.mp.memoryHeaps[0].size/1048576),
+                (uint32_t)((G.mp.memoryHeapCount>1)?G.mp.memoryHeaps[1].size/1048576:0));
     }
 }
 static std::vector<uint32_t> readspv(const char*p){ std::ifstream f(p,std::ios::binary|std::ios::ate); if(!f){fprintf(stderr,"nospv %s\n",p);exit(1);} size_t sz=(size_t)f.tellg(); f.seekg(0); std::vector<uint32_t> b(sz/4); f.read((char*)b.data(),sz); return b; }
@@ -611,6 +649,13 @@ int main(int argc, char**argv){
     int selftest=0;  // prove gemvM correctness at T>1
     int mtp_accept=0; // --mtp-accept N: run the MTP draft head one token ahead, count hits
     int spec_n=0;     // --spec N: speculative decode with the MTP draft head, k=1
+    // KINDI_SPEC_K: drafts per verify pass. 1 = the model's own MTP head (T=2 pass).
+    // 2..3 = n-gram (prompt-lookup) drafting with a T=K+1 verify pass (spec.py
+    // generate_spec); 3 is the sweet spot: T=4 is the widest pass the batched GEMV
+    // and the CT buffers support, and each accepted draft is a near-free token.
+    int spec_k=1;
+    { const char* e=getenv("KINDI_SPEC_K"); if(e) spec_k=atoi(e);
+      if(spec_k<1) spec_k=1; if(spec_k>3) spec_k=3; }
     int serve=0;      // --serve: run the OpenAI-compatible HTTP API
     const char* srv_host="127.0.0.1";
     int srv_port=8080;
@@ -1113,6 +1158,9 @@ Pipe pffn_fused=mkpipe((shdir+"/ffn_fused.comp.spv").c_str(),9,12);
     Pipe pg5nr1=mkpipe((shdir+"/g5ptq_bytenr1.comp.spv").c_str(),3,16);
     Pipe pg5nr2=mkpipe((shdir+"/g5ptq_bytenr2.comp.spv").c_str(),3,16);
     Pipe pg5nr4=mkpipe((shdir+"/g5ptq_bytenr4.comp.spv").c_str(),3,16);
+    // T-inside-the-lane batched kernel: T tokens per pass, one weight read feeds T FMAs
+    // (the speculative verify / chunked prefill workhorse; see g5ptq_bytenrT.comp).
+    Pipe pg5T=mkpipe((shdir+"/g5ptq_bytenrT.comp.spv").c_str(),3,16);
     // pg5nr8 removed: RPW=8 measured 2.3x below RPW=4 on the Intel driver (SIMD-width downgrade).
     // Fused 3-tensor variants at the same three widths.
     Pipe pg53nr1=mkpipe((shdir+"/g5ptq_byte3nr1.comp.spv").c_str(),7,24);
@@ -1200,7 +1248,9 @@ Buf ffn_ctr=mkbuf(4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST
     // chunked-path scratch: T tokens, token-major
     // T width: the chunked prefill width, but never below 2, because the speculative
     // verify pass runs T=2 regardless of KINDI_CHUNK.
-    const int CT = (CHUNK>2) ? CHUNK : ((spec_n>0) ? 2 : 1);
+    // T width: the chunked prefill width; with speculative decode, the verify pass
+    // width T = spec_k+1 (n-gram drafting at K>1, MTP at K=1).
+    const int CT = (CHUNK>2) ? CHUNK : ((spec_n>0) ? ((spec_k>1) ? spec_k+1 : 2) : 1);
     Buf hT=Z(D*CT), xnT=Z(D*CT), xpT=Z(work*CT), zvT=Z(NV*HK*CT), outT=Z(NV*HK*CT);
     // Column-major copy of xpT for the prefill GEMV: [C][T] instead of [T][C], so the T
     // token values for one weight are adjacent and share cache lines. With four separate
@@ -2117,6 +2167,17 @@ Buf ffn_ctr=mkbuf(4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST
             dispatch(pg5M,G.q0,G.cp,(uint32_t)rows,1,1,&pc,16);
             return true;
         }
+        // T-inside-the-lane batched kernel (KINDI_G5T=0 falls back to gy=T for A/B):
+        // one weight read feeds T FMAs; the gy=T shape re-reads the weights per token
+        // because the driver does not co-schedule gy siblings, which measured a T=4
+        // verify pass SLOWER than 4 serial tokens.
+        static const bool g5t = getenv("KINDI_G5T") == nullptr || atoi(getenv("KINDI_G5T")) != 0;
+        if(g5t && T >= 2){
+            bindbufs(pg5T,bufs);
+            int nsub = 256 / (int)g_wave;
+            dispatch(pg5T,G.q0,G.cp,(uint32_t)((rows + nsub - 1) / nsub),1,1,&pc,16);
+            return true;
+        }
         Pipe* P = (g5rpw_eff == 1) ? &pg5nr1 : (g5rpw_eff == 2) ? &pg5nr2
                 : &pg5nr4;
         int wg = 256 / (int)g_wave;
@@ -2446,6 +2507,36 @@ Buf ffn_ctr=mkbuf(4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST
         for(int i=0;i<VOCAB;++i){ acc+=L[i]; if(r<acc) return i; }
         return VOCAB-1;
     };
+
+    // ---- bandwidth probe (KINDI_BW=1): raw streaming-read GB/s, uint vs uvec4.
+    // Decisive experiment for the GEMV memory path: if the probe can't beat the
+    // ~10 GB/s our GEMVs achieve, no kernel rewrite reaches the DRAM floor.
+    if (getenv("KINDI_BW")) {
+        Pipe pbw = mkpipe((shdir+"/bwtest.comp.spv").c_str(), 2, 8);
+        const VkDeviceSize BYTES = 256ull<<20;              // 256 MB
+        Buf src = mkbuf(BYTES, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        { std::vector<uint32_t> z((size_t)BYTES/4, 0x13579BDFu); upload(&src, z.data(), BYTES); }
+        Buf sink = mkbuf(8192*4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        bindbufs(pbw, {src, sink});
+        int n = (int)(BYTES/4);
+        for (int mode = 0; mode <= 4; ++mode) {
+            static const char* mname[5] = { "uvec4 x1", "uint x1", "uint x4ch", "uint x8ch", "uvec4 x4ch" };
+            fprintf(stderr, "bwtest mode %d (%s):\n", mode, mname[mode]);
+            for (int gx = 1024; gx <= 16384; gx *= 2) {
+                struct{ int n; int mode; } pc{ n, mode };
+                for (int w = 0; w < 3; ++w) dispatch(pbw, G.q0, G.cp, (uint32_t)gx,1,1, &pc, 8);  // 2 warmup
+                batch_flush();
+                auto t0 = std::chrono::high_resolution_clock::now();
+                const int iters = 10;
+                for (int w = 0; w < iters; ++w) dispatch(pbw, G.q0, G.cp, (uint32_t)gx,1,1, &pc, 8);
+                batch_flush();
+                double ms = std::chrono::duration<double,std::milli>(std::chrono::high_resolution_clock::now()-t0).count()/iters;
+                fprintf(stderr, "  wg=%5d  threads=%7d  %8.2f ms  -> %7.1f GB/s\n",
+                        gx, gx*256, ms, (double)BYTES/ms/1e6);
+            }
+        }
+        freebuf(sink); freebuf(src);
+    }
 
     // ---- generate ----
     if(selftest){
@@ -3337,7 +3428,11 @@ Buf ffn_ctr=mkbuf(4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST
     }
 
     if(spec_n>0){
-        if(!have_mtp){ fprintf(stderr,"--spec: no usable MTP block in this model\n"); return 1; }
+        if(!have_mtp && spec_k<2){ fprintf(stderr,"--spec: no usable MTP block in this model (set KINDI_SPEC_K=3 for n-gram drafting)\n"); return 1; }
+        if(have_mtp && spec_k>=2)
+            fprintf(stderr,"spec: KINDI_SPEC_K=%d, n-gram drafting (MTP head unused)\n", spec_k);
+        else if(!have_mtp)
+            fprintf(stderr,"spec: KINDI_SPEC_K=%d, n-gram drafting\n", spec_k);
         { const char* g5=getenv("KINDI_G5");
           if(g5 && !strcmp(g5,"byte4")){
               fprintf(stderr,"--spec: KINDI_G5=byte4 is not bit-identical to the batched "
@@ -3369,7 +3464,7 @@ Buf ffn_ctr=mkbuf(4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST
             i+=T;
         }
         fprintf(stderr,"prefill: %d chunked passes, %d serial tokens\n", nchunk_used, nserial);
-    } else if(mtp_accept>0 || spec_n>0){
+    } else if(mtp_accept>0 || (spec_n>0 && have_mtp && spec_k==1)){
         // MTP catch-up interleaved with the trunk prefill: the draft layer's attention needs
         // its own K/V at every prompt position, built from (h_{p-1}, x_p). Position 0 pairs
         // with a zero h, as the reference starts pending_h at 0.
@@ -3396,6 +3491,102 @@ Buf ffn_ctr=mkbuf(4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST
     }
     int pos=(int)ids.size();
     std::vector<int> out;
+    if(spec_n>0 && spec_k>=2){
+        // Speculative decode with n-gram (prompt-lookup) drafting, spec.py generate_spec.
+        // K drafts verified in ONE T=K+1 body_T pass: the weights are read once for all
+        // rows, so each accepted draft is a nearly-free token. Greedy-equivalent by
+        // construction: draft d_i is accepted iff the trunk's argmax after the previously
+        // fed token equals d_i, and a rejected suffix costs one restore + GDN replay of
+        // the accepted prefix (the per-layer captured inputs make the replay exact;
+        // stale attention KV rows are position-indexed and simply overwritten).
+        struct NgramDraft {
+            std::vector<int> h;
+            std::map<std::vector<int>,int> idx;
+            int nmax=4, nmin=1;
+            void push(int t){
+                h.push_back(t);
+                int L=(int)h.size();
+                for(int n=nmin;n<=nmax;++n)
+                    if(L-1-n>=0) idx[std::vector<int>(h.end()-(1+n),h.end()-1)]=L-1;
+            }
+            std::vector<int> propose(int k){
+                for(int n=nmax;n>=nmin;--n){
+                    if((int)h.size()<n) continue;
+                    std::vector<int> pat(h.end()-n,h.end());
+                    auto it=idx.find(pat);
+                    if(it==idx.end()) continue;
+                    int j=it->second;
+                    // validate against stale entries: the match must still sit at j
+                    if(j<(int)h.size() && j>=n && std::equal(h.begin()+j-n,h.begin()+j,pat.begin()))
+                        return std::vector<int>(h.begin()+j,h.begin()+(std::min)(j+k,(int)h.size()));
+                }
+                return {};
+            }
+        } ng;
+        for(int t: ids) ng.push(t);
+        int p=(int)ids.size()-1;
+        int last=ids.back();
+        int nacc=0, ndraft=0, npass=0, ntok_spec=0, nserial=0;
+        ktrace::mark_decode_start();
+        double t0=ktrace::now_us();
+        static const bool force_reject = getenv("KINDI_SPEC_FORCE_REJECT") != nullptr;
+        while((int)out.size()<spec_n){
+            if(p+1>=ctx) break;
+            int room=ctx-2-p;                      // drafts that fit: fed spans p..p+T-1 <= ctx-1
+            if(room<=0) break;
+            int k=(std::min)(spec_k,spec_n-(int)out.size()-1);
+            std::vector<int> d=(k>0)?ng.propose(k):std::vector<int>();
+            if((int)d.size()>room) d.resize(room);
+            if(d.empty()){
+                // no proposal: serial greedy step, bit-identical to the plain path
+                int next=step(last,p);
+                out.push_back(next); ktrace::accuracy_token(next); ntok_spec++; nserial++;
+                ng.push(next); p++; last=next;
+                continue;
+            }
+            npass++; ndraft+=(int)d.size();
+            std::vector<int> fed; fed.push_back(last); fed.insert(fed.end(),d.begin(),d.end());
+            const int T=(int)fed.size();
+            spec_snapshot();
+            ktrace::set_tag("spec:");
+            bool okT=body_T(fed,p,true);
+            ktrace::set_tag("");
+            if(!okT){ fprintf(stderr,"spec: body_T declined (T=%d), finishing serially\n",T); break; }
+            head_rows(T);
+            batch_flush();                         // one readback for all T rows
+            int r[5];
+            for(int i=0;i<T;++i) r[i]=((int*)mtp_aout.mapped)[i];
+            int j=0;
+            while(j<(int)d.size() && r[j]==d[j]) j++;
+            if(force_reject) j=0;
+            const int ntok=1+j;
+            if(j<(int)d.size()){
+                spec_restore();
+                ktrace::set_tag("spec:");
+                spec_replay(ntok);                 // advance GDN by exactly the accepted prefix
+                ktrace::set_tag("");
+            }
+            nacc+=j;
+            for(int i=0;i<=j;++i){
+                out.push_back(r[i]); ktrace::accuracy_token(r[i]); ntok_spec++;
+                ng.push(r[i]);
+            }
+            p+=ntok;
+            last=r[j];
+        }
+        double t1=ktrace::now_us();
+        fprintf(stderr,"spec: %d passes + %d serial, %d tokens, %d/%d drafts accepted = %.1f%%\n",
+                npass, nserial, ntok_spec, nacc, ndraft, ndraft?100.0*nacc/(double)ndraft:0.0);
+        fprintf(stderr,"spec: %.1f ms total, %.3f tok/pass, %.2f tok/s\n",
+                (t1-t0)/1000.0, npass?(double)ntok_spec/npass:0.0,
+                (t1-t0)>0?ntok_spec/((t1-t0)/1e6):0.0);
+        fprintf(stderr,"\nGenerated %zu tokens: ", out.size());
+        for(int t: out) fprintf(stderr,"%d ", t);
+        fprintf(stderr,"\nDecoded: %s\n", tok.decode(out).c_str());
+        batch_flush();
+        ktrace::dump();
+        return 0;
+    }
     if(spec_n>0){
         // Speculative decode, k=1. The draft at position p predicts x_{p+1} from
         // (h_{p-1}, x_p); the trunk verifies [x_p, draft] in one T=2 pass. If the draft

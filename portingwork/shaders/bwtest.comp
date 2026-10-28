@@ -1,0 +1,56 @@
+// bwtest.comp - raw streaming-read bandwidth probe (decisive experiment).
+// Modes:
+//   0: uvec4 (16B) loads, 1 chain        1: uint (4B) loads, 1 chain
+//   2: uint loads, 4 independent chains  3: uint loads, 8 independent chains
+//   4: uvec4 loads, 4 independent chains (64B in flight per thread)
+// Tests whether the ~32 GB/s plateau is outstanding-loads-limited (fixable in
+// the GEMV kernels) or a true fabric/DRAM ceiling (fixable in nothing).
+// Push: { int n; int mode; }  (n = uint element count)
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer BA  { uint  a[];  };
+layout(set = 0, binding = 0) readonly buffer BA4 { uvec4 a4[]; };  // aliased view
+layout(set = 0, binding = 1) buffer BO { float out_[]; };
+layout(push_constant) uniform PC { int n; int mode; } pc;
+
+void main() {
+    uint t  = gl_GlobalInvocationID.x;
+    uint NT = gl_NumWorkGroups.x * 256u;
+    uint N  = uint(pc.n);
+    uint s;
+    if (pc.mode == 0) {
+        uint N4 = N >> 2;
+        uvec4 v = uvec4(0u);
+        for (uint i = t; i < N4; i += NT) v += a4[i];
+        s = v.x ^ v.y ^ v.z ^ v.w;
+    } else if (pc.mode == 1) {
+        uint v = 0u;
+        for (uint i = t; i < N; i += NT) v ^= a[i];
+        s = v;
+    } else if (pc.mode == 2) {
+        uint v0=0u,v1=0u,v2=0u,v3=0u;
+        uint i = t;
+        for (; i + 3u*NT < N; i += 4u*NT) { v0^=a[i]; v1^=a[i+NT]; v2^=a[i+2u*NT]; v3^=a[i+3u*NT]; }
+        for (; i < N; i += NT) v0 ^= a[i];
+        s = v0^v1^v2^v3;
+    } else if (pc.mode == 3) {
+        uint v0=0u,v1=0u,v2=0u,v3=0u,v4=0u,v5=0u,v6=0u,v7=0u;
+        uint i = t;
+        for (; i + 7u*NT < N; i += 8u*NT) {
+            v0^=a[i]; v1^=a[i+NT]; v2^=a[i+2u*NT]; v3^=a[i+3u*NT];
+            v4^=a[i+4u*NT]; v5^=a[i+5u*NT]; v6^=a[i+6u*NT]; v7^=a[i+7u*NT];
+        }
+        for (; i < N; i += NT) v0 ^= a[i];
+        s = v0^v1^v2^v3^v4^v5^v6^v7;
+    } else {
+        uint N4 = N >> 2;
+        uvec4 w0=uvec4(0u),w1=uvec4(0u),w2=uvec4(0u),w3=uvec4(0u);
+        uint i = t;
+        for (; i + 3u*NT < N4; i += 4u*NT) { w0+=a4[i]; w1+=a4[i+NT]; w2+=a4[i+2u*NT]; w3+=a4[i+3u*NT]; }
+        for (; i < N4; i += NT) w0 += a4[i];
+        uvec4 v = w0+w1+w2+w3;
+        s = v.x ^ v.y ^ v.z ^ v.w;
+    }
+    if (gl_LocalInvocationID.x == 0u)
+        out_[gl_WorkGroupID.x] = float(s);
+}

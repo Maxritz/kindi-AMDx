@@ -55,7 +55,11 @@ layout(set = 0, binding = 2) buffer BO { float out_[]; };
 
 layout(push_constant) uniform PC { int R; int C; } pc;
 
-shared float T[NTAB];      // 24 x 256-entry 5-trit tables + 2 x 81-entry 4-trit tables
+shared float T[NTAB];      // 24 x 256-entry 5-trit tables + 2 x 256-entry 4-trit tables
+shared float A[24*27];     // A/B factorized build: 3-trit partial sums per position
+shared float B[24*9];      // 2-trit partial sums per position
+shared float A4[2*9];      // 4-trit partial sums (per byte 24+m)
+shared float B4[2*9];
 
 const uint P3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
 
@@ -76,29 +80,52 @@ void main() {
 
     for (int g = 0; g < NG; ++g) {
         barrier();
-        {   // ---- build: decode each byte value ONCE (mod-multiply), then fold
-            //      into all 24 position tables. c-outer/j-inner: no AB scratch.
-            for (int cc = t; cc < 256; cc += WGS) {
-                float d0 = tritv(uint(cc), 0);
-                float d1 = tritv(uint(cc), 1);
-                float d2 = tritv(uint(cc), 2);
-                float d3 = tritv(uint(cc), 3);
-                float d4 = tritv(uint(cc), 4);
-                for (int j = 0; j < 24; ++j) {
-                    int b0 = (j < 16) ? (g*128 + j) : (g*128 + 80 + j - 16);
-                    int st = (j < 16) ? 16 : 8;
-                    T[j*256 + cc] = d0*x[b0] + d1*x[b0+st] + d2*x[b0+2*st]
-                                  + d3*x[b0+3*st] + d4*x[b0+4*st];
-                }
+        {   // ---- A/B-factorized build (the original g5_tables trick, adapted to
+            //      mod-multiply digits): build 27+9 partial sums per position from
+            //      ~2.5K x loads (the direct build needed 30.7K), then materialize
+            //      T[c] = A[iA(c)] + B[iB(c)] with the digits decoded once per c.
+            // A[j*27+a]: a = t0+3t1+9t2 -> (t0-1)x[p0] + (t1-1)x[p0+st] + (t2-1)x[p0+2st]
+            // B[j*9+b]:  b = t3+3t4    -> (t3-1)x[p0+3st] + (t4-1)x[p0+4st]
+            for (int e = t; e < 24*27; e += WGS) {
+                int j = e / 27, a = e - j*27;
+                int t0 = a % 3, t1 = (a/3) % 3, t2 = a / 9;
+                int b0 = (j < 16) ? (g*128 + j) : (g*128 + 80 + j - 16);
+                int st = (j < 16) ? 16 : 8;
+                A[j*27 + a] = float(t0-1)*x[b0] + float(t1-1)*x[b0+st] + float(t2-1)*x[b0+2*st];
             }
-            // ---- 4-trit tables (bytes 24,25: columns 120+m+2i, interleaved)
+            for (int e = t; e < 24*9; e += WGS) {
+                int j = e / 9, b = e - j*9;
+                int t3 = b % 3, t4 = b / 3;
+                int b0 = (j < 16) ? (g*128 + j) : (g*128 + 80 + j - 16);
+                int st = (j < 16) ? 16 : 8;
+                B[j*9 + b] = float(t3-1)*x[b0+3*st] + float(t4-1)*x[b0+4*st];
+            }
+            // 4-trit: A4[m*9+a] = (t0-1)x[120+m] + (t1-1)x[122+m]
+            //         B4[m*9+b] = (t2-1)x[124+m] + (t3-1)x[126+m]
+            for (int e = t; e < 2*9; e += WGS) {
+                int m = e / 9, a = e - m*9;
+                int t0 = a % 3, t1 = a / 3;
+                A4[m*9+a] = float(t0-1)*x[g*128+120+m] + float(t1-1)*x[g*128+122+m];
+                B4[m*9+a] = float(t0-1)*x[g*128+124+m] + float(t1-1)*x[g*128+126+m];
+            }
+        }
+        barrier();
+        {   // ---- materialize T: decode c once (mod-multiply), then 2 shared
+            //      lookups + 1 add per position. 24 x (2 loads + 1 add) + 2.
             for (int cc = t; cc < 256; cc += WGS) {
-                float d0 = tritv(uint(cc), 0);
-                float d1 = tritv(uint(cc), 1);
-                float d2 = tritv(uint(cc), 2);
-                float d3 = tritv(uint(cc), 3);
-                T[24*256 +        cc] = d0*x[g*128+120]   + d1*x[g*128+122] + d2*x[g*128+124] + d3*x[g*128+126];
-                T[24*256 + 256 + cc] = d0*x[g*128+121] + d1*x[g*128+123] + d2*x[g*128+125] + d3*x[g*128+127];
+                int d0 = int(tritv(uint(cc), 0)) + 1;
+                int d1 = int(tritv(uint(cc), 1)) + 1;
+                int d2 = int(tritv(uint(cc), 2)) + 1;
+                int d3 = int(tritv(uint(cc), 3)) + 1;
+                int d4 = int(tritv(uint(cc), 4)) + 1;
+                int iA = d0 + 3*d1 + 9*d2;
+                int iB = d3 + 3*d4;
+                for (int j = 0; j < 24; ++j)
+                    T[j*256 + cc] = A[j*27 + iA] + B[j*9 + iB];
+                int iA4 = d0 + 3*d1;
+                int iB4 = d2 + 3*d3;
+                T[24*256 +       cc] = A4[   iA4] + B4[   iB4];
+                T[24*256 + 256 + cc] = A4[9+iA4] + B4[9+iB4];
             }
         }
         barrier();
