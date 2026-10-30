@@ -29,6 +29,25 @@ def _host(a):
     return a.get() if hasattr(a, "get") else np.array(a)
 
 
+def _to_dev(dst, pos, src):
+    """dst[:pos] = src[:pos] (a parked K/V block back into the engine), in place. A plain CuPy assignment from a
+    host array first makes a temporary device copy, and on a full card there is no room for it (GTX 1080, 27B at
+    65,536 context: out of memory while a 41,873-token conversation was brought back)."""
+    s = np.ascontiguousarray(src[:pos])
+    if hasattr(dst, "set") and not hasattr(dst, "parts") and not isinstance(dst, np.ndarray):
+        dst[:pos].set(s)                     # CuPy
+    else:
+        dst[:pos] = s                        # NumPy (CPU engine) or tp.Dist (copies in place itself)
+
+
+def _free_device_pool():
+    try:
+        import cupy
+        cupy.get_default_memory_pool().free_all_blocks()
+    except Exception:
+        pass
+
+
 class Cancelled(Exception):
     """The client disconnected; the engine state is consistent (every processed token is in Runner.tokens)."""
 
@@ -338,6 +357,15 @@ def _ram_bytes():
     return 8 * 2 ** 30
 
 
+# branch parking (and resuming inside a parked conversation without taking it apart) is on by default on ROCm: the
+# 780M shares system RAM, so parked conversations are cheap to keep and to restore
+try:
+    import cupy as _cp
+    _PARK_DEFAULT = "1" if getattr(_cp.cuda.runtime, "is_hip", False) else "0"
+except ImportError:
+    _PARK_DEFAULT = "0"
+
+
 class Runner(object):
     """The engine plus the cache. self.tokens = the tokens whose effect is in the engine state."""
 
@@ -486,11 +514,17 @@ class Runner(object):
         return max(c) if c else 0
 
     def _unpark(self, i, pos):
-        P = self.parked.pop(i)
+        """resume parked conversation i at pos. Resuming at its end takes it out of the parked list; resuming
+        inside it (another conversation that shares its first pos tokens: the same system prompt and tools, a
+        common history) copies the state out and leaves it parked, so its own next turn still resumes at its end
+        (KINDI_PARK_SHARE=1, with branch parking; the radix-tree behaviour for shared prefixes)"""
+        share = (pos < len(self.parked[i]["tokens"]) and os.environ.get("KINDI_PARK_BRANCH", _PARK_DEFAULT) == "1"
+                 and os.environ.get("KINDI_PARK_SHARE", "1") == "1")
+        P = self.parked[i] if share else self.parked.pop(i)
         self._restore(P["end"] if pos == len(P["tokens"]) else P["ckpt"][pos])
         for l in range(len(self.eng.Kc)):
-            self.eng.Kc[l][:pos] = P["K"][l][:pos]
-            self.eng.Vc[l][:pos] = P["V"][l][:pos]
+            _to_dev(self.eng.Kc[l], pos, P["K"][l])
+            _to_dev(self.eng.Vc[l], pos, P["V"][l])
         self.tokens = P["tokens"][:pos]
         self.ckpt = {p: v for p, v in P["ckpt"].items() if p <= pos}
 
@@ -509,6 +543,9 @@ class Runner(object):
             opening_end = len(T)
         if 0 < opening_end < len(T) - 1 and opening_end not in self.keep_pos:
             self.keep_pos = (self.keep_pos + [opening_end])[-2:]      # checkpointed below; kept across turns
+        off = os.environ.get("KINDI_PROMPT_CACHE", "1") == "0"     # read every prompt from the start (for comparisons)
+        if off:
+            self.eng.reset(); self.tokens = []; self.ckpt.clear(); self.parked = []
         S = self.tokens
         nS = len(S)
         L = _lcp(S, T)
@@ -522,14 +559,24 @@ class Runner(object):
             p = self._resume_in(P, T)
             if p > best_p:
                 best_i, best_p = i, p
-        if L < nS and L < 0.5 * nS:                                  # an unrelated prompt: park this conversation
+        branch = os.environ.get("KINDI_PARK_BRANCH", _PARK_DEFAULT) == "1" and nS - L >= self.prefix_min
+        if L < nS and (L < 0.5 * nS or branch):                     # an unrelated prompt, or a branch: park it
             chosen = self.parked.pop(best_i) if best_i is not None else None   # out first: parking cannot drop it
             self._park()
             if chosen is not None:
                 self.parked.insert(0, chosen)
                 best_i = 0
         if best_i is not None:
-            self._unpark(best_i, best_p)
+            try:
+                self._unpark(best_i, best_p)
+            except Exception as e:
+                if "OutOfMemory" not in type(e).__name__:
+                    raise
+                # the engine state is half restored: drop it and read this prompt from the start
+                print("[kindi] could not bring back a parked conversation (%s); reading the prompt from the start"
+                      % e, flush=True)
+                self.eng.reset(); self.tokens = []; self.ckpt.clear()
+                _free_device_pool()
             nS = len(self.tokens)
             L = _lcp(self.tokens, T)
         if L == len(self.tokens) and L < len(T):
@@ -549,7 +596,7 @@ class Runner(object):
                 start = 0
         for p in [p for p in self.ckpt if p > start]:
             del self.ckpt[p]
-        hit = self.openings.best(T, start, len(T) - 1)
+        hit = None if off else self.openings.best(T, start, len(T) - 1)
         if hit is not None:
             try:
                 p, Ms, Cs = self.openings.load(hit[0])

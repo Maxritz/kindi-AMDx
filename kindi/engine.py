@@ -15,6 +15,31 @@ try:
 except ImportError:                   # a CPU-only host (KINDI_DEVICE=cpu)
     cp = None
 
+
+def _cupy_arch_fix():
+    """CuPy 9.6 picks the NVRTC target with min() on strings: min("120", "75") is "120", which NVRTC 10.2 rejects
+    (NVRTC_ERROR_INVALID_OPTION for every kernel on Blackwell, sm_120). The same choice, compared as numbers."""
+    try:
+        from cupy.cuda import compiler, device
+        if cp.cuda.runtime.is_hip or getattr(compiler, "_kindi_arch_fix", False):
+            return
+        mx = compiler._get_max_compute_capability()
+    except Exception:
+        return
+
+    def _get_arch():
+        a = device.Device().compute_capability
+        if a in compiler._tegra_archs:
+            return a
+        return a if int(a) <= int(mx) else mx
+
+    compiler._get_arch = _get_arch
+    compiler._kindi_arch_fix = True
+
+
+if cp is not None:
+    _cupy_arch_fix()
+
 from . import layout
 
 VOCAB = 248320
@@ -34,6 +59,20 @@ KERNELS = ("k_g4", "k_g4l", "k_fold_fwht", "k_rmsfold", "k_smfold", "k_l2w", "k_
            "k_attn_sq8f", "k_attn_vq8f", "k_deq_emb4",
            "k_attn_sq8t", "k_attn_vq8u", "k_attn_vq8g", "k_xrmsN", "k_attn_vq8w", "k_g5r4", "k_g5r8", "k_attn_sq8d", "k_g5r1", "k_g5r2", "k_g5n4")
 
+
+
+def _no_thp():
+    """ROCm: no khugepaged collapses in this process (they evict the GPU queues mid-kernel; see AMD-NOTES.md)"""
+    if cp is None or not getattr(cp.cuda.runtime, "is_hip", False) or os.environ.get("KINDI_THP", "0") == "1":
+        return
+    try:
+        import ctypes
+        ctypes.CDLL(None, use_errno=True).prctl(41, 1, 0, 0, 0)       # PR_SET_THP_DISABLE, inherited by children
+    except (OSError, AttributeError):
+        pass
+
+
+_no_thp()
 
 class Kernels(object):
     def __init__(self):

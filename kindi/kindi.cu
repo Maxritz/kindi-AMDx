@@ -1,10 +1,24 @@
+/* HIP (ROCm) or CUDA: KHIP is set only when hipRTC compiles this file. CUDA builds keep their exact
+   instructions; the HIP alternatives sit beside them. */
+#ifndef KHIP   /* KINDI-PORT-BEGIN */
+#if defined(__HIPCC_RTC__) || defined(__HIP_DEVICE_COMPILE__) || defined(__HIP_PLATFORM_AMD__)
+#define KHIP 1
+#define KSHFLX(v, o) __shfl_xor((v), (o))
+#define KSHFL(v, l) __shfl((v), (l))
+#else
+#define KHIP 0
+#define KSHFLX(v, o) __shfl_xor_sync(0xffffffffu, (v), (o))
+#define KSHFL(v, l) __shfl_sync(0xffffffffu, (v), (l))
+#endif
+#endif         /* KINDI-PORT-END */
+
 /* kindi.cu - Kindi 0.1.0 CUDA kernels (sm_30 and later: Quadro K420, K1200). Compiled at run time by NVRTC (CuPy).
    Copyright (c) 2026 Amir Husain. SPDX-License-Identifier: AGPL-3.0-only. See LICENSE and COMMERCIAL-LICENSE.md. */
 
 /* ---------------------------------------------------------------- helpers */
 
 /* __ldg (read-only data cache) exists from sm_35; the Quadro K420 is sm_30 */
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 350
+#if KHIP || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 350)
 #define KLDG(p) (*(p))
 #else
 #define KLDG(p) __ldg(p)
@@ -13,16 +27,28 @@
 /* sm_70+ (Volta and later; the RTX 3080 is sm_86, compiled as compute_75): CUDA 10.2 drops the non-sync warp shuffles
    there. Every __shfl_xor in this file runs with all 32 lanes of the warp active (warp-strided loops, per-warp exits),
    so the full-mask _sync form is the same operation. */
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
-#define __shfl_xor(v, o) __shfl_xor_sync(0xffffffffu, (v), (o))
+#if !KHIP && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#define __shfl_xor(v, o) KSHFLX((v), (o))
 #endif
 
 
+#if KHIP
+__device__ __forceinline__ float h2f(unsigned short h){ return __half2float(*(__half*)&h); }
+#else
 __device__ __forceinline__ float h2f(unsigned short h){ float f; asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h)); return f; }
+#endif
 
+#if KHIP
+__device__ __forceinline__ float hf(unsigned short h){ return __half2float(*(__half*)&h); }
+#else
 __device__ __forceinline__ float hf(unsigned short h){ float f; asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h)); return f; }
+#endif
 
+#if KHIP
+__device__ __forceinline__ float h2f3(unsigned short h){ return __half2float(*(__half*)&h); }
+#else
 __device__ __forceinline__ float h2f3(unsigned short h){ float f; asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h)); return f; }
+#endif
 
 __device__ __forceinline__ double wsum_d(double v){
   for(int o = 16; o > 0; o >>= 1) v += __shfl_xor(v, o);
@@ -506,7 +532,11 @@ extern "C" __global__ void k_deq_emb3(const unsigned char* __restrict__ bc, cons
           const float a = w[i], b = w[i + hh];
           w[i] = a + b; w[i + hh] = a - b;
         }
+#if KHIP
+        __syncthreads();
+#else
         asm volatile("bar.sync 1, 512;");
+#endif
       }
     }
   }
@@ -844,7 +874,11 @@ extern "C" __global__ void k_xchg(const float* __restrict__ mine, float* __restr
   if(!ok) return;
   for(int e = t * 4; e < C; e += blockDim.x * 4){
     float x, y, z, w;
+#if KHIP
+    { float4 v4 = *(const float4*)(ho + e); x = v4.x; y = v4.y; z = v4.z; w = v4.w; }
+#else
     asm volatile("ld.global.cv.v4.f32 {%0,%1,%2,%3}, [%4];" : "=f"(x), "=f"(y), "=f"(z), "=f"(w) : "l"(ho + e));
+#endif
     *(float4*)(parts + (long long)(1 - me) * C + e) = make_float4(x, y, z, w);
   }
 }
@@ -880,7 +914,11 @@ extern "C" __global__ void k_xchg2(const float* __restrict__ pin, int nparts, in
   if(!ok) return;
   for(int e = t * 4; e < C; e += blockDim.x * 4){
     float x, y, z, w;
+#if KHIP
+    { float4 v4 = *(const float4*)(ho + e); x = v4.x; y = v4.y; z = v4.z; w = v4.w; }
+#else
     asm volatile("ld.global.cv.v4.f32 {%0,%1,%2,%3}, [%4];" : "=f"(x), "=f"(y), "=f"(z), "=f"(w) : "l"(ho + e));
+#endif
     *(float4*)(parts + (long long)(1 - me) * C + e) = make_float4(x, y, z, w);
   }
 }
@@ -928,7 +966,11 @@ extern "C" __global__ void k_attn_combn(const float* __restrict__ part, const fl
 extern "C" __global__ void k_store_h(const float* __restrict__ x, unsigned short* __restrict__ dst, int n){
   /* fp32 -> fp16 (round to nearest even), the K/V cache store */
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
+#if KHIP
+  if(i < n){ __half hh = __float2half(x[i]); dst[i] = *(unsigned short*)&hh; }
+#else
   if(i < n){ unsigned short h; asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(x[i])); dst[i] = h; }
+#endif
 }
 
 extern "C" __global__ void k_cpq(const float* __restrict__ qn, float* __restrict__ q, int rows, int hd){
@@ -969,7 +1011,11 @@ extern "C" __global__ void k_xchg3(const float* __restrict__ pin, int nparts, in
   if(!ok) return;
   for(int e = e0 + t * 4; e < e0 + W; e += blockDim.x * 4){
     float x, y, z, w;
+#if KHIP
+    { float4 v4 = *(const float4*)(ho + e); x = v4.x; y = v4.y; z = v4.z; w = v4.w; }
+#else
     asm volatile("ld.global.cv.v4.f32 {%0,%1,%2,%3}, [%4];" : "=f"(x), "=f"(y), "=f"(z), "=f"(w) : "l"(ho + e));
+#endif
     *(float4*)(parts + (long long)(1 - me) * C + e) = make_float4(x, y, z, w);
   }
 }
@@ -1015,7 +1061,11 @@ extern "C" __global__ void __launch_bounds__(1024) k_xrms(
   double acc = 0.0;
   for(int e = t * 4; e < C; e += 4096){
     float a, b, c, d;
+#if KHIP
+    { float4 v4 = *(const float4*)(ho + e); a = v4.x; b = v4.y; c = v4.z; d = v4.w; }
+#else
     asm volatile("ld.global.cv.v4.f32 {%0,%1,%2,%3}, [%4];" : "=f"(a), "=f"(b), "=f"(c), "=f"(d) : "l"(ho + e));
+#endif
     const float o[4] = {a, b, c, d};
 #pragma unroll
     for(int k = 0; k < 4; ++k){
@@ -1191,7 +1241,11 @@ __device__ __forceinline__ void q8_block(const float* __restrict__ x, signed cha
   const float d = a / 127.0f, id = a != 0.0f ? 127.0f / a : 0.0f;
   q[lane] = (signed char)__float2int_rn(v * id);
   if(lane == 0){
+#if KHIP
+    unsigned short hbits; { __half hh = __float2half(d); hbits = *(unsigned short*)&hh; }
+#else
     unsigned short hbits; asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hbits) : "f"(d));
+#endif
     if(dh) dh[0] = hbits;
     if(df) df[0] = h2f(hbits);
   }
@@ -1613,7 +1667,11 @@ extern "C" __global__ void __launch_bounds__(1024) k_xrmsN(
   double acc = 0.0;
   for(int e = t * 4; e < C; e += 4096){
     float a, bb, c, d;
+#if KHIP
+    { float4 v4 = *(const float4*)(ho + e); a = v4.x; bb = v4.y; c = v4.z; d = v4.w; }
+#else
     asm volatile("ld.global.cv.v4.f32 {%0,%1,%2,%3}, [%4];" : "=f"(a), "=f"(bb), "=f"(c), "=f"(d) : "l"(ho + e));
+#endif
     const float o[4] = {a, bb, c, d};
 #pragma unroll
     for(int k = 0; k < 4; ++k){
@@ -1680,6 +1738,7 @@ extern "C" __global__ void __launch_bounds__(128) k_attn_vq8w(const float* __res
   const uint2* vb = Vq8 + ((long long)i0 * n_kv + kv) * 32 + f8;
   const unsigned short* db = Vd + ((long long)i0 * n_kv + kv) * 8 + blk;
   const long long rs = (long long)n_kv * 32, ds = (long long)n_kv * 8;
+#pragma unroll 4
   for(int i = grp; i < m; i += 4){
     const uint2 w = KLDG(vb + i * rs);
     const float d = h2f(KLDG(db + i * ds));
@@ -1834,10 +1893,16 @@ extern "C" __global__ void __launch_bounds__(512) k_g5r1(const unsigned int* __r
 
 /* dp4a as inline PTX: NVRTC 10.2 does not define the __dp4a intrinsic (sm_61_intrinsics are not included) */
 __device__ __forceinline__ int kdp4a(int a, int b, int c){
-#if __CUDA_ARCH__ >= 610
+  /* dp4a.s32.s32: four SIGNED int8 x int8 products added to c */
+#if KHIP
+  return __builtin_amdgcn_sudot4(true, a, true, b, c, false);    /* v_dot4_i32_iu8, both operands signed, no clamp */
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
   int d; asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c)); return d;
 #else
-  return c;
+  return c + (int)(signed char)(a & 0xff) * (int)(signed char)(b & 0xff) +
+      (int)(signed char)((a >> 8) & 0xff) * (int)(signed char)((b >> 8) & 0xff) +
+      (int)(signed char)((a >> 16) & 0xff) * (int)(signed char)((b >> 16) & 0xff) +
+      (int)(signed char)((a >> 24) & 0xff) * (int)(signed char)((b >> 24) & 0xff);
 #endif
 }
 
@@ -1969,7 +2034,7 @@ __device__ __forceinline__ void g5n_core(const uint4* __restrict__ W, float* __r
       const unsigned int wv[4] = {w[u].x, w[u].y, w[u].z, w[u].w};
 #pragma unroll
       for(int i = 0; i < 4; ++i){
-        const unsigned int lo = __shfl_sync(0xffffffffu, wv[i], 26), hi = __shfl_sync(0xffffffffu, wv[i], 27);
+        const unsigned int lo = KSHFL(wv[i], 26), hi = KSHFL(wv[i], 27);
 #pragma unroll
         for(int q = 0; q < 4; ++q){
           const unsigned int c = (wv[i] >> (8 * q)) & 255u;
@@ -1993,11 +2058,11 @@ __device__ __forceinline__ void g5n_core(const uint4* __restrict__ W, float* __r
       for(int j = 0; j < 8; ++j){
         if(j < h){
           const float send = up ? v[j] : v[j + h], keep = up ? v[j + h] : v[j];
-          v[j] = keep + __shfl_xor_sync(0xffffffffu, send, msk);
+          v[j] = keep + KSHFLX(send, msk);
         }
       }
     }
-    const float s = v[0] + __shfl_xor_sync(0xffffffffu, v[0], 1);
+    const float s = v[0] + KSHFLX(v[0], 1);
     const int m = m0 + u;
     if(m < NT16 && !(lane & 1)) y[(long long)blockIdx.y * R + m * 16 + ((lane >> 1) & 15)] = s;
   }

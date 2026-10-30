@@ -19,7 +19,7 @@ DEFAULTS = {
     "api_key": "",                      # if set, clients must send Authorization: Bearer <api_key>
     "model_name": "auto",              # infer the reported id from the selected pack
     # engine
-    "ctx": "24576",                     # context length in tokens (K420: 24576 max with a safety margin)
+    "ctx": "24576",                     # requested context; each backend clamps it to available device memory
     "head": "exact",                    # exact | fast (shortlist head, ~15% faster, approximate)
     "fast_clusters": "256",             # clusters scored by the fast head
     # prompt cache
@@ -100,9 +100,17 @@ def load(explicit=None, overrides=None):
             cfg[k] = v
     if cfg["model_name"] == "auto":
         manifest = os.path.join(cfg["pack"], "kindi_pack.json")
-        model = json.load(open(manifest)).get("model", "") if os.path.isfile(manifest) else ""
-        size = re.search(r"(\d+(?:\.\d+)?)b\b", model.lower())          # Ternary-Bonsai-2-9B -> 9b
-        cfg["model_name"] = "bonsai2-%sb" % (size.group(1) if size else "2")
+        m = json.load(open(manifest)) if os.path.isfile(manifest) else {}
+        if m.get("backend") == "kindi_gemma4":
+            cfg["model_name"] = m.get("model_id", "gemma4")
+        else:
+            # the GGUF's general.name, then its file name: some files name the model only "Hf"
+            size = None
+            for text in (m.get("model") or "", m.get("source_file") or ""):
+                size = re.search(r"(\d+(?:\.\d+)?)b(?:\b|-|_)", text.lower())   # Ternary-Bonsai-2-9B -> 9b
+                if size:
+                    break
+            cfg["model_name"] = "bonsai2-%sb" % (size.group(1) if size else "2")
     if cfg["head"] not in ("exact", "fast"):
         raise SystemExit("kindi: head must be exact or fast, not %r" % cfg["head"])
     cfg["source"] = source or "(built-in defaults)"

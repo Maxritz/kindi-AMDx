@@ -26,7 +26,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 i32 = np.int32
 WRAP = ("k_rmsfold", "k_smfold", "k_rmsw", "k_rmsw_s", "k_rope2", "k_store_q8", "k_q8row", "k_fold_fwht")
 OWN = ("k_gdn_pre_T", "k_gdn_deltan_T", "k_sumsplits", "k_mm_g5n", "k_att_qk_T", "k_att_softmax_T", "k_att_pv_T",
-       "k_att_comb_T", "k_att_flash_T", "k_att_merge_T", "k_q8x_T", "k_mm_g5q", "k_mm_g4", "k_mm_g4s", "k_mm_g4k", "k_add2")
+       "k_att_comb_T", "k_att_flash_T", "k_att_merge_T", "k_q8x_T", "k_q8x_T2", "k_mm_g5q", "k_mm_g4", "k_mm_g4s", "k_mm_g4k", "k_add2")
 
 
 def _kernel_text(src, name):
@@ -48,9 +48,15 @@ def _kernel_text(src, name):
     return params, src[i:j + 1]
 
 
+def _port(src):
+    """the HIP/CUDA portability preamble of kindi.cu (KHIP, KSHFLX, KSHFL): copies of its kernels need it"""
+    a, b = src.find("#ifndef KHIP   /* KINDI-PORT-BEGIN */"), src.find("/* KINDI-PORT-END */")
+    return src[a:b + len("/* KINDI-PORT-END */")] + chr(10) if a >= 0 and b > a else ""
+
+
 def _wrappers(src, names=WRAP):
     """device copies of the decode kernels in names (default WRAP), and token-batched wrappers k_*_T(..., int T_, strides...)"""
-    out, nptr = [], {}
+    out, nptr = [_port(src)], {}
     for name in names:
         params, body = _kernel_text(src, name)
         ps = [p.strip() for p in params.split(",")]
@@ -80,7 +86,7 @@ class ChunkKernels(object):
 
 def enabled(eng):
     v = os.environ.get("KINDI_CHUNK", "256")
-    return v not in ("0", "", "1") and eng.W in (1, 2) and all(s.g5l or not s.g5 for s in eng.cards)
+    return v not in ("0", "", "1") and eng.W in (1, 2) and all(s.g5l or not s.g5 or getattr(s, "wl", None) for s in eng.cards)
 
 
 def reserve(eng):
@@ -101,7 +107,8 @@ def reserve(eng):
             c["U1"], c["U2"] = z(T * uw), z(T * uw)
             c["OUT"] = z(T * max(s.NV * HK, s.NH * HD))
             # split parts: the 5-trit path splits only the small K/V products; the 2-bit path may split D-row ones
-            c["SPL"] = z(1 if getattr(s, "tc_layout", False) else 8 * T * (s.NHKV * HD if s.g5 else max(s.NHKV * HD, D)))   # (tc: not used)
+            ctc = getattr(s, "tc_layout", False) and getattr(s, "wl", None) is None   # (HIP keeps the lane copy: no tc GEMMs)
+            c["SPL"] = z(1 if ctc else 8 * T * (s.NHKV * HD if s.g5 else max(s.NHKV * HD, D)))   # (tc: not used)
             c["YP"] = z(T * D) if eng.W == 2 else None          # the other card's row-parallel part
             tv = os.environ.get("KINDI_CHUNK_TILE", "")
             c["small"] = tv == "64" or (tv != "128" and cp.cuda.runtime.getDeviceProperties(s.card)["major"] < 5)
@@ -109,16 +116,17 @@ def reserve(eng):
             c["QQ"], c["QD"] = cp.zeros(T * s.NH * HD, dtype=cp.int8), z(T * s.NH * HD // 32)
             prop = cp.cuda.runtime.getDeviceProperties(s.card)
             c["q8"] = os.environ.get("KINDI_CHUNK_Q8", "1") == "1" and prop["major"] * 10 + prop["minor"] >= 61
-            if c["q8"] and not getattr(s, "tc_layout", False):   # int8 activations (dp4a): XQ[k4][t], XS[group][t]
+            if c["q8"] and not ctc:   # int8 activations (dp4a): XQ[k4][t], XS[group][t]
                 c["XQ"], c["XS"] = cp.zeros(T * work // 4, dtype=cp.uint32), z(T * work // 128)
-            c["tc"] = getattr(s, "tc_layout", False)    # tc layout (spec.py): tensor-core GEMMs, XQ in the tc order
+            c["tc"] = ctc                               # tc layout (spec.py): tensor-core GEMMs, XQ in the tc order
             if c["tc"]:
                 c["XQ"], c["XS"] = cp.zeros(T * work // 4, dtype=cp.uint32), z(T * work // 128)
                 c["XA"] = cp.zeros(T * work // 128, dtype=cp.int32)
             s.ck = ChunkKernels()               # kernel handles belong to the current device
-            fp = ctypes.c_void_p(s.ck.k_mm_g4k.kernel.ptr)
-            _tp._drv().cuFuncSetSharedMemConfig(fp, 2)            # 8-byte banks (Kepler)
-            _tp._drv().cuFuncSetCacheConfig(fp, 1)                # prefer shared memory
+            if not cp.cuda.runtime.is_hip:                        # CUDA only (fixed bank layout on ROCm)
+                fp = ctypes.c_void_p(s.ck.k_mm_g4k.kernel.ptr)
+                _tp._drv().cuFuncSetSharedMemConfig(fp, 2)        # 8-byte banks (Kepler)
+                _tp._drv().cuFuncSetCacheConfig(fp, 1)            # prefer shared memory
 
 
 def _set(P, pos, T, toks):
@@ -167,13 +175,16 @@ def _build(s):
             return gemm_tc(name, X, ldx, Yb, ldy, quant)
         if not s.g5:
             return gemm4(name, X, ldx, Yb, ldy)
-        _, W5, R, C = s.w[name]
+        _, W5, R, C = (getattr(s, "wl", None) or s.w)[name]       # the lane layout (a second copy when decode is row)
         R, C = int(R), int(C)
         NG = C // 128
         gx, gy = R // 128, (T + 127) // 128
         if c["q8"]:
             if quant:                       # the first product of an input: its int8 rows
-                P.add(CK.k_q8x_T, (NG, T), (128,), (X, i32(ldx), c["XQ"], c["XS"], i32(T), TT))
+                if os.environ.get("KINDI_Q8X2", "1") == "1":      # coalesced stores (same values)
+                    P.add(CK.k_q8x_T2, (NG, (T + 63) // 64), (256,), (X, i32(ldx), c["XQ"], c["XS"], i32(T), TT))
+                else:
+                    P.add(CK.k_q8x_T, (NG, T), (128,), (X, i32(ldx), c["XQ"], c["XS"], i32(T), TT))
             P.add(CK.k_mm_g5q, (gx, gy), (256,), (W5, i32(R), i32(NG), c["XQ"], c["XS"], i32(T), Yb, i32(ldy), TT))
             return
         sp = 1 if gx * gy >= 40 else max(1, min(8, NG, -(-80 // (gx * gy))))
@@ -384,10 +395,17 @@ def feed(eng, toks, pos):
     T = cs[0].chunk["T"]
     mn = int(os.environ.get("KINDI_CHUNK_MIN", "32"))
     drv = _tp._drv()
-    L = drv.cuLaunchKernel
+    # HIP (the tp driver is libamdhip64, see tp._drv): module launches take cuLaunchKernel's arguments, and a
+    # card's ctxh is its device index (tp.py sets it with hipSetDevice)
+    hip = not hasattr(drv, "cuLaunchKernel")
+    L = drv.hipModuleLaunchKernel if hip else drv.cuLaunchKernel
+    ctx_set = drv.hipSetDevice if hip else drv.cuCtxSetCurrent
     i = 0
-    prev = ctypes.c_void_p()
-    drv.cuCtxGetCurrent(ctypes.byref(prev))
+    if hip:
+        prev = cp.cuda.runtime.getDevice()
+    else:
+        prev = ctypes.c_void_p()
+        drv.cuCtxGetCurrent(ctypes.byref(prev))
     # the runtime's current device too: a `with cp.cuda.Device(n)` below (_exchange, run_core) entered while the driver
     # context is the other card's restores THAT card on exit, and the caller's CuPy work (the sampler's buffers on
     # card 0) then ran on card 1: cudaErrorInvalidValue after a chunked read on two cards
@@ -400,7 +418,7 @@ def feed(eng, toks, pos):
             P0 = cs[0].plan_chunk
             for j in range(len(P0.segs)):
                 for s in cs:
-                    drv.cuCtxSetCurrent(s.ctxh)
+                    ctx_set(s.ctxh)
                     for fn, g, b, arr, _ in s.plan_chunk.segs[j]:
                         if L(fn, g[0], g[1], g[2], b[0], b[1], b[2], 0, None, arr, None):
                             raise RuntimeError("kindi: a chunk kernel launch failed on card %d" % s.card)
@@ -412,6 +430,6 @@ def feed(eng, toks, pos):
                             run_core(s, s.plan_chunk.cores[j], pos + i, n)
             i += n
     finally:
-        drv.cuCtxSetCurrent(prev)
+        ctx_set(prev)
         cp.cuda.runtime.setDevice(dev0)
     return i

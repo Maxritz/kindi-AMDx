@@ -1,3 +1,17 @@
+/* HIP (ROCm) or CUDA: KHIP is set only when hipRTC compiles this file. CUDA builds keep their exact
+   instructions; the HIP alternatives sit beside them. */
+#ifndef KHIP   /* KINDI-PORT-BEGIN */
+#if defined(__HIPCC_RTC__) || defined(__HIP_DEVICE_COMPILE__) || defined(__HIP_PLATFORM_AMD__)
+#define KHIP 1
+#define KSHFLX(v, o) __shfl_xor((v), (o))
+#define KSHFL(v, l) __shfl((v), (l))
+#else
+#define KHIP 0
+#define KSHFLX(v, o) __shfl_xor_sync(0xffffffffu, (v), (o))
+#define KSHFL(v, l) __shfl_sync(0xffffffffu, (v), (l))
+#endif
+#endif         /* KINDI-PORT-END */
+
 
 /* ---------------------------------------------------------------- prompt chunks on the single-card engine */
 /* The 2B / 4B / 9B engine (engine.py): 2-bit weights (k_g4 layout), fp16 K/V, GQA, head size 256. The GEMM is mm_core
@@ -207,13 +221,13 @@ extern "C" __global__ void __launch_bounds__(256) k_att_flash16_T(const unsigned
         mt = fmaxf(mt, sv[c]);
       }
 #pragma unroll
-      for(int off = 8; off > 0; off >>= 1) mt = fmaxf(mt, __shfl_xor_sync(0xffffffffu, mt, off));
+      for(int off = 8; off > 0; off >>= 1) mt = fmaxf(mt, KSHFLX(mt, off));
       const float mn = fmaxf(m[a], mt);
       float rs = 0.f, pv[4];
 #pragma unroll
       for(int c = 0; c < 4; ++c){ pv[c] = mn == KNEGINF ? 0.f : expf(sv[c] - mn); rs += pv[c]; }
 #pragma unroll
-      for(int off = 8; off > 0; off >>= 1) rs += __shfl_xor_sync(0xffffffffu, rs, off);
+      for(int off = 8; off > 0; off >>= 1) rs += KSHFLX(rs, off);
       const float sc = (m[a] == KNEGINF) ? 0.f : expf(m[a] - mn);
       m[a] = mn;
       l[a] = l[a] * sc + rs;
@@ -538,13 +552,13 @@ extern "C" __global__ void __launch_bounds__(256) k_att_flash16k_T(const unsigne
         mt = fmaxf(mt, sv[c]);
       }
 #pragma unroll
-      for(int off = 8; off > 0; off >>= 1) mt = fmaxf(mt, __shfl_xor_sync(0xffffffffu, mt, off));
+      for(int off = 8; off > 0; off >>= 1) mt = fmaxf(mt, KSHFLX(mt, off));
       const float mn = fmaxf(m[a], mt);
       float rs = 0.f, pv[4];
 #pragma unroll
       for(int c = 0; c < 4; ++c){ pv[c] = mn == KNEGINF ? 0.f : expf(sv[c] - mn); rs += pv[c]; }
 #pragma unroll
-      for(int off = 8; off > 0; off >>= 1) rs += __shfl_xor_sync(0xffffffffu, rs, off);
+      for(int off = 8; off > 0; off >>= 1) rs += KSHFLX(rs, off);
       const float sc = (m[a] == KNEGINF) ? 0.f : expf(m[a] - mn);
       m[a] = mn;
       l[a] = l[a] * sc + rs;

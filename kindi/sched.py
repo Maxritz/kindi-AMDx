@@ -15,6 +15,20 @@ def blocking_sync(log=print):
     if _done[0] or os.environ.get("KINDI_BLOCKING_SYNC", "1") != "1":
         return
     _done[0] = True
+    from . import gpudrv
+    if gpudrv.HIP:
+        # ROCm: no libcuda; hipSetDeviceFlags(hipDeviceScheduleBlockingSync) on every device
+        try:
+            hip = gpudrv.hip_lib()
+            n = ctypes.c_int()
+            hip.hipGetDeviceCount(ctypes.byref(n))
+            for i in range(n.value):
+                hip.hipSetDevice(i)
+                hip.hipSetDeviceFlags(4)
+            log("blocking sync: HIP blocking sync on %d device(s)" % n.value)
+        except OSError as e:
+            log("blocking sync: %s - driver default kept" % e)
+        return
     try:
         cu = ctypes.CDLL("libcuda.so.1")
         if cu.cuInit(0) != 0:

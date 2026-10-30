@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.3.0 (2026-10-28)
+
+### New
+
+- **AMD Radeon 780M graphics.** A ROCm image (`docker/Dockerfile.rocm`) runs the 2B, the 27B and Nemotron on the
+  780M. The installer finds the card and builds the image. [docs/AMD.md](docs/AMD.md) gives the settings.
+- **Quadro K6000.** The installer runs the 27B on this 12 GB Kepler card. [docs/CARDS.md](docs/CARDS.md) gives the
+  settings.
+- **NVIDIA Nemotron 3.5 Bolt E4B (experimental).** Kindi has its own decoder for this model, with tool calls and
+  thinking. It runs on one card, or on two cards of the same kind in tensor parallel. Use `--model nemotron` with
+  the installer.
+- **More prompt cache.** Nemotron has its own prompt cache (`KINDI_G4_PROMPT_CACHE`). With the Bonsai models, the
+  server can also resume a request inside a parked conversation (`KINDI_PARK_BRANCH`, on by default on ROCm).
+  `KINDI_PROMPT_CACHE=0` turns the Bonsai cache off. [docs/PROMPT-CACHE.md](docs/PROMPT-CACHE.md) gives the
+  results, and `examples/prompt_cache_bench.py` is the test.
+- **A setup menu.** The installer shows each setup that the machine supports, the recommended setup first.
+  `--auto` takes the recommended setup. `--config N,M` runs several setups side by side, and `--config NxK` runs
+  one setup on K cards of the same kind. Each server gets its own container and port.
+- **CPU servers next to GPU servers.** The installer offers a 2B server on the CPU on each machine.
+- **gpu-unlock.** The installer finds the GeForce RTX 30 cards that NVIDIA limits to half-rate 16-bit arithmetic.
+  It offers to unlock them with the [gpu-unlock](https://github.com/Zagitta/gpu-unlock) module by Zagitta. It never
+  does this without a question.
+- **`kindi models` and `kindi use`.** A model catalog, the models that fit this machine, and a resumable download
+  with a sha256 check.
+
+### Changed
+
+- Sampling uses the order of llama.cpp by default: top-k, top-p, then temperature.
+- The server returns OpenAI `logprobs` and `top_logprobs` for Nemotron.
+- With the 2B draft model, a guard stops speculation when it is slower than plain steps (`KINDI_SPEC_GUARD=0` turns
+  the guard off).
+- The installer detects a server that restarts in a loop, and it checks that the Kindi modules load after the build.
+- The installer makes one pi provider for each server.
+- On a 2 GB Kepler card, the installer asks for a context of 23,808 tokens for the 4B. This is the context that fits.
+
+### Fixed
+
+- `model_name = auto` also reads the model size from the GGUF file name. Before, a 27B pack could report
+  `bonsai2-2b`.
+- `/health` shows a git commit only for a Kindi checkout. Before, a copy of Kindi in another git folder showed the
+  commit of that folder.
+- The installer works on machines with one GPU and with Kepler workstation cards.
+- The cache brings a parked conversation back in place, and the server continues after an engine error.
+- The tensor-core path starts on cards after the RTX 30 series (RTX 40, RTX 50 and Hopper). Before, the 27B
+  with the installer's tensor-core profile and the Nemotron model stopped at start-up with `CUDA_ERROR_INVALID_PTX`.
+- Kindi starts on RTX 50 cards. Before, no kernel compiled on these cards, because CuPy compared the card versions
+  as text.
+
 ## 0.2.0 (2026-10-22)
 
 ### New

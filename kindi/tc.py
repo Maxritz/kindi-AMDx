@@ -20,13 +20,20 @@ def supported(card=None):
     return p["major"] >= 8
 
 
+def ptx_target(arch):
+    """the PTX target for this card: PTX ISA 7.1 knows sm_80 and sm_86 only (ptxas: "PTX .version 7.1 does not
+    support .target sm_89"), so a later card (sm_87, Ada sm_89, Hopper, Blackwell) gets sm_80 code, which its
+    driver builds for the card"""
+    return arch if arch in ("sm_80", "sm_86") else "sm_80"
+
+
 def _patched_module(src, arch):
     prog = compiler._NVRTCProgram(src, "tc.cu")
     ptx, _ = prog.compile(("-arch=compute_75",))
     if isinstance(ptx, bytes):
         ptx = ptx.decode()
     ptx = re.sub(r"\.version \d+\.\d+", ".version 7.1", ptx, count=1)
-    ptx = re.sub(r"\.target sm_\d+", ".target " + arch, ptx, count=1)
+    ptx = re.sub(r"\.target sm_\d+", ".target " + ptx_target(arch), ptx, count=1)
     m = function.Module()
     m.load(ptx.encode())
     return m

@@ -9,6 +9,95 @@ Unless a table says otherwise, the method is the same for the two engines. They 
 is read in segments up to each N, and the read time of N tokens is the sum of the segments. At each N, 32 tokens are
 generated. Project page: [amirhusain.com/kindi](https://amirhusain.com/kindi/).
 
+## Kindi 0.3.0: Nemotron, the CPU engine and the prompt cache
+
+The tables in this section are new in 0.3.0. The Bonsai tables after them are from Kindi 0.2.0. We measured the
+0.3.0 engine against them again on the K1200 cards: the Bonsai rows are within 0.5%.
+
+### NVIDIA Nemotron 3.5 Bolt E4B (UD-Q3_K_XL, sha256 3f8032b9…)
+
+The same GGUF for both engines, f16 K/V, the same token ids, greedy, both engines warmed first.
+
+| Hardware | Context | Kindi read | llama.cpp read | Kindi write | llama.cpp write |
+|---|---|---:|---:|---:|---:|
+| GeForce GTX 1080 8 GB | 512 | 742.5 | 1087.9 | 55.10 | 56.42 |
+| GeForce GTX 1080 8 GB | 8,192 | 922.2 | 896.6 | 51.11 | 53.05 |
+| GeForce GTX 1080 8 GB | 16,384 | 837.8 | 730.7 | 47.76 | 50.35 |
+| GeForce GTX 1080 8 GB | 24,000 | 746.9 | 626.5 | 45.20 | 48.22 |
+| Quadro K1200 4 GB (ctx 8,448) | 512 | 66.8 | 17.6 | 10.41 | 8.27 |
+| Quadro K1200 4 GB (ctx 8,448) | 8,000 | 73.9 | 12.0 | 9.07 | 7.67 |
+| 2× Quadro K1200, split (ctx 8,448) | 512 | 122.5 | 15.3 | 17.15 | 7.44 |
+| 2× Quadro K1200, split (ctx 8,448) | 8,000 | 124.2 | 19.0 | 16.08 | 7.37 |
+| GeForce RTX 3080, 190 W, one chat request | — | 2,614 | 2,630 | 123.1 | 88.0 |
+
+Builds: GTX 1080: Kindi 0.3.0-dev 849840a, llama.cpp CUDA b11804 (c7fc509), 2026-10-25. K1200: Kindi 0.3.0-dev
+(5350b87 + the server fix), llama.cpp Vulkan 1b29621 (llama.cpp splits by layers on two cards), 2026-10-24. RTX 3080:
+Kindi 0.3.0-dev b340cbe, gpu-unlock loaded, 2026-10-24. On the GTX 1080, llama.cpp reads a 512-token prompt faster
+and writes 2-7% faster; Kindi reads longer prompts faster.
+
+### The CPU engine (Ternary-Bonsai-2, AVX2)
+
+Read: a ~2,000-token prompt with no cache reuse. Write: 256 tokens. Median of 3 runs, each engine at its best thread
+count. llama.cpp: Prism ML's fork, CPU build.
+
+| CPU | Model | Kindi read | llama.cpp read | Kindi write | llama.cpp write |
+|---|---|---:|---:|---:|---:|
+| AMD Ryzen 9 7940HS (8 cores) | 2B | 90.4 | 60.5 | 64.8 | 23.6 |
+| AMD Ryzen 9 7940HS | 4B | 37.8 | 25.7 | 29.1 | 16.5 |
+| Intel Core i7-8700 (6 cores) | 2B | 42.50 | 33.45 | 28.92 | 18.12 |
+| Intel Core i7-8700 | 4B | 17.02 | 12.97 | 12.61 | 7.75 |
+
+### The prompt cache, GTX 1080
+
+Seconds for each request (prompt and reply), `examples/prompt_cache_bench.py`. Kindi with its cache off and on; llama.cpp
+(b11804) with its cache on. The replies with Kindi's cache off and on were the same in all 12 requests of each model.
+
+| Job, request | Nemotron, Kindi off | Nemotron, Kindi on | Nemotron, llama.cpp on | 27B, Kindi off | 27B, Kindi on |
+|---|---:|---:|---:|---:|---:|
+| Agent, turn 2 | 2.76 | 0.67 | 1.29 | 15.33 | 2.52 |
+| Agent, turn 3 | 2.96 | 0.86 | 1.30 | 15.65 | 2.93 |
+| Regenerate | 2.69 | 0.43 | 4.93 | 15.47 | 1.85 |
+| Document, question 2 | 11.03 | 0.70 | 3.16 | 49.42 | 14.53 |
+| Document, question 3 | 10.71 | 0.42 | 3.10 | 47.19 | 11.46 |
+| Two agents, A turn 2 | 2.58 | 0.58 | 1.40 | 14.68 | 2.61 |
+| Two agents, B turn 2 | 2.57 | 0.53 | 1.44 | 14.80 | 2.79 |
+
+### Radeon 780M
+
+2026-10-25. Kindi 0.3.0 development build (b5230a3), `HSA_OVERRIDE_GFX_VERSION=11.0.2`, `amdgpu.cwsr_enable=0`.
+The same token ids for both engines, greedy, one pass, 32 write tokens at each depth, both engines warmed first.
+K/V: q8_0 for the 27B, f16 for Nemotron. llama.cpp: `-ngl 99 -fa on --parallel 1 -b 2048 -ub 512 -c 24576`; the
+Prism fork (ROCm build) for the 27B, upstream b10700 (ROCm build) for Nemotron. Read / write tokens/s:
+
+| Model | Context | Kindi | llama.cpp ROCm |
+|---|---:|---:|---:|
+| 27B | 512 | 103.7 / 10.61 | 60.5 / 10.33 |
+| 27B | 8,192 | 95.6 / 9.99 | 58.2 / 8.52 |
+| 27B | 24,000 | 80.8 / 8.75 | 54.5 / 6.13 |
+| Nemotron (experimental) | 512 | 185.9 / 19.11 | 669.5 / 24.02 |
+| Nemotron (experimental) | 8,192 | 391.9 / 20.03 | 598.7 / 21.36 |
+| Nemotron (experimental) | 24,000 | 239.4 / 17.01 | 476.6 / 19.09 |
+
+With the 27B, Kindi reads 1.5 to 1.7 times as fast at each context and writes 1.03, 1.17 and 1.43 times as fast.
+Kindi's Nemotron support is experimental, and we are still optimizing it; on this chip llama.cpp is faster with it.
+
+## Quadro K6000, 12 GB
+
+2026-10-25. Quadro K6000 12 GB (Kepler GK110, sm_35) passed through to a KVM virtual machine on a dual Xeon E5-2673 v4 host, NVIDIA driver 470.256.02. The same model files and the same token ids for both engines, greedy, 32 tokens of write at each depth. Kindi 0.3.0 development build (597d2d8) in the CUDA 10.2 image, q8_0 K/V for the 27B, f16 for Nemotron. llama.cpp: Vulkan builds (the Prism fork for the 27B, upstream 1b29621 for Nemotron), `-ngl 99 -fa on`. Read / write tokens/s:
+
+| Model | Context | Kindi | llama.cpp Vulkan |
+|---|---:|---:|---:|
+| 27B | 512 | 36.2 / 20.42 | 7.0 / 2.07 |
+| 27B | 8,192 | 30.2 / 16.36 | 6.9 / 2.15 |
+| 27B | 24,000 | 26.2 / 13.09 | did not finish in 1 hour |
+| Nemotron (experimental) | 512 | 187.5 / 20.05 | 90.7 / 10.70 |
+| Nemotron (experimental) | 8,192 | 182.4 / 19.08 | 33.8 / 9.80 |
+| Nemotron (experimental) | 24,000 | 163.6 / 17.40 | 15.6 / 8.56 |
+
+`kindi verify`: the 27B 4 of 4 token-exact; Nemotron 4 of 4 (the first 16 to 40 of 40 tokens agree). With the 27B,
+Kindi reads 4 to 5 times as fast and writes 7 to 10 times as fast. Both engines were warmed first. The tuning settings that we tried (chunk size,
+tile, split, blocking sync, batch) changed the speed by 3% or less.
+
 ## Quadro K420, 1 GB · Ternary-Bonsai-2-2B
 
 2026-10-23. Kindi 0.2.0, ctx 24,576, f16 K/V. llama.cpp: the prebuilt Vulkan release,

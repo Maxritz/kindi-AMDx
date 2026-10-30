@@ -26,7 +26,7 @@ Replace `...` with the variables in the section for your card. To use one card o
 |---|---|
 | model | Ternary-Bonsai-2-2B |
 | variables | `KINDI_CTX=24576` (the default) |
-| generation | 20.8 tokens/s (exact head), about 23 tokens/s (fast head) |
+| generation | 22.9 tokens/s (fast head, 2,000 tokens of context); 20.8 tokens/s (exact head, 512 tokens) |
 | prompt reading | 31.6 tokens/s at 3K tokens, 28.1 at 12K (one token at a time: 25.3 and 23.4; dev build of 10-21) |
 
 - The prompt path uses chunks of 128 tokens on this card. Then the context stays at 24,576 tokens.
@@ -36,8 +36,8 @@ Replace `...` with the variables in the section for your card. To use one card o
 
 | item | value |
 |---|---|
-| model | Ternary-Bonsai-2-2B (or the 4B with `KINDI_PACK=/data/pack4b`) |
-| variables | `KINDI_CTX=65536` for the 2B, `KINDI_CTX=24576` for the 4B |
+| model | Ternary-Bonsai-2-4B (the installer's choice), or the 2B |
+| variables | `KINDI_CTX=23808` for the 4B (the context that fits), `KINDI_CTX=65536` for the 2B |
 | generation | 2B: 21.2 tokens/s (exact head), 24.8 (fast head); 4B: 9.8 tokens/s |
 
 ## Quadro K1200, 4 GB (Maxwell, sm_50)
@@ -64,6 +64,21 @@ Replace `...` with the variables in the section for your card. To use one card o
 - The K/V cache is q8_0. The output matches llama.cpp with `-ctk q8_0 -ctv q8_0`.
 - Set the host to text mode. A desktop session turns on the CUDA watchdog, and the watchdog stops the exchange
   kernels.
+
+## Quadro K6000, 12 GB (Kepler, sm_35)
+
+| item | value |
+|---|---|
+| model | Ternary-Bonsai-2-27B |
+| variables | `KINDI_PACK=/data/pack27b`, `KINDI_CARDS=1`, `KINDI_CTX=65536`, `KINDI_HEAD=exact`, `KINDI_REPEAT_STOP=1`, `KINDI_MAX_TOKENS=65536` |
+| generation | 20.4 tokens/s at 512 tokens, 16.4 at 8K, 13.1 at 24K |
+| prompt reading | 36.2 tokens/s at 512 tokens, 30.2 at 8K, 26.2 at 24K |
+
+- The card needs the NVIDIA 470 driver. The 470 driver does not report the compute capability, so the installer
+  reads it from the card name.
+- With all of the 12 GB, the engine fits a context of 156,672 tokens. The installer sets 65,536.
+- Nemotron also runs on this card (experimental): 20.1 tokens/s of generation at 512 tokens. The installer does not
+  offer it on Kepler cards.
 
 ## GeForce GTX 1080, 8 GB (Pascal, sm_61)
 

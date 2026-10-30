@@ -64,6 +64,38 @@ class _Fn(object):
         return self.f(*a, **k)
 
 
+_TCF_HIP = (
+    ("""    unsigned int word = ((unsigned int)qi & 255u) << (8 * (lane & 3));
+    word |= __shfl_xor_sync(0xffffffffu, word, 1);
+    word |= __shfl_xor_sync(0xffffffffu, word, 2);
+    if(on && (lane & 3) == 0){
+      const int k4 = col >> 2, s = k4 >> 3, h = (k4 >> 2) & 1, t = k4 & 3;
+      XQ[(((long long)n * NG + g) * 4 + t) * 8 + 2 * s + h] = word;
+    }
+    __syncthreads();""",
+     """    __shared__ unsigned char tcq_qb[8][128];
+    tcq_qb[w >> 2][col] = (unsigned char)(qi & 255);
+    __syncthreads();
+    if(on && (w & 3) == 0) XQ[((long long)n * NG + g) * 32 + lane] = tcq_word5(tcq_qb[w >> 2], lane);
+    __syncthreads();"""),
+    ("""  unsigned int word = ((unsigned int)qi & 255u) << (8 * (lane & 3));
+  word |= __shfl_xor_sync(0xffffffffu, word, 1);
+  word |= __shfl_xor_sync(0xffffffffu, word, 2);
+  const int g = (col0 >> 7) + (w >> 2), col = (w & 3) * 32 + lane;
+  if((lane & 3) == 0){
+    const int k4 = col >> 2, s = k4 >> 3, hh = (k4 >> 2) & 1, t = k4 & 3;
+    XQ[(((long long)n * NG + g) * 4 + t) * 8 + 2 * s + hh] = word;
+  }
+  __syncthreads();""",
+     """  __shared__ unsigned char tcq_qb[8][128];
+  const int g = (col0 >> 7) + (w >> 2), col = (w & 3) * 32 + lane;
+  tcq_qb[w >> 2][col] = (unsigned char)(qi & 255);
+  __syncthreads();
+  if((w & 3) == 0) XQ[((long long)n * NG + g) * 32 + lane] = tcq_word5(tcq_qb[w >> 2], lane);
+  __syncthreads();"""),
+)
+
+
 class SpecKernels(object):
     def __init__(self):
         base = open(os.path.join(HERE, "kindi.cu"), encoding="utf-8").read()
@@ -71,16 +103,31 @@ class SpecKernels(object):
         # copies are taken from a text without the launch bounds)
         wr, _ = _chunk._wrappers(re.sub(r"__launch_bounds__\(\d+\) (k_\w+)\(", r"\1(", base), WRAP)
         own = open(os.path.join(HERE, "spec.cu"), encoding="utf-8").read()
-        tcs = open(os.path.join(HERE, "tc.cu"), encoding="utf-8").read()
+        hip = cp.cuda.runtime.is_hip
+        tcs = open(os.path.join(HERE, "tc_hip.cu" if hip else "tc.cu"), encoding="utf-8").read()
         tcf = open(os.path.join(HERE, "tcf.cu"), encoding="utf-8").read()
-        tcf += chr(10) + open(os.path.join(HERE, "tca.cu"), encoding="utf-8").read()
-        p = cp.cuda.runtime.getDeviceProperties(cp.cuda.Device().id)
-        mod = _tc._patched_module(base + "\n" + wr + "\n" + own + "\n" + tcs + "\n" + tcf,
-                                  "sm_%d%d" % (p["major"], p["minor"]))
+        if hip:
+            # RDNA3: dp4a is v_dot4_i32_iu8; tca.cu (k_att_tc_T) is mma.sync only
+            tcf = tcf.replace('asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));',
+                              "d = __builtin_amdgcn_sudot4(true, a, true, b, c, false);")
+            # the fused quantisers store the int8 rows in tc_hip.cu's 5-column order (tcq_word5)
+            for old, new in _TCF_HIP:
+                assert tcf.count(old) == 1, old
+                tcf = tcf.replace(old, new)
+            mod = cp.RawModule(code=base + "\n" + tcs + "\n" + wr + "\n" + own + "\n" + tcf)
+        else:
+            tcf += chr(10) + open(os.path.join(HERE, "tca.cu"), encoding="utf-8").read()
+            p = cp.cuda.runtime.getDeviceProperties(cp.cuda.Device().id)
+            mod = _tc._patched_module(base + "\n" + wr + "\n" + own + "\n" + tcs + "\n" + tcf,
+                                      "sm_%d%d" % (p["major"], p["minor"]))
         self.mod = mod
         for k in ([w + "_T" for w in WRAP] + ["k_sgdn_pre_T", "k_sgdn_deltan_T", "k_sgdn_deltan_C", "k_sconv_C"] +
-                  list(_tc.NAMES) + list(FUSED)):
-            setattr(self, k, _Fn(mod.get_function(k)))
+                  list(_tc.NAMES) + [f for f in FUSED if not (hip and f == "k_att_tc_T")]):
+            f = mod.get_function(k)
+            w = _Fn(f)
+            if hip:                                  # a RawKernel: the plans want its driver function (.ptr)
+                w.kernel = f.kernel
+            setattr(self, k, w)
         self.mv = {2: self.k_tc_mv2, 4: self.k_tc_mv4, 8: self.k_tc_mv8}
         self.mv3 = {2: self.k_tc_mv3_2, 4: self.k_tc_mv3_4, 8: self.k_tc_mv3_8}
 
@@ -98,7 +145,11 @@ _g = None
 def _gdrv():
     global _g
     if _g is None:
-        d = ctypes.CDLL("libcuda.so.1")
+        from . import gpudrv
+        d = gpudrv.driver()
+        if gpudrv.HIP:                       # ROCm: the HIP stand-in has its argument types set
+            _g = d
+            return _g
         P = ctypes.c_void_p
         d.cuGraphCreate.argtypes = [ctypes.POINTER(P), ctypes.c_uint]
         d.cuGraphAddKernelNode.argtypes = [ctypes.POINTER(P), P, ctypes.POINTER(P), ctypes.c_size_t, ctypes.POINTER(_KP)]
@@ -151,7 +202,10 @@ class Graph(object):
         self.ctx = ctypes.c_void_p()
         d.cuCtxGetCurrent(ctypes.byref(self.ctx))
 
-    def launch(self):
+    def launch(self, toks=None, pos=None):
+        """toks/pos (optional): set the plan's Dyn holders first (the same call as Replay.launch on HIP)"""
+        if toks is not None:
+            self.plan.set(toks[0], pos, toks)
         d = _gdrv()
         if d.cuCtxSetCurrent(self.ctx):
             raise RuntimeError("kindi: cuCtxSetCurrent failed")
@@ -162,6 +216,29 @@ class Graph(object):
             raise RuntimeError("kindi: cuGraphLaunch failed")
 
 
+class Replay(object):
+    """HIP: a plan replayed launch by launch (hipModuleLaunchKernel reads the Dyn holders at every launch); the
+    Graph interface. A captured HIP graph keeps the capture's kernel arguments, so it is not used by default."""
+
+    def __init__(self, plan):
+        self.plan = plan
+        self.nodes = [n for seg in plan.segs for n in seg]
+        self.L = _gdrv().hipModuleLaunchKernel
+
+    def launch(self, toks=None, pos=None):
+        if toks is None:
+            toks, pos = [0] * TMAX, 0
+        self.plan.set(toks[0], pos, toks)
+        L = self.L
+        for fn, g, b, arr, _ in self.nodes:
+            if L(fn, g[0], g[1], g[2], b[0], b[1], b[2], 0, None, arr, None):
+                raise RuntimeError("kindi: a plan launch failed")
+
+
+if cp.cuda.runtime.is_hip and os.environ.get("KINDI_TC_GRAPHS", "0") != "1":
+    Graph = Replay
+
+
 # ====================================================================================== weights: tc layout
 def repack(s, log):
     """the card's 5-trit lane weights -> the tc layout, tensor by tensor through a scratch buffer"""
@@ -169,13 +246,26 @@ def repack(s, log):
     SK = s.sk
     big = max(int(R) * (int(C) // 128) * 7 for _, (_, _, R, C) in s.w.items())
     tmp = cp.empty(big, dtype=cp.uint32)
+    dual = cp.cuda.runtime.is_hip and os.environ.get("KINDI_TC_DUAL", "1") == "1"
+    if dual:
+        # a second copy for the tc layout; the lane layout stays as s.wl for the chunk path
+        s.bct = cp.empty_like(s.bc)
+        s.wl, wt = s.w, {}
     for name, (tag, W5, R, C) in s.w.items():
         R, C = int(R), int(C)
         if R % 16 or C % 1024:
             raise SystemExit("kindi tc: %s (%d x %d) does not fit the tc layout" % (name, R, C))
         n = R * (C // 128) * 7
+        if dual:
+            o = (W5.data.ptr - s.bc.data.ptr) // 4
+            Wt = s.bct[o:]
+            SK.k_tc_pack(((n * 4 + 255) // 256,), (256,), (W5, Wt, i32(R), i32(C // 128)))
+            wt[name] = (tag, Wt, i32(R), i32(C))
+            continue
         SK.k_tc_pack(((n * 4 + 255) // 256,), (256,), (W5, tmp, i32(R), i32(C // 128)))
         W5[:n] = tmp[:n]
+    if dual:
+        s.w = wt
     cp.cuda.Device(s.card).synchronize()
     del tmp
     cp.get_default_memory_pool().free_all_blocks()
@@ -570,8 +660,7 @@ def run(eng, toks, pos, head):
         raise OverflowError("position %d is past the context (%d)" % (pos + T - 1, eng.ctx))
     s = eng.cards[0]
     g = s.tc_plans[(T, head)]
-    g.plan.set(toks[0], pos, list(toks) + [0] * (TMAX - T))
-    g.launch()
+    g.launch(list(toks) + [0] * (TMAX - T), pos)
 
 
 def _hist(self):
@@ -611,6 +700,117 @@ def _spec_flush(self):
         self._sppend, self._spq = False, []
 
 
+class _Guard(object):
+    """Speculation only while it pays: tokens per second of speculative passes vs plain steps, each measured as
+    wall time per call (every pass ends in a readback, so the wall time is the pass), totalled over windows of
+    WIN tokens. The rates are kept across requests and reset when the depth moves by more than 8K tokens (the cost
+    of a pass depends on it). At a new depth: one spec window, one PLAIN-token window of plain steps, then spec
+    windows; two spec windows in a row below the plain rate x MARGIN pause speculation for PAUSE tokens, after
+    which it is probed again (the first pass after a switch is not timed: it also catches the drafter up). A probe
+    after a pause needs one window: a slow one pauses again for twice as long (up to MAXPAUSE), a fast one resumes."""
+    WIN, PLAIN, PAUSE, MAXPAUSE, MARGIN = 48, 16, 256, 4096, 0.97
+    BOUND = float(os.environ.get("KINDI_SPEC_GUARD_BOUND", "2.5"))   # verify pass <= BOUND plain steps (T <= 8: 2.28x measured)
+
+    BOUND_DEPTH = int(os.environ.get("KINDI_SPEC_GUARD_BOUND_DEPTH", "8192"))   # deepest measured position
+
+    def __init__(self):
+        self.spec_r = self.plain_r = None
+        self.depth = -10 ** 9
+        self.pauses = self.probes = self.bad = 0
+        self.pause_len, self.probing = self.PAUSE, False
+        self._start("spec")
+
+    def _start(self, mode):
+        self.tv_n, self.tv_t = 0, 0.0                    # verify passes and their time, this window
+        self.mode, self.n, self.t, self.skip = mode, 0, 0.0, mode == "spec"
+        self.left = {"spec": self.WIN, "plain": self.PLAIN, "pause": self.pause_len}[mode]
+
+    def at(self, pos):
+        if abs(pos - self.depth) > 8192:
+            self.spec_r = self.plain_r = None
+            self.bad, self.depth = 0, pos
+            self.pause_len, self.probing = self.PAUSE, False
+            self._start("spec")
+
+    def want_spec(self):
+        return self.mode == "spec"
+
+    def span(self, t0):
+        """wall time since the last note (it includes the early-return steps that hand out accepted tokens and
+        the drafter's catch-up), or since t0 when there is no recent note (a new request, or after a long gap)"""
+        now = time.perf_counter()
+        last, self.t_last = getattr(self, "t_last", None), now
+        own = now - t0
+        if last is None or last > t0 or now - last > 20 * own + 1.0:
+            return own
+        return now - last
+
+    def note(self, spec, ntok, dt, tv=0.0):
+        lp = os.environ.get("KINDI_SPEC_GUARD_LOG")
+        if lp:
+            with open(lp, "a") as f:
+                f.write("%.4f %s %s n=%d dt=%.4f tv=%.4f left=%d\n" % (time.perf_counter(), self.mode,
+                        "S" if spec else "P", ntok, dt, tv, self.left))
+        if spec and tv > 0:
+            self.tv_n, self.tv_t = self.tv_n + 1, self.tv_t + tv
+        self.left -= ntok
+        if spec and self.skip:
+            self.skip = False
+        elif dt > 0:
+            self.n, self.t = self.n + ntok, self.t + dt
+        if self.left > 0:
+            return
+        r = self.n / self.t if self.t > 0 else None
+        if self.mode == "spec":
+            if r is not None:
+                self.spec_r = r
+            if self.plain_r is None:                       # measure plain steps once at this depth
+                # the bound (verify pass <= BOUND plain steps) is measured only up to BOUND_DEPTH; deeper, the
+                # drafter and verify costs grow, so measure the plain rate instead of assuming it
+                ub = (self.BOUND * self.tv_n / self.tv_t
+                      if self.BOUND > 0 and self.tv_t > 0 and self.depth <= self.BOUND_DEPTH else None)
+                if ub is not None and self.spec_r is not None and self.spec_r > ub:
+                    self.plain_r = ub                      # an upper bound of the plain rate: spec wins anyway
+                    self._start("spec")
+                    return
+                self._start("plain")
+                return
+            slow = self.spec_r is not None and self.spec_r < self.plain_r * self.MARGIN
+            self.bad = self.bad + 1 if slow else 0
+            if self.probing:                               # the one window after a pause decides
+                self.probing = False
+                if slow:
+                    self.pause_len = min(self.pause_len * 2, self.MAXPAUSE)
+                    self.bad = 0
+                    self.pauses += 1
+                    self._start("pause")
+                    return
+                self.pause_len = self.PAUSE
+            if self.bad >= 2:
+                self.bad = 0
+                self.pauses += 1
+                self._start("pause")
+            else:
+                self._start("spec")
+        elif self.mode == "plain":
+            if r is not None:
+                self.plain_r = r
+            self._start("spec")
+        else:                                              # paused: plain steps keep the plain rate fresh
+            if r is not None:
+                self.plain_r = r
+            self.probes += 1
+            self.probing = True
+            self._start("spec")
+
+
+def _guard(self):
+    g = getattr(self, "_sguard", None)
+    if g is None:
+        g = self._sguard = _Guard()
+    return g
+
+
 def tc_step(self, tok, pos):
     self.spec_presampled = None
     q = getattr(self, "_spq", None)
@@ -628,6 +828,12 @@ def tc_step(self, tok, pos):
     _hist_set(self, pos, [tok])
     k = getattr(self, "spec_k", 0) if getattr(self, "spec_ok", False) else 0
     k = min(k, self.ctx - pos - 1)
+    G = _guard(self) if k > 0 and os.environ.get("KINDI_SPEC_GUARD", "1") == "1" else None
+    if G is not None:
+        G.at(pos)
+        if not G.want_spec():
+            k = 0
+    t0 = time.perf_counter()
     dr2 = getattr(self, "drafter", None) if k > 0 and self.spec_mode in ("draft2b", "both") else None
     d = []
     if k > 0:
@@ -637,7 +843,9 @@ def tc_step(self, tok, pos):
         else:
             dr2 = None
     if d:
+        tv0 = time.perf_counter()
         A = verify(self, [tok] + d, pos)
+        tv = time.perf_counter() - tv0
         if getattr(self, "spec_sp", None) is not None:
             # sampling: rejection sampling against the server's own distribution of each row
             E = spec_accept(lambda i: _dist(self, i, A[i]), d, self.spec_sp[3])
@@ -658,6 +866,8 @@ def tc_step(self, tok, pos):
         st["accepted"] += j
         if not self._spq:
             _spec_flush(self)
+        if G is not None:
+            G.note(True, j + 1, G.span(t0), tv)
         self._best, self._ylog_ok, self._ylog_row = A[0], True, 0
         if getattr(self, "spec_sp", None) is not None:
             self.spec_presampled = A[0]
@@ -665,6 +875,8 @@ def tc_step(self, tok, pos):
     run(self, [tok], pos, True)
     s = self.cards[0]
     best = int(s.tcb["AOUT"][0])
+    if G is not None:
+        G.note(False, 1, G.span(t0))
     if k:
         self.spec_stats["passes"] += 1
     self._best, self._ylog_ok, self._ylog_row = best, True, 0
@@ -711,7 +923,11 @@ def spec_begin(self, greedy, temperature=0.0, top_p=1.0, top_k=0, rng=None):
 def spec_end(self):
     _spec_flush(self)
     self.spec_ok, self.spec_sp, self.spec_presampled = False, None, None
-    return getattr(self, "spec_stats", None)
+    st = getattr(self, "spec_stats", None)
+    G = getattr(self, "_sguard", None)
+    if st is not None and G is not None:
+        st["guard"] = {"mode": G.mode, "spec_tok_s": G.spec_r, "plain_tok_s": G.plain_r, "pauses": G.pauses}
+    return st
 
 
 def tc_ylog(self):
@@ -976,8 +1192,7 @@ class Draft2B(object):
             with cp.cuda.Device(s.card):
                 g = self.g[k] = Graph(build_draft(s, k, self.M0, self.C0))
         x = hist[pos]
-        g.plan.set(x, p2, [x] + [0] * TMAX)
-        g.launch()
+        g.launch([x] + [0] * TMAX, p2)
         d = [int(t) for t in cp.asnumpy(s.tcb["AOUT"][:k])]
         self.pend = (p2, x, d)
         return d
@@ -1071,10 +1286,15 @@ def install(log=print):
     def _bplans(self):
         if getattr(self, "tc_layout", False):          # the tensor-core plans replace them (any Hadamard block)
             drv = _tp._drv()
-            c = ctypes.c_void_p()
             cp.cuda.Device(self.card).synchronize()
-            drv.cuCtxGetCurrent(ctypes.byref(c))
-            self.ctxh = c
+            if cp.cuda.runtime.is_hip:             # HIP: the device index (tp.py hipSetDevice(s.ctxh))
+                c = ctypes.c_int()
+                drv.hipGetDevice(ctypes.byref(c))
+                self.ctxh = c.value
+            else:                                  # CUDA: the current context
+                c = ctypes.c_void_p()
+                drv.cuCtxGetCurrent(ctypes.byref(c))
+                self.ctxh = c
             return None
         return o_bplans(self)
 

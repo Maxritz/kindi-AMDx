@@ -1,4 +1,4 @@
-# Kindi 0.1.0 - runtime image for the NVIDIA Quadro K420 (Kepler, sm_30).
+# Kindi runtime image. CUDA 10.2 supports the Quadro K420 (sm_30) and the GTX 1080 (sm_61).
 # CUDA 10.2 is the last toolkit with Kepler sm_30 support, and CuPy 9.6 the last CuPy built for it; the host needs
 # the NVIDIA 470 driver (the last branch that supports Kepler) and the NVIDIA Container Toolkit.
 #
@@ -24,7 +24,7 @@ ENV PATH=/usr/local/cuda-10.2/bin:$PATH \
 RUN apt-get update && apt-get install -y --no-install-recommends gcc python3-dev \
     && python3 -m pip install --no-cache-dir --upgrade "pip<21.4" "setuptools<60" \
     && python3 -m pip install --no-cache-dir "numpy==1.19.5" "fastrlock==0.8.3" "cupy-cuda102==9.6.0" \
-       "fastapi==0.79.1" "uvicorn==0.16.0" "pydantic==1.9.2" \
+       "fastapi==0.79.1" "uvicorn==0.16.0" "pydantic==1.9.2" "Jinja2==3.0.3" "MarkupSafe==2.0.1" \
     && apt-get purge -y python3-dev && apt-get autoremove -y \
     && apt-get install -y --no-install-recommends libgomp1 && rm -rf /var/lib/apt/lists/*
 

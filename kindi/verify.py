@@ -17,6 +17,44 @@ def reference_for(pack):
     return p if os.path.exists(p) else None
 
 
+GEMMA4_MIN_PREFIX = 12      # Gemma 4: every prompt must agree with llama.cpp on at least this many first tokens
+
+
+def run_gemma4(cfg, man, log=print):
+    """Nemotron / Gemma 4: Kindi quantizes activations to int8 and sums in its own order, so it is not token-exact
+    with llama.cpp. Each prompt must agree with llama.cpp's greedy output on its first GEMMA4_MIN_PREFIX tokens."""
+    import cupy as cp
+    here = os.path.dirname(os.path.abspath(__file__))
+    rp = os.path.join(here, "reference-%s.json" % man.get("model_id", ""))
+    if not os.path.exists(rp):
+        log("no llama.cpp reference for this model in this version of Kindi")
+        return 2
+    ref = json.load(open(rp))
+    man = dict(man, pack_path=cfg["pack"])
+    from .server import _two_cards
+    if _two_cards():
+        from .gemma4_tp import TPEngine as E
+    else:
+        from .gemma4 import Engine as E
+    eng = E(man, ctx=2048, log=log)
+    ok_all, tok, dt = True, 0, 0.0
+    for i, r in enumerate(ref["prompts"]):
+        ids, want = r["ids"], r["expected"]
+        cp.cuda.Device().synchronize(); t0 = time.time()
+        eng.forward_batch(ids[:-1], 0); t = int(cp.argmax(eng.forward(ids[-1], len(ids) - 1)).item()); got = [t]
+        for pos in range(len(ids), len(ids) + len(want) - 1):
+            t = int(cp.argmax(eng.forward(t, pos)).item()); got.append(t)
+        cp.cuda.Device().synchronize(); dt += time.time() - t0; tok += len(ids) + len(got)
+        pre = next((k for k in range(len(want)) if got[k] != want[k]), len(want))
+        ok = pre >= GEMMA4_MIN_PREFIX
+        ok_all &= ok
+        log("prompt %d %-60s %s  the first %d of %d tokens agree" % (i + 1, repr(r["prompt"])[:60], "PASS" if ok else "FAIL",
+                                                                     pre, len(want)))
+    log("%s - %.1f tokens/s over the run" % (("ALL PASS: each prompt agrees with llama.cpp on its first %d tokens or more"
+                                              % GEMMA4_MIN_PREFIX) if ok_all else "FAIL", tok / dt))
+    return 0 if ok_all else 1
+
+
 def run(cfg, log=print):
     try:
         import cupy as cp
@@ -25,6 +63,9 @@ def run(cfg, log=print):
     from .engine import make_engine
     import numpy as np
     pack = cfg["pack"]
+    man = json.load(open(os.path.join(pack, "kindi_pack.json")))
+    if man.get("backend") == "kindi_gemma4":
+        return run_gemma4(cfg, man, log=log)
     rp = reference_for(pack)
     if rp is None:
         log("no llama.cpp reference for this model in this version of Kindi")

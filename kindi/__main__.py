@@ -42,15 +42,24 @@ def cmd_convert(cfg, a):
     out = a.out or cfg["pack"]
     if os.path.exists(os.path.join(out, "kindi_pack.json")) and not a.force:
         raise SystemExit("kindi: %s already holds a pack (use --force to rebuild)" % out)
-    convert(a.gguf, out, log=log)
-    log("next: kindi verify")
+    manifest = convert(a.gguf, out, log=log)
+    if manifest.get("backend") == "kindi_gemma4":
+        log("Gemma 4 model ready for Kindi native CUDA inference")
+    else:
+        log("next: kindi verify")
     return 0
 
 
 def cmd_fast_head(cfg, a):
     _setup_gpu_env(cfg)
-    from .cluster import build
-    build(cfg["pack"], K=a.clusters, iters=a.iters, log=log)
+    manifest_path=os.path.join(cfg["pack"],"kindi_pack.json")
+    manifest=json.load(open(manifest_path)) if os.path.isfile(manifest_path) else {}
+    if manifest.get("backend")=="kindi_gemma4":
+        from .gemma4 import build_fast_head
+        build_fast_head(manifest["model_path"],cfg["pack"],K=a.clusters,iters=a.iters,log=log)
+    else:
+        from .cluster import build
+        build(cfg["pack"], K=a.clusters, iters=a.iters, log=log)
     log("restart `kindi serve`, then `kindi head fast` to use it")
     return 0
 
@@ -118,6 +127,17 @@ def cmd_head(cfg, a):
     return 0
 
 
+def cmd_models(cfg, a):
+    from .catalog import list_models
+    list_models(cfg, log=log)
+    return 0
+
+
+def cmd_use(cfg, a):
+    from .catalog import use
+    return use(cfg, a.model, gguf=a.gguf, log=log)
+
+
 def cmd_info(cfg, a):
     print("Kindi %s" % __version__)
     print("config: %s" % cfg["source"])
@@ -128,8 +148,13 @@ def cmd_info(cfg, a):
     if os.path.exists(man):
         m = json.load(open(man))
         print("pack: %s - %s, from %s" % (cfg["pack"], m.get("model"), m.get("source_file")))
-        print("fast head: %s" % ("available" if os.path.exists(os.path.join(cfg["pack"], "head_clusters.npz"))
-                                 else "not built (kindi fast-head)"))
+        if m.get("backend") == "kindi_gemma4":
+            print("backend: Kindi Gemma 4 CUDA")
+            print("fast head: %s" % ("available" if os.path.exists(os.path.join(cfg["pack"],"head_clusters.npz"))
+                                     else "not built (kindi fast-head)"))
+        else:
+            print("fast head: %s" % ("available" if os.path.exists(os.path.join(cfg["pack"], "head_clusters.npz"))
+                                     else "not built (kindi fast-head)"))
     else:
         print("pack: none at %s (kindi convert MODEL.gguf)" % cfg["pack"])
     try:
@@ -157,7 +182,7 @@ def _malloc_tuning():
 
 def main(argv=None):
     _malloc_tuning()
-    p = argparse.ArgumentParser(prog="kindi", description="Kindi %s - ternary LLM engine for the Quadro K420" % __version__)
+    p = argparse.ArgumentParser(prog="kindi", description="Kindi %s - native CUDA inference for ternary models and Gemma 4" % __version__)
     p.add_argument("--config")
     p.add_argument("--pack")
     p.add_argument("--state-dir", dest="state_dir")
@@ -185,6 +210,10 @@ def main(argv=None):
     s = sub.add_parser("head", help="exact or fast output head for a running server")
     s.add_argument("mode", choices=("exact", "fast"))
     sub.add_parser("info", help="show configuration, pack and GPU")
+    sub.add_parser("models", help="list the models and what fits this machine")
+    s = sub.add_parser("use", help="download a model, build its pack and select it")
+    s.add_argument("model")
+    s.add_argument("--gguf", help="use this GGUF file instead of downloading it")
     a = p.parse_args(argv)
     if not a.cmd:
         p.print_help()
@@ -192,7 +221,8 @@ def main(argv=None):
     ov = {k: getattr(a, k, None) for k in ("pack", "state_dir", "ctx", "host", "port", "api_key", "head")}
     cfg = C.load(a.config, ov)
     return {"convert": cmd_convert, "fast-head": cmd_fast_head, "verify": cmd_verify, "bench": cmd_bench,
-            "serve": cmd_serve, "chat": cmd_chat, "head": cmd_head, "info": cmd_info}[a.cmd](cfg, a)
+            "serve": cmd_serve, "chat": cmd_chat, "head": cmd_head, "info": cmd_info,
+            "models": cmd_models, "use": cmd_use}[a.cmd](cfg, a)
 
 
 if __name__ == "__main__":

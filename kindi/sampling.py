@@ -4,6 +4,8 @@ Only candidate tokens are copied to the host: for top-k sampling, a single-block
 threshold that keeps at least k tokens (k_topk); without top-k, every token within 30 * temperature of the best
 (k_band - anything further has relative probability < e^-30). The candidates then go through the usual
 temperature / top-k / top-p steps on the host. The chosen token is the same as sampling from the full logits."""
+import os
+
 import numpy as np
 try:
     import cupy as cp
@@ -12,6 +14,7 @@ except ImportError:               # the CPU engine
 
 BAND_T = 30.0
 CAP = 8192
+SAMPLER_ORDER = os.environ.get("KINDI_SAMPLER_ORDER", "llama").lower()     # llama | hf
 
 
 class Sampler(object):
@@ -56,17 +59,20 @@ class Sampler(object):
 
     @staticmethod
     def _pick(cand, z, temperature, top_p, kk, rng):
+        """top-k, then top-p, then the temperature: the order of llama.cpp's default sampler chain, where top-p
+        sees the probabilities at temperature 1. KINDI_SAMPLER_ORDER=hf applies the temperature first (the
+        Hugging Face and vLLM order); at temperature < 1 that keeps fewer tokens and samples more greedily."""
         k = max(1, min(kk or len(cand), len(cand)))
         sel = np.argpartition(-z, k - 1)[:k] if k < len(cand) else np.arange(len(cand))
-        idx = cand[sel]
-        zz = z[sel] / temperature
-        zz -= zz.max()
-        p = np.exp(zz)
-        p /= p.sum()
-        order = np.argsort(-p)
-        idx, p = idx[order], p[order]
+        idx, zs = cand[sel], z[sel]
+        order = np.argsort(-zs)
+        idx, zs = idx[order], zs[order]
         if top_p and top_p < 1.0:
-            keep = (np.cumsum(p) - p) < top_p
-            idx, p = idx[keep], p[keep]
-            p /= p.sum()
+            q = zs / temperature if SAMPLER_ORDER == "hf" else zs
+            q = np.exp(q - q.max())
+            q /= q.sum()
+            keep = (np.cumsum(q) - q) < top_p
+            idx, zs = idx[keep], zs[keep]
+        p = np.exp((zs - zs.max()) / temperature)
+        p /= p.sum()
         return int(rng.choice(idx, p=p))

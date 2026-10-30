@@ -67,8 +67,18 @@ def g5_gx(R, nt, rpt):
     return (R // 16 + nt // 8 - 1) // (nt // 8) if rpt == 0 else (R + nt * rpt - 1) // (nt * rpt)
 
 
+# (rows, 128-column groups, row-parallel) -> (threads, rows per thread, splits): the Radeon 780M's measured bests
+G5_PINNED_HIP = {(1024, 40, False): (512, 8, 32), (5120, 48, True): (512, 4, 4), (5120, 136, True): (512, 4, 8),
+                 (6144, 40, False): (512, 4, 8), (10240, 40, False): (512, 8, 4), (12288, 40, False): (512, 4, 4),
+                 (17408, 40, False): (512, 8, 2), (248320, 40, False): (512, 8, 1)}
+
+
 def g5_tuned(s, name, R, NG, rowpar):
     """(threads, rows per thread, splits) for a 5-trit product of shape (R, 128 NG) on card s: timed once per shape."""
+    if (rt.is_hip and not s.g5l and os.environ.get("KINDI_G5_PIN", "1") == "1" and (R, NG, rowpar) in G5_PINNED_HIP
+            and G5_PINNED_HIP[(R, NG, rowpar)][2] * R <= s.gpart.size):
+        s.__dict__.setdefault("g5cfg", {})[(R, NG, rowpar)] = G5_PINNED_HIP[(R, NG, rowpar)]
+        return G5_PINNED_HIP[(R, NG, rowpar)]
     if os.environ.get("KINDI_G5_TUNE", "1") != "1":
         nt, rpt, sp = g5_shape(R, NG)
         if s.g5l:
@@ -193,7 +203,10 @@ def _bsync_ev():
 def _drv():
     global _cuda
     if _cuda is None:
-        _cuda = ctypes.CDLL("libcuda.so.1")
+        from . import gpudrv
+        _cuda = gpudrv.driver()
+        if gpudrv.HIP:                       # ROCm: the HIP stand-in has its argument types set
+            return _cuda
         _cuda.cuLaunchKernel.argtypes = [ctypes.c_void_p] + [ctypes.c_uint] * 7 + [ctypes.c_void_p] * 3
         _cuda.cuCtxSetCurrent.argtypes = [ctypes.c_void_p]
         _cuda.cuCtxGetCurrent.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
@@ -226,8 +239,9 @@ class Shard(object):
             self.nsm = prop["multiProcessorCount"]
             g5 = os.environ.get("KINDI_G5", "")
             self.g5 = g5 == "1" or (g5 != "0" and prop["major"] >= 6)
-            self.g5l = self.g5 and os.environ.get("KINDI_G5L", "1") == "1"   # lane-owned tables (k_g5n4)
-            self.dp4a = prop["major"] * 10 + prop["minor"] >= 61 and os.environ.get("KINDI_DP4A", "0") == "1"   # dp4a scores: slower than the float path at long context on the 1080 (measured), off by default
+            # lane-owned tables (k_g5n4); on HIP the row kernels (k_g5r*) decode ~20% faster (780M, 27B)
+            self.g5l = self.g5 and os.environ.get("KINDI_G5L", "0" if rt.is_hip and os.environ.get("KINDI_TC", "0") != "1" else "1") == "1"
+            self.dp4a = prop["major"] * 10 + prop["minor"] >= 61 and os.environ.get("KINDI_DP4A", "1" if rt.is_hip else "0") == "1"   # dp4a scores: slower than the float path at long context on the 1080 (measured), off by default
             self._load()
             self._alloc_fixed()
 
@@ -362,6 +376,13 @@ class Shard(object):
             del host
             self.dp = cp.zeros(1, dtype=cp.uint16)
             self.w = {n: ("g5", self.bc[o:], i32(R), i32(C)) for n, (o, R, C) in offs.items()}
+            # row-layout decode weights plus the lane-layout copy for the chunked prompt GEMM (k_mm_g5n needs it):
+            # KINDI_G5_DUAL=1, the default on HIP, where the card's memory is the host's (unified memory)
+            self.wl = None
+            if not self.g5l and os.path.exists(lpath) and \
+                    os.environ.get("KINDI_G5_DUAL", "1" if rt.is_hip else "0") == "1":
+                self.bcl = _stream_to_card(lpath)
+                self.wl = {n: ("g5", self.bcl[o:], i32(R), i32(C)) for n, (o, R, C) in offs.items()}
         else:
             bc, dp = bc_all, dp_all
             del bc_all, dp_all
@@ -867,7 +888,8 @@ class Dist(object):
         for card, a in self.parts:
             w = a[0].nbytes
             with cp.cuda.Device(card):
-                a[:p] = cp.asarray(np.ascontiguousarray(v[:, o:o + w]).view(a.dtype).reshape((p,) + a.shape[1:]))
+                # in place: a full card has no room for the temporary device copy that cp.asarray makes
+                a[:p].set(np.ascontiguousarray(v[:, o:o + w]).view(a.dtype).reshape((p,) + a.shape[1:]))
             o += w
 
 

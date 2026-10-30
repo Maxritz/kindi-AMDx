@@ -75,8 +75,25 @@ def convert(gguf_path, out_dir, log=print):
     t0 = time.time()
     selftest()
     g = GGUF(gguf_path)
+    if g.kv.get("general.architecture") == "gemma4":
+        from .gemma4 import inspect_model
+        info = inspect_model(gguf_path)
+        os.makedirs(out_dir, exist_ok=True)
+        manifest = {
+            "kindi_version": __version__, "pack_format": PACK_FORMAT, "backend": "kindi_gemma4",
+            "model": info["name"], "model_id": "nemotron-bolt-e4b" if "Nemotron" in info["name"] else "gemma4",
+            "source_file": os.path.basename(gguf_path), "model_path": os.path.abspath(gguf_path),
+            "source_sha256": sha256(gguf_path), "context_length": info["context_length"],
+            "dimensions": info["dimensions"], "tensor_count": info["tensor_count"],
+            "tensor_types": info["tensor_types"], "native_status": "Kindi Gemma 4 CUDA decoder",
+        }
+        with open(os.path.join(out_dir, "kindi_pack.json"), "w") as f:
+            json.dump(manifest, f, indent=2)
+        log("recognized Gemma 4 GGUF: %d tensors, %s quantization; Kindi native CUDA decoder" %
+            (info["tensor_count"], info["tensor_types"]))
+        return manifest
     if g.kv.get("general.architecture") != "qwen35":
-        raise SystemExit("kindi convert: expected a qwen35 GGUF")
+        raise SystemExit("kindi convert: expected a qwen35 or Gemma 4 GGUF")
     profile = (g.kv.get("qwen35.block_count"), g.kv.get("qwen35.embedding_length"),
                g.kv.get("qwen35.feed_forward_length"), g.kv.get("qwen35.attention.head_count"),
                g.kv.get("qwen35.attention.head_count_kv"), g.kv.get("qwen35.ssm.group_count"))

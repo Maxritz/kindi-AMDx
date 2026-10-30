@@ -56,8 +56,9 @@ def reserve(eng):
     tv = os.environ.get("KINDI_CHUNK_TILE", "")
     c["small"] = tv == "64" or (tv != "128" and prop["major"] < 5)
     eng.ck = Chunk1Kernels()
-    if True:
-        # 8-byte shared memory banks (Kepler; the float4 tile loads) and the larger shared memory split
+    if not cp.cuda.runtime.is_hip:
+        # 8-byte shared memory banks (Kepler; the float4 tile loads) and the larger shared memory split (CUDA only;
+        # on ROCm the bank layout is fixed)
         import ctypes
         drv = ctypes.CDLL("libcuda.so.1")
         fp = ctypes.c_void_p(eng.ck.k_mm_g4k.kernel.ptr)

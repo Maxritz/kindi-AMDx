@@ -1,3 +1,17 @@
+/* HIP (ROCm) or CUDA: KHIP is set only when hipRTC compiles this file. CUDA builds keep their exact
+   instructions; the HIP alternatives sit beside them. */
+#ifndef KHIP   /* KINDI-PORT-BEGIN */
+#if defined(__HIPCC_RTC__) || defined(__HIP_DEVICE_COMPILE__) || defined(__HIP_PLATFORM_AMD__)
+#define KHIP 1
+#define KSHFLX(v, o) __shfl_xor((v), (o))
+#define KSHFL(v, l) __shfl((v), (l))
+#else
+#define KHIP 0
+#define KSHFLX(v, o) __shfl_xor_sync(0xffffffffu, (v), (o))
+#define KSHFL(v, l) __shfl_sync(0xffffffffu, (v), (l))
+#endif
+#endif         /* KINDI-PORT-END */
+
 
 /* ---------------------------------------------------------------- prompt chunks: weight-tile unpack + fp32 GEMM */
 /* Y[t][r] = sum_k X[t][k] W[r][k] for a chunk of T prompt tokens (X: T rows of K floats, ldx apart; Y: T rows, ldy
@@ -658,13 +672,13 @@ extern "C" __global__ void __launch_bounds__(256, 2) k_att_flash_T(const uint2* 
         mt = fmaxf(mt, sv[c]);
       }
 #pragma unroll
-      for(int off = 8; off > 0; off >>= 1) mt = fmaxf(mt, __shfl_xor_sync(0xffffffffu, mt, off));
+      for(int off = 8; off > 0; off >>= 1) mt = fmaxf(mt, KSHFLX(mt, off));
       const float mn = fmaxf(m[a], mt);
       float rs = 0.f, pv[4];
 #pragma unroll
       for(int c = 0; c < 4; ++c){ pv[c] = mn == KNEGINF ? 0.f : expf(sv[c] - mn); rs += pv[c]; }
 #pragma unroll
-      for(int off = 8; off > 0; off >>= 1) rs += __shfl_xor_sync(0xffffffffu, rs, off);
+      for(int off = 8; off > 0; off >>= 1) rs += KSHFLX(rs, off);
       const float sc = (m[a] == KNEGINF) ? 0.f : expf(m[a] - mn);
       m[a] = mn;
       l[a] = l[a] * sc + rs;
@@ -773,7 +787,7 @@ extern "C" __global__ void k_q8x_T(const float* __restrict__ X, int ldx, unsigne
   __shared__ float wm[4];
   const float v = X[(long long)t * ldx + g * 128 + e];
   float a = fabsf(v);
-  for(int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+  for(int o = 16; o > 0; o >>= 1) a = fmaxf(a, KSHFLX(a, o));
   if(lane == 0) wm[w] = a;
   __syncthreads();
   const float amax = fmaxf(fmaxf(wm[0], wm[1]), fmaxf(wm[2], wm[3]));
@@ -781,10 +795,34 @@ extern "C" __global__ void k_q8x_T(const float* __restrict__ X, int ldx, unsigne
   const unsigned int q = (unsigned int)(__float2int_rn(v * id) & 255);
   /* pack 4 consecutive columns: lanes 4 m .. 4 m + 3 */
   unsigned int word = q << (8 * (lane & 3));
-  word |= __shfl_xor_sync(0xffffffffu, word, 1);
-  word |= __shfl_xor_sync(0xffffffffu, word, 2);
+  word |= KSHFLX(word, 1);
+  word |= KSHFLX(word, 2);
   if((lane & 3) == 0) XQ[((long long)g * 32 + (e >> 2)) * ldt + t] = word;
   if(e == 0) XS[(long long)g * ldt + t] = amax / 127.0f;
+}
+
+extern "C" __global__ void __launch_bounds__(256) k_q8x_T2(const float* __restrict__ X, int ldx,
+    unsigned int* __restrict__ XQ, float* __restrict__ XS, int ldt, int T){
+  /* grid (K / 128, ceil(T / 64)), block 256 (8 warps x 8 tokens): bit-identical XQ / XS to k_q8x_T */
+  __shared__ unsigned int Q[32][65];
+  const int g = blockIdx.x, t0 = blockIdx.y * 64, lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+  for(int i = 0; i < 8; ++i){
+    const int tt = w * 8 + i, t = t0 + tt;
+    if(t < T){
+      const float4 v = *(const float4*)(X + (long long)t * ldx + g * 128 + lane * 4);
+      float a = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
+      for(int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor(a, o));
+      const float id = a != 0.0f ? 127.0f / a : 0.0f;
+      Q[lane][tt] = ((unsigned int)(__float2int_rn(v.x * id) & 255)) | ((unsigned int)(__float2int_rn(v.y * id) & 255) << 8) |
+                    ((unsigned int)(__float2int_rn(v.z * id) & 255) << 16) | ((unsigned int)(__float2int_rn(v.w * id) & 255) << 24);
+      if(lane == 0) XS[(long long)g * ldt + t] = a / 127.0f;
+    }
+  }
+  __syncthreads();
+  for(int i = threadIdx.x; i < 32 * 64; i += 256){
+    const int k4 = i >> 6, tt = i & 63, t = t0 + tt;
+    if(t < T) XQ[((long long)g * 32 + k4) * ldt + t] = Q[k4][tt];
+  }
 }
 
 struct MQShared {

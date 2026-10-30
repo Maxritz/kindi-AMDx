@@ -1,6 +1,6 @@
 # Why Kindi
 
-**A modern 2-billion-parameter language model that runs at 20+ tokens per second on a ten-year-old, 1 GB,
+**A modern 2-billion-parameter language model that runs at 22.9 tokens per second on a ten-year-old, 1 GB,
 entry-level graphics card.**
 
 The NVIDIA Quadro K420 is a 2014 workstation card. It has one Kepler multiprocessor, 192 CUDA cores, 1 GB of DDR3
@@ -18,7 +18,7 @@ exactly this chip.
 
 Kindi is about **13x faster than llama.cpp when it generates text and 28x faster when it reads a prompt**. Both
 engines use the same card, the same model file and the same context. At 8,192 tokens, llama.cpp stopped with a Vulkan
-error; Kindi runs to 24,576 tokens on this card. The fast head gives about 23 tokens/s. Kindi's default output is
+error; Kindi runs to 24,576 tokens on this card. The fast head gives 22.9 tokens/s at 2,000 tokens of context. Kindi's default output is
 also **token-for-token identical to llama.cpp's** (`kindi verify` checks it). We searched and found no published result that shows any modern language model on a K420
 at anything close to this speed (see [docs/BENCHMARKS.md](docs/BENCHMARKS.md)).
 
